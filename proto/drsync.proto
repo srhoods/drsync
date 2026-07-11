@@ -1,0 +1,515 @@
+// drsync wire protocol — the single contract between the Go control plane and
+// the C agents (protobuf-c). See docs/DESIGN-protocol.md.
+//
+// Rules: field numbers are never reused; additions only; no semantic changes
+// to existing fields. Frame types map 1:1 to the u16 in the frame header.
+
+syntax = "proto3";
+
+package drsync.v1;
+
+option go_package = "drsync/proto/gen/drsyncpb";
+
+// ---------------------------------------------------------------------------
+// Framing
+// ---------------------------------------------------------------------------
+
+// FrameType is carried in the frame header (u16), not inside the payload.
+enum FrameType {
+  FRAME_UNSPECIFIED     = 0;
+  FRAME_HELLO           = 1;   // A→C  Hello
+  FRAME_HELLO_ACK       = 2;   // C→A  HelloAck
+  FRAME_HEARTBEAT       = 3;   // A→C  Heartbeat
+  FRAME_HEARTBEAT_ACK   = 4;   // C→A  HeartbeatAck
+  FRAME_WORK_REQUEST    = 5;   // A→C  WorkRequest
+  FRAME_WORK_GRANT      = 6;   // C→A  WorkGrant
+  FRAME_SHARD_SPLIT     = 7;   // A→C  ShardSplit
+  FRAME_SHARD_SPLIT_ACK = 8;   // C→A  ShardSplitAck
+  FRAME_SHARD_RESULT    = 9;   // A→C  ShardResult
+  FRAME_TASK_RESULT     = 10;  // A→C  TaskResultBatch
+  FRAME_JOURNAL_BATCH   = 11;  // A→C  JournalBatch
+  FRAME_JOURNAL_ACK     = 12;  // C→A  JournalAck
+  FRAME_STATS_REPORT    = 13;  // A→C  StatsReport
+  FRAME_CONTROL         = 14;  // C→A  Control
+  FRAME_ERROR           = 15;  // both ProtocolError (before teardown)
+}
+
+// ---------------------------------------------------------------------------
+// Common types
+// ---------------------------------------------------------------------------
+
+enum EntryType {
+  ENTRY_UNSPECIFIED = 0;
+  ENTRY_FILE        = 1;
+  ENTRY_DIR         = 2;
+  ENTRY_SYMLINK     = 3;
+  ENTRY_CHARDEV     = 4;
+  ENTRY_BLOCKDEV    = 5;
+  ENTRY_FIFO        = 6;
+  ENTRY_SOCKET      = 7;
+}
+
+message StatInfo {
+  EntryType type   = 1;
+  uint32 mode      = 2;   // permission bits + suid/sgid/sticky
+  uint32 uid       = 3;
+  uint32 gid       = 4;
+  uint64 size      = 5;
+  int64  atime_ns  = 6;
+  int64  mtime_ns  = 7;
+  int64  ctime_ns  = 8;   // informational only; never preserved
+  uint64 dev       = 9;
+  uint64 ino       = 10;
+  uint32 nlink     = 11;
+  uint32 rdev_major = 12;
+  uint32 rdev_minor = 13;
+  uint64 blocks    = 14;  // 512B blocks; sparseness heuristic
+}
+
+// Per-mount capabilities discovered by the job-start probe task.
+message MountCaps {
+  bool statx           = 1;
+  bool copy_file_range = 2;
+  bool seek_hole       = 3;
+  bool fallocate_punch = 4;
+  bool posix_acl       = 5;  // system.posix_acl_* xattrs usable
+  bool nfs4_acl        = 6;  // system.nfs4_acl xattr usable
+  bool xattr_user      = 7;
+  bool xattr_trusted   = 8;
+  bool xattr_security  = 9;
+  bool btime           = 10;
+  string fs_type       = 11; // statfs f_type, symbolic (nfs4, gpfs, wekafs, ...)
+}
+
+// ---------------------------------------------------------------------------
+// Session establishment
+// ---------------------------------------------------------------------------
+
+message Hello {
+  string agent_id      = 1;  // stable across restarts (machine-id derived)
+  string hostname      = 2;
+  uint32 proto_major   = 3;
+  uint32 proto_minor   = 4;
+  string agent_version = 5;
+  uint32 cores         = 6;
+  uint64 mem_limit     = 7;  // bytes
+  bool   io_uring      = 8;  // kernel support present
+}
+
+message HelloAck {
+  bool   accepted             = 1;
+  string reject_reason        = 2;
+  uint32 proto_major          = 3;  // version the coordinator will speak
+  uint32 heartbeat_interval_s = 4;
+  uint32 lease_ttl_s          = 5;
+  uint64 fleet_epoch          = 6;  // bumps on coordinator restart
+}
+
+// ---------------------------------------------------------------------------
+// Liveness / control
+// ---------------------------------------------------------------------------
+
+message MountHealth {
+  string path    = 1;
+  bool   healthy = 2;
+}
+
+message Heartbeat {
+  uint64 seq                    = 1;
+  repeated uint64 held_lease_ids = 2;  // implicit renewal of all of these
+  uint32 shard_queue_depth      = 3;
+  uint32 copy_queue_depth       = 4;
+  uint64 inflight_bytes         = 5;
+  uint64 rss_bytes              = 6;
+  repeated MountHealth mounts   = 7;
+}
+
+message HeartbeatAck {
+  uint64 seq          = 1;
+  bool   pause        = 2;
+  bool   drain        = 3;  // finish leases, request no new work
+  uint64 config_epoch = 4;  // job options changed somewhere; re-check hashes
+}
+
+message Control {
+  enum Command {
+    CMD_UNSPECIFIED = 0;
+    CMD_PAUSE       = 1;
+    CMD_RESUME      = 2;
+    CMD_DRAIN       = 3;
+    CMD_CANCEL_JOB  = 4;
+    CMD_SHUTDOWN    = 5;
+    CMD_LOG_LEVEL   = 6;
+  }
+  Command command = 1;
+  uint64  job_id  = 2;  // CMD_CANCEL_JOB
+  string  arg     = 3;  // CMD_LOG_LEVEL: "debug" | "info" | ...
+}
+
+message ProtocolError {
+  uint32 code    = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Job options (resolved YAML spec → what agents need; see DESIGN-jobspec.md)
+// ---------------------------------------------------------------------------
+
+message FilterRule {
+  bool   exclude = 1;  // false = include
+  string pattern = 2;  // rsync-like glob, ** supported
+}
+
+message AclOptions {
+  enum Untranslatable {
+    UNTRANSLATABLE_UNSPECIFIED = 0;
+    UNTRANSLATABLE_WARN        = 1;  // journal FIDELITY_EXCEPTION, apply mode bits
+    UNTRANSLATABLE_FAIL        = 2;
+    UNTRANSLATABLE_SKIP        = 3;
+  }
+  bool posix                    = 1;
+  bool nfs4                     = 2;
+  Untranslatable untranslatable = 3;
+}
+
+message MetadataOptions {
+  bool owner        = 1;
+  bool mode         = 2;
+  bool times        = 3;
+  bool xattrs       = 4;
+  AclOptions acls   = 5;
+  bool specials     = 6;  // device nodes, FIFOs, sockets
+}
+
+message VerifyOptions {
+  // sample_rate_ppm: parts-per-million of entries checksummed, selected
+  // deterministically by xxh3(rel_path) % 1_000_000 < sample_rate_ppm.
+  uint32 sample_rate_ppm = 1;
+  enum OnMismatch {
+    ON_MISMATCH_UNSPECIFIED = 0;
+    ON_MISMATCH_RECOPY      = 1;
+    ON_MISMATCH_FAIL        = 2;
+  }
+  OnMismatch on_mismatch = 2;
+}
+
+message CopyOptions {
+  uint64 chunk_threshold = 1;  // bytes; files >= this become chunk tasks
+  uint64 chunk_size      = 2;
+  uint64 buffer_size     = 3;
+  bool   preserve_sparse = 4;
+  enum ServerSideCopy {
+    SSC_UNSPECIFIED = 0;
+    SSC_AUTO        = 1;
+    SSC_OFF         = 2;
+    SSC_REQUIRE     = 3;
+  }
+  ServerSideCopy server_side_copy = 5;
+  string temp_prefix              = 6;  // ".drsync.tmp."
+  enum FsyncMode {
+    FSYNC_UNSPECIFIED = 0;
+    FSYNC_PER_FILE    = 1;
+    FSYNC_BATCHED     = 2;
+  }
+  FsyncMode fsync_mode  = 7;
+  uint32 fsync_batch    = 8;
+}
+
+message LimitOptions {
+  uint64 bandwidth_per_agent = 1;  // bytes/s, 0 = unlimited
+  uint64 iops_per_agent      = 2;
+}
+
+message TuningOptions {
+  uint64 shard_budget        = 1;  // entries per shard before splitting
+  uint64 dir_split_threshold = 2;  // single-dir size triggering entry-list split
+  uint32 statx_batch         = 3;
+  int64  mtime_slop_ns       = 4;
+  uint32 op_deadline_s       = 5;  // watchdog per-syscall deadline
+}
+
+message JobOptions {
+  uint64 job_id       = 1;
+  string job_name     = 2;
+  string src_root     = 3;
+  string dst_root     = 4;
+  repeated FilterRule filters = 5;
+  CopyOptions copy            = 6;
+  MetadataOptions metadata    = 7;
+  VerifyOptions verify        = 8;
+  LimitOptions limits         = 9;
+  TuningOptions tuning        = 10;
+  bool dry_run                = 11;
+  // Hash of all fields above (coordinator-computed). Agents cache options by
+  // this hash; WorkGrant omits JobOptions when the agent already holds it.
+  uint64 options_hash         = 12;
+}
+
+// ---------------------------------------------------------------------------
+// Work distribution
+// ---------------------------------------------------------------------------
+
+message WorkRequest {
+  uint32 shard_credits = 1;  // capacity for walk shards
+  uint32 task_credits  = 2;  // capacity for chunk/dirfix/verify/delete tasks
+  // Options hashes the agent already caches, per job.
+  message CachedOptions {
+    uint64 job_id       = 1;
+    uint64 options_hash = 2;
+  }
+  repeated CachedOptions cached = 3;
+}
+
+message FileGen {
+  uint64 size     = 1;
+  int64  mtime_ns = 2;
+}
+
+message Shard {
+  uint64 shard_id = 1;
+  uint64 job_id   = 2;
+  uint32 pass_no  = 3;
+  string rel_path = 4;  // "" = job root
+}
+
+// A slice of a huge directory: enumeration already done, names supplied.
+message EntryListShard {
+  uint64 shard_id       = 1;
+  uint64 job_id         = 2;
+  uint32 pass_no        = 3;
+  string dir_rel        = 4;
+  repeated bytes names  = 5;  // bytes: names are not guaranteed UTF-8
+}
+
+message ChunkTask {
+  uint64 task_id   = 1;
+  uint64 job_id    = 2;
+  uint32 pass_no   = 3;
+  string rel_path  = 4;
+  uint64 offset    = 5;
+  uint64 length    = 6;
+  FileGen gen      = 7;  // abort + SRC_CHANGED if source no longer matches
+  bool   create_temp = 8; // this chunk creates the shared temp file
+  string temp_name   = 9; // coordinator-assigned, stable across chunk retries
+  bool   finalize    = 10; // fsync + metadata + rename (granted when all chunks done)
+}
+
+message DirMeta {
+  bytes  rel_path = 1;
+  uint32 uid      = 2;
+  uint32 gid      = 3;
+  uint32 mode     = 4;
+  int64  atime_ns = 5;
+  int64  mtime_ns = 6;
+}
+
+message DirFixBatch {
+  uint64 task_id  = 1;
+  uint64 job_id   = 2;
+  uint32 pass_no  = 3;
+  repeated DirMeta dirs = 4;  // pre-sorted deepest-first by the coordinator
+}
+
+message VerifyEntry {
+  bytes rel_path = 1;
+  bool  checksum = 2;  // in the sample: re-read both sides, compare xxh3-128
+}
+
+message VerifyBatch {
+  uint64 task_id  = 1;
+  uint64 job_id   = 2;
+  uint32 pass_no  = 3;
+  repeated VerifyEntry entries = 4;
+}
+
+message DeleteBatch {
+  uint64 task_id  = 1;
+  uint64 job_id   = 2;
+  uint32 pass_no  = 3;
+  repeated bytes rel_paths = 4;  // destination orphans, deepest-first
+}
+
+// Capability + fidelity probe for a job's mount pair on this agent.
+message ProbeTask {
+  uint64 task_id = 1;
+  uint64 job_id  = 2;
+}
+
+message WorkItem {
+  uint64 lease_id    = 1;
+  uint32 lease_ttl_s = 2;
+  oneof item {
+    Shard          shard      = 3;
+    EntryListShard entry_list = 4;
+    ChunkTask      chunk      = 5;
+    DirFixBatch    dirfix     = 6;
+    VerifyBatch    verify     = 7;
+    DeleteBatch    delete     = 8;
+    ProbeTask      probe      = 9;
+  }
+}
+
+message WorkGrant {
+  repeated WorkItem items = 1;
+  // Present only for jobs whose options_hash was absent from WorkRequest.cached.
+  repeated JobOptions options = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Work discovery (agent → coordinator)
+// ---------------------------------------------------------------------------
+
+message ShardSplit {
+  uint64 parent_shard_id = 1;
+  uint64 seq             = 2;  // per-parent sequence for retransmit dedup
+  message NewShard {
+    bytes rel_path = 1;
+  }
+  message NewEntryList {
+    bytes dir_rel        = 1;
+    repeated bytes names = 2;
+  }
+  repeated NewShard subdirs         = 3;
+  repeated NewEntryList entry_lists = 4;
+}
+
+message ShardSplitAck {
+  uint64 parent_shard_id = 1;
+  uint64 seq             = 2;
+  repeated uint64 assigned_shard_ids = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Results
+// ---------------------------------------------------------------------------
+
+enum ResultStatus {
+  RESULT_UNSPECIFIED = 0;
+  RESULT_OK          = 1;
+  RESULT_ERROR       = 2;  // permanent for this attempt → park
+  RESULT_TRANSIENT   = 3;  // re-queue with backoff
+  RESULT_MOUNT_SICK  = 4;  // agent-local mount problem → re-queue elsewhere
+  RESULT_SRC_CHANGED = 5;  // chunk gen mismatch; re-diffed next pass
+}
+
+message ShardCounters {
+  uint64 entries_walked  = 1;
+  uint64 files_copied    = 2;
+  uint64 bytes_copied    = 3;
+  uint64 meta_fixed      = 4;
+  uint64 clean           = 5;
+  uint64 orphans         = 6;
+  uint64 errors          = 7;
+  uint64 dirs            = 8;
+  uint64 symlinks        = 9;
+  uint64 specials        = 10;
+  uint64 nlink_dup_files = 11;
+  uint64 nlink_dup_bytes = 12;
+  uint64 wall_ms         = 13;
+  // Attributes that could not be preserved (untranslatable ACL, unsupported
+  // xattr namespace on the destination, ...): counted, never silently dropped.
+  uint64 fidelity_exceptions = 14;
+  uint64 verify_ok           = 15;
+  uint64 verify_fail         = 16;
+}
+
+message ShardResult {
+  uint64 shard_id       = 1;
+  uint64 lease_id       = 2;
+  ResultStatus status   = 3;
+  ShardCounters counters = 4;
+  string error          = 5;
+}
+
+message TaskResult {
+  uint64 task_id      = 1;
+  uint64 lease_id     = 2;
+  ResultStatus status = 3;
+  string error        = 4;
+  // ProbeTask results:
+  MountCaps src_caps  = 5;
+  MountCaps dst_caps  = 6;
+  bool acl_readback_ok = 7;
+  // Verify results:
+  uint64 verify_ok    = 8;
+  uint64 verify_fail  = 9;
+}
+
+message TaskResultBatch {
+  repeated TaskResult results = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Journal
+// ---------------------------------------------------------------------------
+
+// One per-file outcome record. Streamed in zstd-compressed batches; the
+// coordinator appends batches verbatim (segment format: docs/DESIGN-coordinator.md §5).
+message JournalRecord {
+  enum Type {
+    JR_UNSPECIFIED        = 0;
+    JR_COPIED             = 1;
+    JR_META_FIXED         = 2;
+    JR_SKIPPED_CLEAN      = 3;   // sampled, not exhaustive
+    JR_ORPHAN             = 4;
+    JR_DIR_META           = 5;   // input to the DIRFIX phase
+    JR_ERROR              = 6;
+    JR_FIDELITY_EXCEPTION = 7;
+    JR_NLINK_DUP          = 8;
+    JR_VERIFY_OK          = 9;
+    JR_VERIFY_FAIL        = 10;
+    JR_WOULD_COPY         = 11;  // dry-run
+    JR_WOULD_DELETE       = 12;  // dry-run
+    JR_DELETED            = 13;
+    JR_SRC_CHANGED        = 14;
+  }
+  Type type        = 1;
+  bytes rel_path   = 2;
+  int64 ts_ns      = 3;
+  StatInfo src     = 4;
+  StatInfo dst     = 5;
+  uint64 xxh3_lo   = 6;   // inline source checksum (COPIED) or computed (VERIFY_*)
+  uint64 xxh3_hi   = 7;
+  int32  errno     = 8;   // JR_ERROR
+  string detail    = 9;   // human-readable context (which xattr, which ACE, ...)
+}
+
+// The batch inside FRAME_JOURNAL_BATCH. records_zstd is a zstd frame containing
+// length-delimited (varint-prefixed) JournalRecord messages.
+message JournalBatch {
+  uint64 seq          = 1;  // per-agent monotonic; coordinator dedups on replay
+  uint64 job_id       = 2;
+  uint32 pass_no      = 3;
+  uint32 record_count = 4;
+  bytes  records_zstd = 5;
+}
+
+message JournalAck {
+  uint64 acked_seq = 1;  // high-water: everything <= is durable
+}
+
+// ---------------------------------------------------------------------------
+// Stats (1 Hz)
+// ---------------------------------------------------------------------------
+
+message LatencyHistogram {
+  string mount = 1;
+  string op    = 2;  // stat | readdir | read | write | fsync | meta
+  // Fixed log2 microsecond buckets: [1,2,4,...,2^31] us; index = floor(log2(us)).
+  repeated uint64 bucket_counts = 3;
+}
+
+message StatsReport {
+  int64 ts_ns = 1;
+  // Cumulative since agent start (coordinator computes rates from deltas).
+  uint64 entries_scanned = 2;
+  uint64 files_copied    = 3;
+  uint64 bytes_copied    = 4;
+  uint64 meta_fixed      = 5;
+  uint64 entries_verified = 6;
+  uint64 errors          = 7;
+  uint32 shard_queue_depth = 8;
+  uint32 copy_queue_depth  = 9;
+  uint64 rss_bytes         = 10;
+  repeated LatencyHistogram latencies = 11;
+}

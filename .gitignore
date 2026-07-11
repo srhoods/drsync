@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+/agent/bin/
+agent/src/*.o
+
+# Runtime state (coordinator store + journals, if pointed inside the tree)
+/var/
+*.db
+*.db-wal
+*.db-shm
+
+# Local tooling / harness settings
+.claude/
+
+# Keys / secrets — never commit
+/ssh/
+*.pem
+id_ed25519*
+id_rsa*
+
+# Editor / OS cruft
+*~
+.DS_Store

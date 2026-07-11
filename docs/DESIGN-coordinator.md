@@ -1,0 +1,209 @@
+# drsync Detailed Design — Coordinator (`drsyncd`)
+
+**Status:** Detailed design v1 — 2026-07-10
+**Language:** Go (decision D1). Runs on a dedicated host (D7); needs fast local disk for
+the state store and journals (NVMe recommended; journals for a 1B-file pass ≈ 100–200 GB
+before compression, ~30–60 GB with zstd).
+
+> **Implementation status (2026-07-11):** the §6 operator surface is complete.
+> All REST endpoints are live — job CRUD/actions, pass detail with shard
+> breakdown and duration, the error browser (errno-class + path-prefix
+> filters, per-class counts), the paged journal query (type/path filters,
+> `pass=N|all`), the migration report (per-pass delta trajectory, verify and
+> fidelity totals, orphans outstanding, parked shards) and the global queue /
+> parked-shard view — plus the `GET /api/v1/events` WebSocket: job/pass state
+> changes, agent connect/disconnect, parked-shard alerts, and 1 Hz stats
+> frames for running jobs. Events are produced by a 1 s store-snapshot differ
+> (`internal/events`) rather than per-transition hooks: one producer, always
+> consistent with what the REST views report. WebSocket auth accepts the
+> bearer token as a `?token=` query parameter (browser clients cannot set
+> headers). Not yet: OIDC/roles, coordinator HA (§8), the event-driven pass
+> controller (state machine still ticks at 2 s).
+
+---
+
+## 1. Process Structure
+
+```
+drsyncd
+├── grpc-less TCP listener (:7440)   agent protocol (see DESIGN-protocol.md)
+├── HTTP listener (:7441)            REST API + WebSocket events + /metrics
+├── scheduler                        shard queue, grants, credit accounting
+├── lease manager                    TTL wheel, expiry → re-queue
+├── pass controller                  per-job pass lifecycle state machine
+├── journal writer                   per-pass segment files, zstd, fsync policy
+├── stats aggregator                 fleet counters, rate windows, ETA model
+└── state store (SQLite, WAL mode)   single-writer goroutine, batched txns
+```
+
+**Why SQLite over RocksDB:** state is sized by *shards* (10⁵–10⁶ rows), not files;
+write rate is O(shard transitions) ≈ low thousands/s peak. SQLite-WAL with batched
+transactions handles that with a single file to back up, snapshot, and reason about.
+RocksDB remains the fallback if shard counts ever explode (interface is a thin
+`Store` abstraction), but it is not justified at D7 scale (4 agents).
+
+## 2. State Machines
+
+### 2.1 Job
+
+```
+CREATED ──validate──▶ READY ──start──▶ RUNNING ⇄ PAUSED
+                                        │  │
+                       converged/max ───┘  └──▶ CANCELLED
+                              ▼
+                          COMPLETED            (any state) ──▶ FAILED
+```
+
+- `RUNNING` iterates passes via the pass controller.
+- Convergence: after each pass, compare pass delta (files+bytes copied) against
+  `spec.passes.converge_when`; met ⇒ `COMPLETED` (or hold in `RUNNING/awaiting-cutover`
+  if `schedule: manual`).
+
+### 2.2 Pass
+
+```
+PENDING ──▶ SCANNING ──all shards done──▶ DIRFIX ──▶ VERIFY ──▶ [DELETE] ──▶ COMPLETE
+              (walk+diff+copy               (dir     (sampled     (only if
+               interleaved per               metadata  checksums,   explicitly
+               shard)                        sweep)    metadata)    triggered)
+```
+
+- `SCANNING` is the long phase: walk, diff, and copy are interleaved *per shard*, so
+  data starts moving seconds after pass start; there is no global "scan first" barrier.
+- `DIRFIX` applies directory metadata deepest-first from the journal's dir records
+  (see agent doc §6.3). Cheap: directories are typically 1–5% of entries.
+- `VERIFY` grants verify batches built from the pass journal (all-metadata + sampled
+  checksum per D4).
+- `DELETE` exists only when triggered with the explicit double-gate (D5); tasks are
+  built from the orphan journal — **no additional scan**.
+
+### 2.3 Shard
+
+```
+QUEUED ──grant──▶ LEASED ──ShardResult ok──▶ DONE
+                    │  │
+        lease expiry┘  └─ShardResult(err)──▶ PARKED ──(operator retry / auto after
+                    ▼                                   transient-window)──▶ QUEUED
+                 QUEUED (attempt++)
+```
+
+- `attempt` counter with ceiling (default 5): repeated lease-expiry of the same shard
+  (e.g. a directory that OOMs/kills agents or hangs an NFS mount) parks it with
+  diagnosis breadcrumbs instead of poisoning the fleet forever.
+- Shards created by `ShardSplit` enter `QUEUED` in the same transaction that records
+  the split against the parent (ordering invariant, protocol doc §4.2).
+
+## 3. Schema (SQLite)
+
+```sql
+jobs    (id, name UNIQUE, spec_yaml, spec_hash, state, created_at, updated_at)
+passes  (id, job_id, pass_no, state, started_at, finished_at,
+         files_scanned, files_copied, bytes_copied, files_meta_fixed,
+         orphans, errors, nlink_dup_files, nlink_dup_bytes)   -- denormalized counters
+shards  (id, pass_id, parent_shard_id, kind,        -- kind: dir | entrylist | chunk |
+         rel_path, payload BLOB,                    --        dirfix | verify | delete
+         state, attempt, lease_id, lease_agent, lease_expiry,
+         result BLOB, updated_at)
+         INDEX (pass_id, state)                     -- the scheduler's working set
+agents  (id, hostname, state, version, caps BLOB, last_heartbeat,
+         cert_cn, registered_at)
+chunk_sets (file_key, pass_id, total_chunks, done_chunks, file_gen, state)
+            -- large-file assembly tracking; finalize task emitted at done==total
+journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control/dedup
+```
+
+- All writes funnel through one writer goroutine committing batched transactions every
+  20 ms or 1000 ops — keeps SQLite happy and makes crash recovery trivial (WAL replay).
+- Recovery on restart: load `shards WHERE state='LEASED'` → leases resume their TTL
+  countdown from `lease_expiry` (persisted absolute time); everything else is stateless.
+
+## 4. Scheduler
+
+- **Credit-based pull** (protocol doc §3): agents advertise capacity; the scheduler
+  grants up to `parallel_shards_per_agent` outstanding shards each.
+- **Queue ordering:** FIFO within a pass, with two twists:
+  1. **Chunk tasks outrank dir shards** — a huge file's chunks should saturate the
+     fleet rather than trickle while walkers churn.
+  2. **Anti-affinity for retries** — a re-queued shard is preferentially granted to a
+     *different* agent than the one whose lease expired (dodges host-local mount issues).
+- **Fairness across jobs:** weighted round-robin by job priority (spec field, default
+  equal). Multiple concurrent jobs are first-class.
+- **Throttles:** bandwidth/IOPS ceilings are enforced agent-side (token bucket), but the
+  scheduler enforces `src_load_ceiling` by shrinking grant credits when agents report
+  p99 latency above the ceiling — global backpressure with no agent coordination.
+
+## 5. Journals
+
+Append-only, per (job, pass), the system of record for per-file outcomes:
+
+```
+/var/lib/drsync/journals/<job>/<pass>/segment-<n>.drj    (zstd frames)
+```
+
+- Record = length-delimited protobuf `JournalRecord`; batches arrive pre-compressed from
+  agents and are appended as received (coordinator does not decompress on the hot path).
+- Record types: `COPIED`, `META_FIXED`, `SKIPPED_CLEAN` (sampled, not exhaustive —
+  counters cover the rest), `ORPHAN`, `DIR_META` (input to DIRFIX), `ERROR`,
+  `FIDELITY_EXCEPTION` (e.g. untranslatable ACL), `NLINK_DUP`, `VERIFY_OK`,
+  `VERIFY_FAIL`, `WOULD_COPY`/`WOULD_DELETE` (dry-run), `DELETED`.
+- Every record: rel_path, record type, src/dst stat essentials, timestamps, agent id,
+  and type-specific payload (e.g. checksum, errno, ACL blob that failed translation).
+- Consumers: `DIRFIX`/`VERIFY`/`DELETE` task generation, `drsync journal cat`,
+  `drsync report`, the WebUI error browser, and the final migration audit report.
+- Retention: journals are the audit trail — kept until job deletion; segments are
+  immutable and rsync-able for archival.
+
+## 6. REST API & WebSocket (day-1 surface, also the WebUI contract)
+
+```
+POST   /api/v1/jobs                    submit (YAML or JSON body)
+GET    /api/v1/jobs                    list (+state filter)
+GET    /api/v1/jobs/{name}             spec + live status + per-pass summary
+POST   /api/v1/jobs/{name}/pause|resume|cancel
+POST   /api/v1/jobs/{name}/passes      trigger manual pass  {delete: bool, confirm: str}
+GET    /api/v1/jobs/{name}/passes/{n}  pass detail: counters, timings, delta trajectory
+GET    /api/v1/jobs/{name}/errors      paged error browser (class/path filters)
+GET    /api/v1/jobs/{name}/journal     paged journal query (type/path filters)
+GET    /api/v1/jobs/{name}/report      migration report (JSON; CLI/WebUI render it)
+GET    /api/v1/agents                  fleet: state, version, live rates, mounts probed
+GET    /api/v1/queue                   shard queue depth, parked shards
+GET    /metrics                        Prometheus
+GET    /api/v1/events                  WebSocket: job/pass/shard state changes,
+                                       1 Hz aggregated stats frames, error events
+```
+
+- Auth: bearer tokens (static file to start; OIDC when the WebUI lands). Mutating
+  endpoints require a token with `operator` role; delete-pass additionally requires the
+  in-body confirmation string.
+- The WebSocket event stream is designed for the phase-3 WebUI but is useful
+  immediately (`drsync job status --watch` consumes it).
+
+## 7. Metrics (Prometheus)
+
+Per-job and fleet-aggregated, the load-bearing ones:
+
+```
+drsync_scan_entries_total{job,agent}          drsync_copy_bytes_total{job,agent}
+drsync_copy_files_total{job,agent}            drsync_verify_fail_total{job}
+drsync_shard_queue_depth{job,state}           drsync_lease_expiries_total{agent}
+drsync_errors_total{job,class}                drsync_orphans_total{job}
+drsync_pass_delta_files{job,pass}             drsync_pass_delta_bytes{job,pass}
+drsync_mount_latency_seconds{agent,mount,op}  (histogram: stat/read/write/readdir)
+drsync_agent_up{agent}                        drsync_eta_seconds{job}
+```
+
+`drsync_pass_delta_*` per pass is the **convergence curve** — the single most important
+migration-management signal (flattening curve = ready for cutover window planning).
+
+ETA model: exponentially-weighted copy rate × remaining known bytes, marked "lower
+bound" while the walk is still discovering (queue depth > 0 and discovery rate > 0).
+
+## 8. HA Posture (phase 2, designed-for now)
+
+- Active/passive: standby `drsyncd` with the SQLite file + journal directory on shared
+  or replicated storage (DRBD / NFS / litestream continuous replication). Failover =
+  start standby, agents reconnect (they retry `coordinator_addrs` list in order).
+- A coordinator outage **pauses** grant flow; agents finish leased shards, buffer
+  journal batches (bounded, then stall), and reconnect. Nothing is lost; the migration
+  resumes where it stopped. This makes single-node-with-replication acceptable for
+  phase 1 at D7 scale.
