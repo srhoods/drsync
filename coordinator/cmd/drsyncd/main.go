@@ -95,6 +95,7 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA string,
 
 	apiSrv := api.New(st, pc, met, bus, journalRoot, apiToken)
 	apiSrv.ConnectedAgents = asrv.ConnectedAgents
+	apiSrv.DropJournal = jw.DropJob
 	poller.ConnectedAgents = asrv.ConnectedAgents
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

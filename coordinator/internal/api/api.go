@@ -11,6 +11,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -30,6 +33,9 @@ type Server struct {
 	token       string // empty = no auth (dev only)
 	// ConnectedAgents is injected by agentsrv for the fleet view.
 	ConnectedAgents func() []string
+	// DropJournal removes a purged job's on-disk journal segments; injected in
+	// main so the API can reclaim disk on `job purge`.
+	DropJournal func(jobID int64) error
 }
 
 func New(st *store.Store, pc *passctrl.Controller, met *metrics.Metrics,
@@ -47,7 +53,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("POST /api/v1/jobs", s.auth(s.submitJob))
 	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
+	mux.HandleFunc("POST /api/v1/jobs/purge", s.auth(s.purgeJobs))
 	mux.HandleFunc("GET /api/v1/jobs/{name}", s.auth(s.getJob))
+	mux.HandleFunc("DELETE /api/v1/jobs/{name}", s.auth(s.purgeJob))
 	mux.HandleFunc("POST /api/v1/jobs/{name}/start", s.auth(s.jobAction("start")))
 	mux.HandleFunc("POST /api/v1/jobs/{name}/pause", s.auth(s.jobAction("pause")))
 	mux.HandleFunc("POST /api/v1/jobs/{name}/resume", s.auth(s.jobAction("resume")))
@@ -181,6 +189,91 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		v.Passes = append(v.Passes, passViewOf(p))
 	}
 	writeJSON(w, http.StatusOK, v)
+}
+
+// dropJournal removes a purged job's on-disk journal (best effort; logged).
+func (s *Server) dropJournal(name string, id int64) {
+	if s.DropJournal == nil {
+		return
+	}
+	if err := s.DropJournal(id); err != nil {
+		slog.Warn("purge: journal cleanup failed", "job", name, "err", err)
+	}
+}
+
+// DELETE /api/v1/jobs/{name} — purge one terminal job (rows + journal).
+func (s *Server) purgeJob(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	id, err := s.st.DeleteJob(name)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		httpErr(w, http.StatusNotFound, "no such job")
+		return
+	case errors.Is(err, store.ErrJobActive):
+		httpErr(w, http.StatusConflict,
+			"job %q is not finished; cancel it before purging", name)
+		return
+	case err != nil:
+		httpErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	s.dropJournal(name, id)
+	slog.Info("job purged", "job", name)
+	writeJSON(w, http.StatusOK, map[string]any{"purged": name})
+}
+
+// POST /api/v1/jobs/purge?state=completed|cancelled|failed|terminal&older_than_ms=N
+// Bulk-purge terminal jobs. state defaults to "completed"; "terminal" matches
+// any of completed/cancelled/failed. older_than_ms (optional) restricts to jobs
+// last updated before now-older_than_ms.
+func (s *Server) purgeJobs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sel := strings.ToUpper(q.Get("state"))
+	if sel == "" {
+		sel = "COMPLETED"
+	}
+	if sel != "TERMINAL" && !store.TerminalJobState(sel) {
+		httpErr(w, http.StatusBadRequest,
+			"state must be completed, cancelled, failed or terminal")
+		return
+	}
+	var cutoff int64
+	if v := q.Get("older_than_ms"); v != "" {
+		ms, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || ms < 0 {
+			httpErr(w, http.StatusBadRequest, "older_than_ms must be a non-negative integer")
+			return
+		}
+		if ms > 0 {
+			cutoff = time.Now().UnixMilli() - ms
+		}
+	}
+	jobs, err := s.st.ListJobs()
+	if err != nil {
+		httpErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	purged := []string{}
+	for _, j := range jobs {
+		state := string(j.State)
+		if !store.TerminalJobState(state) {
+			continue
+		}
+		if sel != "TERMINAL" && sel != state {
+			continue
+		}
+		if cutoff > 0 && j.UpdatedAt >= cutoff {
+			continue
+		}
+		id, err := s.st.DeleteJob(j.Name)
+		if err != nil {
+			continue // raced into non-terminal, or vanished; skip
+		}
+		s.dropJournal(j.Name, id)
+		purged = append(purged, j.Name)
+	}
+	slog.Info("bulk job purge", "state", sel, "count", len(purged))
+	writeJSON(w, http.StatusOK, map[string]any{"purged": purged, "count": len(purged)})
 }
 
 func (s *Server) jobAction(action string) http.HandlerFunc {

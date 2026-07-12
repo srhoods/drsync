@@ -142,8 +142,10 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 |---------|--------------|
 | `drsync job submit <spec.yaml> [--dry-run] [--start] [--set path=value]...` | Register a job. `--dry-run` walks/diffs/journals but executes nothing. `--start` runs it immediately. `--set` overrides a spec field (repeatable), e.g. `--set spec.tuning.shard_budget=4`. |
 | `drsync job list` | All jobs and their states. |
-| `drsync job status <name> [--watch]` | Job state + per-pass table (walked/copied/bytes/meta/orphans/verify/errors). `--watch` streams live progress over the WebSocket until the job reaches a terminal state. |
+| `drsync job status [<name>] [--watch] [--all]` | Job state + per-pass table (walked/copied/bytes/meta/orphans/verify/errors). **With no name**, shows every *active* job (`--all` includes finished ones). `--watch` streams one job's live progress over the WebSocket until it reaches a terminal state. |
 | `drsync job start\|pause\|resume\|cancel <name>` | Lifecycle control. `pause` stops granting new work (in-flight finishes); `resume` continues; `cancel` ends the job. |
+| `drsync job purge <name>` | Delete one **finished** job — its rows and on-disk journal — to reclaim coordinator disk. Refused for jobs that aren't terminal (cancel first). |
+| `drsync job purge --completed [--older-than 168h]` | Bulk-purge finished jobs. `--completed` targets `COMPLETED`; `--state completed\|cancelled\|failed\|terminal` selects which finished states; `--older-than` keeps jobs that finished more recently than the given duration. |
 
 ### Passes
 
@@ -320,6 +322,30 @@ still required to actually delete — there is no "just delete" switch.
 - **Metrics:** the coordinator exposes Prometheus metrics at
   `http://<coord>:7441/metrics` (grants, journal batches, parked shards,
   per-agent scan/copy rates and RSS). Point Grafana at it for dashboards.
+
+---
+
+## 6a. Managing coordinator disk
+
+The coordinator's `-data-dir` holds the SQLite state store **and** the per-job
+journal segments. Journals for billion-file jobs are large and are retained
+after a job finishes (they're your audit trail). Over many migrations this
+grows without bound, so reclaim it by **purging finished jobs** once you no
+longer need their history:
+
+```bash
+drsync job purge proj-migration                 # one finished job (rows + journal)
+drsync job purge --completed                    # every COMPLETED job
+drsync job purge --completed --older-than 336h  # keep the last ~2 weeks
+drsync job purge --state terminal               # completed + cancelled + failed
+```
+
+Purge only touches **terminal** jobs (COMPLETED / CANCELLED / FAILED); an active
+job is refused so live work is never stranded. Purging is irreversible — it
+removes the job row, its passes/shards, and its journal from disk — so export
+anything you need first (`drsync report <name> --json`, `drsync journal cat
+<name> --jsonl`). A good habit is a scheduled `drsync job purge --completed
+--older-than <retention>` on the operator host.
 
 ---
 

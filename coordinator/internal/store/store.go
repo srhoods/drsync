@@ -213,6 +213,61 @@ func (s *Store) SetJobState(id int64, st model.JobState) error {
 	return err
 }
 
+// ErrJobActive is returned when a purge targets a job that has not reached a
+// terminal state (COMPLETED/CANCELLED/FAILED) — deleting live work would strand
+// leases and agents.
+var ErrJobActive = errors.New("job is not in a terminal state")
+
+// TerminalJobState reports whether a job in this state can be purged.
+func TerminalJobState(st string) bool {
+	return st == string(model.JobCompleted) || st == string(model.JobCancelled) ||
+		st == string(model.JobFailed)
+}
+
+// DeleteJob removes a terminal job and all its rows (passes, shards, splits,
+// journal cursors) in one transaction. Returns the deleted job's id so the
+// caller can drop its on-disk journal segments. ErrJobActive if not terminal,
+// sql.ErrNoRows if the name is unknown.
+func (s *Store) DeleteJob(name string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var id int64
+	var state string
+	if err := s.db.QueryRow(`SELECT id, state FROM jobs WHERE name = ?`, name).
+		Scan(&id, &state); err != nil {
+		return 0, err
+	}
+	if !TerminalJobState(state) {
+		return 0, ErrJobActive
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	passSel := `SELECT id FROM passes WHERE job_id = ?`
+	stmts := []string{
+		`DELETE FROM journal_cursors WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM splits WHERE parent_shard_id IN
+		   (SELECT id FROM shards WHERE pass_id IN (` + passSel + `))`,
+		`DELETE FROM shards WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM passes WHERE job_id = ?`,
+		`DELETE FROM jobs WHERE id = ?`,
+	}
+	args := []any{id, id, id, id, id}
+	for i, q := range stmts {
+		if _, err := tx.Exec(q, args[i]); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
 // ---------------------------------------------------------------------------
 // Passes
 // ---------------------------------------------------------------------------

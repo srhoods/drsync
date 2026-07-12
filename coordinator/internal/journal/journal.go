@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"google.golang.org/protobuf/proto"
@@ -95,6 +96,22 @@ func (w *Writer) Flush() error {
 		}
 	}
 	return first
+}
+
+// DropJob closes any open segments for a job and removes its journal directory
+// on disk (used by job purge). Closing the fds first is what actually reclaims
+// the space — an unlinked file whose descriptor is still open is not freed.
+func (w *Writer) DropJob(jobID int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	prefix := fmt.Sprintf("%d/", jobID)
+	for k, seg := range w.segs {
+		if strings.HasPrefix(k, prefix) {
+			seg.f.Close()
+			delete(w.segs, k)
+		}
+	}
+	return os.RemoveAll(filepath.Join(w.root, fmt.Sprintf("%d", jobID)))
 }
 
 func (w *Writer) Close() error {

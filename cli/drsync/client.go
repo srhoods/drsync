@@ -88,6 +88,7 @@ func (c *client) do(method, path string, body []byte, out any) error {
 }
 
 func (c *client) get(path string, out any) error { return c.do("GET", path, nil, out) }
+func (c *client) del(path string, out any) error { return c.do("DELETE", path, nil, out) }
 func (c *client) post(path string, body, out any) error {
 	var data []byte
 	if body != nil {

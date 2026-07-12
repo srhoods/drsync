@@ -85,6 +85,8 @@ func cmdJob(args []string) error {
 		return jobStatus(args[1:])
 	case "start", "pause", "resume", "cancel":
 		return jobAction(args[0], args[1:])
+	case "purge":
+		return jobPurge(args[1:])
 	default:
 		return fmt.Errorf("unknown job subcommand %q", args[0])
 	}
@@ -216,11 +218,21 @@ func jobStatus(args []string) error {
 	fs := flag.NewFlagSet("job status", flag.ExitOnError)
 	mk := connFlags(fs)
 	watch := fs.Bool("watch", false, "follow live progress on the event stream")
+	all := fs.Bool("all", false, "with no job name, include finished jobs too")
 	pos := parseFlags(fs, args)
-	if len(pos) != 1 {
-		return fmt.Errorf("job status needs a job name")
+	if len(pos) > 1 {
+		return fmt.Errorf("job status takes at most one job name")
 	}
-	c, name := mk(), pos[0]
+	c := mk()
+	// No job name: show every active job (or all with --all). --watch needs a
+	// specific job to filter its event stream.
+	if len(pos) == 0 {
+		if *watch {
+			return fmt.Errorf("job status --watch needs a job name")
+		}
+		return statusAll(c, *all)
+	}
+	name := pos[0]
 	jv, err := printStatus(c, name)
 	if err != nil {
 		return err
@@ -229,6 +241,36 @@ func jobStatus(args []string) error {
 		return nil
 	}
 	return watchJob(c, name)
+}
+
+// statusAll prints the status of every active job (RUNNING/PAUSED/READY), or
+// every job when all is true.
+func statusAll(c *client, all bool) error {
+	var jobs []jobView
+	if err := c.get("/api/v1/jobs", &jobs); err != nil {
+		return err
+	}
+	shown := 0
+	for _, j := range jobs {
+		if !all && terminalJob(j.State) {
+			continue
+		}
+		if shown > 0 {
+			fmt.Println()
+		}
+		if _, err := printStatus(c, j.Name); err != nil {
+			return err
+		}
+		shown++
+	}
+	if shown == 0 {
+		if all {
+			fmt.Println("no jobs")
+		} else {
+			fmt.Println("no active jobs (use --all to include finished jobs, or drsync job list)")
+		}
+	}
+	return nil
 }
 
 func printStatus(c *client, name string) (*jobView, error) {
@@ -330,6 +372,68 @@ func jobAction(action string, args []string) error {
 		return err
 	}
 	fmt.Printf("job %s: %s ok\n", name, action)
+	return nil
+}
+
+// jobPurge deletes finished jobs and their journals to reclaim coordinator disk.
+//
+//	drsync job purge <name>                       # one terminal job
+//	drsync job purge --completed [--older-than 168h]
+//	drsync job purge --state terminal --older-than 720h
+func jobPurge(args []string) error {
+	fs := flag.NewFlagSet("job purge", flag.ExitOnError)
+	mk := connFlags(fs)
+	completed := fs.Bool("completed", false, "bulk-purge all COMPLETED jobs")
+	state := fs.String("state", "", "bulk-purge jobs in this state: completed|cancelled|failed|terminal")
+	olderThan := fs.Duration("older-than", 0, "with bulk purge, only jobs finished longer ago than this (e.g. 168h)")
+	pos := parseFlags(fs, args)
+
+	// Single named job.
+	if len(pos) == 1 {
+		if *completed || *state != "" || *olderThan != 0 {
+			return fmt.Errorf("give a job name OR bulk flags (--completed/--state/--older-than), not both")
+		}
+		name := pos[0]
+		if err := mk().del("/api/v1/jobs/"+url.PathEscape(name), nil); err != nil {
+			return err
+		}
+		fmt.Printf("job %s purged\n", name)
+		return nil
+	}
+	if len(pos) > 1 {
+		return fmt.Errorf("job purge takes at most one job name")
+	}
+
+	// Bulk purge.
+	sel := *state
+	if *completed {
+		if sel != "" && sel != "completed" {
+			return fmt.Errorf("--completed conflicts with --state %s", sel)
+		}
+		sel = "completed"
+	}
+	if sel == "" {
+		return fmt.Errorf("specify a job name, or --completed / --state <s> for bulk purge")
+	}
+	path := "/api/v1/jobs/purge?state=" + url.QueryEscape(sel)
+	if *olderThan > 0 {
+		path += "&older_than_ms=" + strconv.FormatInt(olderThan.Milliseconds(), 10)
+	}
+	var res struct {
+		Purged []string `json:"purged"`
+		Count  int      `json:"count"`
+	}
+	if err := mk().post(path, nil, &res); err != nil {
+		return err
+	}
+	if res.Count == 0 {
+		fmt.Println("no matching jobs to purge")
+		return nil
+	}
+	for _, n := range res.Purged {
+		fmt.Printf("purged %s\n", n)
+	}
+	fmt.Printf("%d job(s) purged\n", res.Count)
 	return nil
 }
 
@@ -490,7 +594,9 @@ func cmdJournal(args []string) error {
 	fs := flag.NewFlagSet("journal cat", flag.ExitOnError)
 	mk := connFlags(fs)
 	pass, path, limit, offset := journalQuery(fs)
-	typ := fs.String("type", "", "filter by record type (orphan, error, verify_fail, ...)")
+	typ := fs.String("type", "", "filter by record type: copied, meta_fixed, orphan, deleted, error,\n"+
+		"    \tfidelity_exception, nlink_dup, verify_ok, verify_fail, would_copy,\n"+
+		"    \twould_delete, src_changed, dir_meta, skipped_clean")
 	jsonl := fs.Bool("jsonl", false, "emit raw records as JSON lines")
 	pos := parseFlags(fs, args[1:])
 	if len(pos) != 1 {

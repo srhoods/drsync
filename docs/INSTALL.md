@@ -57,8 +57,8 @@ mounts. It never crosses the control network between agent and coordinator.
 ### Agent (C)
 
 - A **C11 compiler** (gcc or clang).
-- **libzstd** + headers — journal batch compression. (`zstd-devel` /
-  `libzstd-dev`.)
+- **libzstd** + headers — journal batch compression. (`libzstd-devel` on
+  RHEL / Rocky / Alma, `libzstd-dev` on Debian / Ubuntu.)
 - **OpenSSL ≥ 1.1.1** + headers — mTLS to the coordinator (TLS 1.3).
   (`openssl-devel` / `libssl-dev`.)
 - **pthreads**, **glibc**, a **Linux kernel** new enough for `statx(2)` and
@@ -74,7 +74,7 @@ Example dependency install:
 
 ```bash
 # RHEL / Rocky / Alma 9
-sudo dnf install -y gcc make zstd-devel openssl-devel      # + Go 1.26 from go.dev
+sudo dnf install -y gcc make libzstd-devel openssl-devel   # + Go 1.26 from go.dev
 # Debian / Ubuntu
 sudo apt install -y build-essential libzstd-dev libssl-dev # + Go 1.26 from go.dev
 ```
