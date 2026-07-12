@@ -145,7 +145,7 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 | `drsync job status [<name>] [--watch] [--all]` | Job state + per-pass table (walked/copied/bytes/meta/orphans/verify/errors). **With no name**, shows every *active* job (`--all` includes finished ones). `--watch` streams one job's live progress over the WebSocket until it reaches a terminal state. |
 | `drsync job start\|pause\|resume\|cancel <name>` | Lifecycle control. `pause` stops granting new work (in-flight finishes); `resume` continues; `cancel` ends the job. |
 | `drsync job purge <name>` | Delete one **finished** job — its rows and on-disk journal — to reclaim coordinator disk. Refused for jobs that aren't terminal (cancel first). |
-| `drsync job purge --completed [--older-than 168h]` | Bulk-purge finished jobs. `--completed` targets `COMPLETED`; `--state completed\|cancelled\|failed\|terminal` selects which finished states; `--older-than` keeps jobs that finished more recently than the given duration. |
+| `drsync job purge --completed [--older-than 168h] [--dry-run]` | Bulk-purge finished jobs. `--completed` targets `COMPLETED`; `--state completed\|cancelled\|failed\|terminal` selects which finished states; `--older-than` keeps jobs that finished more recently than the given duration; **`--dry-run` lists what would be purged without deleting anything**. |
 
 ### Passes
 
@@ -335,6 +335,7 @@ longer need their history:
 
 ```bash
 drsync job purge proj-migration                 # one finished job (rows + journal)
+drsync job purge --completed --dry-run          # preview: list what would go
 drsync job purge --completed                    # every COMPLETED job
 drsync job purge --completed --older-than 336h  # keep the last ~2 weeks
 drsync job purge --state terminal               # completed + cancelled + failed

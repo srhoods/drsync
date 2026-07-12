@@ -44,9 +44,10 @@ JOBS
         Lifecycle control (pause stops new grants; in-flight work finishes).
   job purge <name>
         Delete one FINISHED job (rows + journal) to reclaim coordinator disk.
-  job purge --completed [--older-than 168h]
+  job purge --completed [--older-than 168h] [--dry-run]
   job purge --state completed|cancelled|failed|terminal [--older-than 720h]
-        Bulk-purge finished jobs; --older-than keeps recently-finished ones.
+        Bulk-purge finished jobs; --older-than keeps recently-finished ones;
+        --dry-run lists what would be purged without deleting anything.
 
 PASSES
   pass trigger <name>

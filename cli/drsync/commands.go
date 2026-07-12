@@ -386,12 +386,13 @@ func jobPurge(args []string) error {
 	completed := fs.Bool("completed", false, "bulk-purge all COMPLETED jobs")
 	state := fs.String("state", "", "bulk-purge jobs in this state: completed|cancelled|failed|terminal")
 	olderThan := fs.Duration("older-than", 0, "with bulk purge, only jobs finished longer ago than this (e.g. 168h)")
+	dryRun := fs.Bool("dry-run", false, "bulk purge: list which jobs would be purged; delete nothing")
 	pos := parseFlags(fs, args)
 
 	// Single named job.
 	if len(pos) == 1 {
-		if *completed || *state != "" || *olderThan != 0 {
-			return fmt.Errorf("give a job name OR bulk flags (--completed/--state/--older-than), not both")
+		if *completed || *state != "" || *olderThan != 0 || *dryRun {
+			return fmt.Errorf("give a job name OR bulk flags (--completed/--state/--older-than/--dry-run), not both")
 		}
 		name := pos[0]
 		if err := mk().del("/api/v1/jobs/"+url.PathEscape(name), nil); err != nil {
@@ -419,6 +420,9 @@ func jobPurge(args []string) error {
 	if *olderThan > 0 {
 		path += "&older_than_ms=" + strconv.FormatInt(olderThan.Milliseconds(), 10)
 	}
+	if *dryRun {
+		path += "&dry_run=true"
+	}
 	var res struct {
 		Purged []string `json:"purged"`
 		Count  int      `json:"count"`
@@ -430,10 +434,14 @@ func jobPurge(args []string) error {
 		fmt.Println("no matching jobs to purge")
 		return nil
 	}
-	for _, n := range res.Purged {
-		fmt.Printf("purged %s\n", n)
+	verb, tail := "purged", "purged"
+	if *dryRun {
+		verb, tail = "would purge", "would be purged"
 	}
-	fmt.Printf("%d job(s) purged\n", res.Count)
+	for _, n := range res.Purged {
+		fmt.Printf("%s %s\n", verb, n)
+	}
+	fmt.Printf("%d job(s) %s\n", res.Count, tail)
 	return nil
 }
 

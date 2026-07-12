@@ -248,6 +248,7 @@ func (s *Server) purgeJobs(w http.ResponseWriter, r *http.Request) {
 			cutoff = time.Now().UnixMilli() - ms
 		}
 	}
+	dryRun := q.Get("dry_run") == "true"
 	jobs, err := s.st.ListJobs()
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, "%v", err)
@@ -265,6 +266,10 @@ func (s *Server) purgeJobs(w http.ResponseWriter, r *http.Request) {
 		if cutoff > 0 && j.UpdatedAt >= cutoff {
 			continue
 		}
+		if dryRun { // preview: match but delete nothing
+			purged = append(purged, j.Name)
+			continue
+		}
 		id, err := s.st.DeleteJob(j.Name)
 		if err != nil {
 			continue // raced into non-terminal, or vanished; skip
@@ -272,8 +277,9 @@ func (s *Server) purgeJobs(w http.ResponseWriter, r *http.Request) {
 		s.dropJournal(j.Name, id)
 		purged = append(purged, j.Name)
 	}
-	slog.Info("bulk job purge", "state", sel, "count", len(purged))
-	writeJSON(w, http.StatusOK, map[string]any{"purged": purged, "count": len(purged)})
+	slog.Info("bulk job purge", "state", sel, "count", len(purged), "dry_run", dryRun)
+	writeJSON(w, http.StatusOK,
+		map[string]any{"purged": purged, "count": len(purged), "dry_run": dryRun})
 }
 
 func (s *Server) jobAction(action string) http.HandlerFunc {
