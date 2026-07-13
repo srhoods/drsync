@@ -163,7 +163,7 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 | `drsync agent list` | Connected agents, liveness, and scheduling status (`SCHED` = `enabled`/`DISABLED`). |
 | `drsync agent disable <id>` | Stop granting new shards to an agent. It stays connected and finishes its in-flight leases; nothing new is scheduled onto it. Survives agent reconnects. |
 | `drsync agent enable <id>` | Re-admit a disabled agent to scheduling. |
-| `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, totals, fidelity exceptions. Your go/no-go artifact. |
+| `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, fidelity exceptions. The per-pass table ends with a **TOTAL** footer row summing the additive columns (duration, delta-files, delta-bytes, verify, errors; orphans is a per-scan census so it is dashed). Your go/no-go artifact. |
 | `drsync queue` | Shard queue depth by state, including **parked** shards. |
 | `drsync errors <name> [--pass N\|all] [--class EACCES] [--path prefix] [--limit N] [--offset N]` | Browse errors, filterable by errno class and path prefix. |
 | `drsync journal cat <name> [--pass N\|all] [--type orphan] [--path prefix] [--summary] [--jsonl]` | Page the journal. `--type` filters record kind (`orphan`, `error`, `copied`, `meta_fixed`, `verify_fail`, …); `--summary` counts records by type instead of listing them (color-coded: **green** nominal, **yellow** informational — `would_copy`/`would_delete`/`nlink_dup`/`orphan`/`src_changed`, **red** failures — `error`/`fidelity_exception`/`verify_fail`); `--jsonl` emits raw records (or the summary histogram) for scripting. |
