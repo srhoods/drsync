@@ -10,7 +10,7 @@
 //	drsync pass trigger <name> [--delete-pass --i-know-this-deletes]
 //	drsync agent list | enable <id> | disable <id>
 //	drsync errors <name> [--pass N|all] [--class EACCES] [--path prefix]
-//	drsync journal cat <name> [--pass N|all] [--type orphan] [--jsonl]
+//	drsync journal cat <name> [--pass N|all] [--type orphan] [--summary] [--jsonl]
 //	drsync report <name> [--json]
 //	drsync queue
 //	drsync events [--job name]
@@ -71,11 +71,13 @@ INSPECT & AUDIT
         Shard queue depth by state, including PARKED shards needing attention.
   errors <name> [--pass N|all] [--class EACCES] [--path prefix] [--limit N] [--offset N]
         Browse errors; --class filters by errno name (EACCES, ENOENT, ESTALE, ...).
-  journal cat <name> [--pass N|all] [--type T] [--path prefix] [--jsonl]
+  journal cat <name> [--pass N|all] [--type T] [--path prefix] [--summary] [--jsonl]
         Page the journal. --type is one of:
           copied  meta_fixed  orphan  deleted  error  fidelity_exception
           nlink_dup  verify_ok  verify_fail  would_copy  would_delete
           src_changed  dir_meta  skipped_clean
+        --summary counts records by type instead of listing them (green=nominal,
+        yellow=informational, red=failure); honors --pass/--type/--path.
         --jsonl emits raw records (one JSON object per line) for scripting.
   events [--job name]
         Tail the live event stream (state changes, agent up/down, parked-shard

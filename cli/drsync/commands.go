@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -637,7 +638,7 @@ func zeroStr(v any) any {
 
 func cmdJournal(args []string) error {
 	if len(args) < 1 || args[0] != "cat" {
-		return fmt.Errorf("usage: drsync journal cat <name> [--pass N] [--type T] [--jsonl]")
+		return fmt.Errorf("usage: drsync journal cat <name> [--pass N] [--type T] [--summary] [--jsonl]")
 	}
 	fs := flag.NewFlagSet("journal cat", flag.ExitOnError)
 	mk := connFlags(fs)
@@ -646,6 +647,8 @@ func cmdJournal(args []string) error {
 		"    \tfidelity_exception, nlink_dup, verify_ok, verify_fail, would_copy,\n"+
 		"    \twould_delete, src_changed, dir_meta, skipped_clean")
 	jsonl := fs.Bool("jsonl", false, "emit raw records as JSON lines")
+	summary := fs.Bool("summary", false, "count records by type instead of listing them\n"+
+		"    \t(honors --pass/--type/--path; color-coded on a terminal)")
 	pos := parseFlags(fs, args[1:])
 	if len(pos) != 1 {
 		return fmt.Errorf("journal cat needs a job name")
@@ -653,6 +656,9 @@ func cmdJournal(args []string) error {
 	extra := url.Values{}
 	if *typ != "" {
 		extra.Set("type", *typ)
+	}
+	if *summary {
+		return journalSummary(mk(), pos[0], *pass, *typ, *path, *limit, *offset, extra, *jsonl)
 	}
 	var out struct {
 		Count     int              `json:"count"`
@@ -687,6 +693,91 @@ func cmdJournal(args []string) error {
 		fmt.Fprintln(os.Stderr, "-- page truncated; use --offset/--limit for more")
 	}
 	return nil
+}
+
+// journalSummary fetches and renders the per-type record histogram.
+func journalSummary(c *client, name, pass, typ, path string, limit, offset int, extra url.Values, asJSON bool) error {
+	extra.Set("summary", "true")
+	var out struct {
+		Summary map[string]int64 `json:"summary"`
+		Total   int64            `json:"total"`
+	}
+	if err := c.get("/api/v1/jobs/"+url.PathEscape(name)+"/journal"+
+		queryString(pass, path, limit, offset, extra), &out); err != nil {
+		return err
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	scope := pass
+	if scope == "" {
+		scope = "latest"
+	}
+	printJournalSummary(name, scope, out.Summary, out.Total)
+	return nil
+}
+
+// journalCats lists record types in display order with their category color:
+// green = nominal (work done as expected), yellow = informational (dry-run
+// intentions, hardlink duplication, orphans, mid-copy source changes), red =
+// failures (errors, unpreservable fidelity, checksum mismatches).
+var journalCats = []struct{ key, label, color string }{
+	{"COPIED", "copied", ansiGreen},
+	{"META_FIXED", "meta_fixed", ansiGreen},
+	{"DELETED", "deleted", ansiGreen},
+	{"DIR_META", "dir_meta", ansiGreen},
+	{"SKIPPED_CLEAN", "skipped_clean", ansiGreen},
+	{"VERIFY_OK", "verify_ok", ansiGreen},
+	{"WOULD_COPY", "would_copy", ansiYellow},
+	{"WOULD_DELETE", "would_delete", ansiYellow},
+	{"NLINK_DUP", "nlink_dup", ansiYellow},
+	{"ORPHAN", "orphan", ansiYellow},
+	{"SRC_CHANGED", "src_changed", ansiYellow},
+	{"ERROR", "error", ansiRed},
+	{"FIDELITY_EXCEPTION", "fidelity_exception", ansiRed},
+	{"VERIFY_FAIL", "verify_fail", ansiRed},
+}
+
+func printJournalSummary(job, scope string, counts map[string]int64, total int64) {
+	fmt.Printf("journal summary: %s (pass %s)\n", job, scope)
+	if total == 0 {
+		fmt.Println("  (no records)")
+		return
+	}
+	on := colorEnabled()
+	cw := len("total")
+	seen := map[string]bool{}
+	for _, r := range journalCats {
+		if c, ok := counts[r.key]; ok {
+			seen[r.key] = true
+			if w := len(strconv.FormatInt(c, 10)); w > cw {
+				cw = w
+			}
+		}
+	}
+	// Unknown types (forward-compat): counted, printed uncolored after the rest.
+	var extra []string
+	for k := range counts {
+		if !seen[k] {
+			extra = append(extra, k)
+			if w := len(strconv.FormatInt(counts[k], 10)); w > cw {
+				cw = w
+			}
+		}
+	}
+	sort.Strings(extra)
+
+	for _, r := range journalCats {
+		if c, ok := counts[r.key]; ok {
+			fmt.Println(colorize(on, r.color, fmt.Sprintf("  %-20s %*d", r.label, cw, c)))
+		}
+	}
+	for _, k := range extra {
+		fmt.Printf("  %-20s %*d\n", strings.ToLower(k), cw, counts[k])
+	}
+	fmt.Printf("  %-20s %*d\n", "total", cw, total)
 }
 
 // ---------------------------------------------------------------------------

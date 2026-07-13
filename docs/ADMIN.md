@@ -166,7 +166,7 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 | `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, totals, fidelity exceptions. Your go/no-go artifact. |
 | `drsync queue` | Shard queue depth by state, including **parked** shards. |
 | `drsync errors <name> [--pass N\|all] [--class EACCES] [--path prefix] [--limit N] [--offset N]` | Browse errors, filterable by errno class and path prefix. |
-| `drsync journal cat <name> [--pass N\|all] [--type orphan] [--path prefix] [--jsonl]` | Page the journal. `--type` filters record kind (`orphan`, `error`, `copied`, `meta_fixed`, `verify_fail`, …); `--jsonl` emits raw records for scripting. |
+| `drsync journal cat <name> [--pass N\|all] [--type orphan] [--path prefix] [--summary] [--jsonl]` | Page the journal. `--type` filters record kind (`orphan`, `error`, `copied`, `meta_fixed`, `verify_fail`, …); `--summary` counts records by type instead of listing them (color-coded: **green** nominal, **yellow** informational — `would_copy`/`would_delete`/`nlink_dup`/`orphan`/`src_changed`, **red** failures — `error`/`fidelity_exception`/`verify_fail`); `--jsonl` emits raw records (or the summary histogram) for scripting. |
 | `drsync events [--job name]` | Tail the live event stream (state changes, agent connect/disconnect, parked-shard alerts, 1 Hz stats). |
 
 ### Certificates
@@ -413,6 +413,7 @@ drsync pass trigger <name> --delete-pass --i-know-this-deletes
 # health & audit
 drsync agent list ; drsync queue ; drsync report <name>
 drsync errors <name> --class EACCES ; drsync events
+drsync journal cat <name> --pass all --summary   # per-type record census (color-coded)
 
 # certificates
 drsync ca init --cn drsync-ca

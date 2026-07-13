@@ -128,6 +128,10 @@ func (s *Server) pageParams(w http.ResponseWriter, r *http.Request, job *store.J
 
 var errPageFull = errors.New("page full")
 
+// scanAll is an effectively-unbounded page limit used by summary aggregation,
+// which must visit every matching record rather than one page of them.
+const scanAll = int(^uint(0) >> 1)
+
 // scanJournal streams matching records across the requested passes, applying
 // offset/limit after the filter. Returns matched-total-so-far (capped by the
 // page) and whether more matches remain beyond the page.
@@ -254,15 +258,36 @@ func (s *Server) getJournal(w http.ResponseWriter, r *http.Request) {
 	typeFilter = strings.TrimPrefix(typeFilter, "JR_")
 	pathPrefix := r.URL.Query().Get("path")
 
+	match := func(rec *drsyncpb.JournalRecord) bool {
+		if typeFilter != "" &&
+			strings.TrimPrefix(rec.Type.String(), "JR_") != typeFilter {
+			return false
+		}
+		return pathPrefix == "" || strings.HasPrefix(string(rec.RelPath), pathPrefix)
+	}
+
+	// Summary mode: count matching records by type across every requested pass
+	// (no paging), returning the histogram instead of the records themselves.
+	if r.URL.Query().Get("summary") == "true" {
+		byType := map[string]int64{}
+		var total int64
+		_, err := s.scanJournal(job, passes, scanAll, 0, match,
+			func(pn int, rec *drsyncpb.JournalRecord) {
+				byType[strings.TrimPrefix(rec.Type.String(), "JR_")]++
+				total++
+			})
+		if err != nil {
+			httpErr(w, http.StatusInternalServerError, "read journal: %v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"job": job.Name, "summary": byType, "total": total,
+		})
+		return
+	}
+
 	records := []map[string]any{}
-	truncated, err := s.scanJournal(job, passes, limit, offset,
-		func(rec *drsyncpb.JournalRecord) bool {
-			if typeFilter != "" &&
-				strings.TrimPrefix(rec.Type.String(), "JR_") != typeFilter {
-				return false
-			}
-			return pathPrefix == "" || strings.HasPrefix(string(rec.RelPath), pathPrefix)
-		},
+	truncated, err := s.scanJournal(job, passes, limit, offset, match,
 		func(pn int, rec *drsyncpb.JournalRecord) {
 			records = append(records, recView(pn, rec))
 		})
