@@ -1,0 +1,1015 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drsync console</title>
+<style>
+  /* ---- design tokens: light base, dark via media + explicit toggle ---- */
+  :root {
+    --bg: #eef1f6; --panel: #ffffff; --panel-2: #f5f7fb; --raise: #ffffff;
+    --line: #dde3ec; --line-2: #c6cfdd;
+    --ink: #14202f; --ink-2: #46566d; --muted: #8391a6;
+    --accent: #0c8b9c; --accent-2: #0aa1b6; --accent-ink: #06616e;
+    --good: #2c8a60; --warn: #a9781f; --crit: #ce4a40;
+    --good-2: #2c8a60; --warn-2: #a9781f; --crit-2: #ce4a40;
+    --grid: #e6ebf2;
+    --shadow: 0 1px 2px rgba(20,32,47,.06), 0 6px 20px rgba(20,32,47,.06);
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
+    --ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b1019; --panel: #141b28; --panel-2: #1a2231; --raise: #1e283a;
+      --line: #26324a; --line-2: #37475f;
+      --ink: #e8eef7; --ink-2: #9fb1c8; --muted: #647389;
+      --accent: #37b6c4; --accent-2: #63d6e2; --accent-ink: #8fe6f0;
+      --good: #56bd8b; --warn: #e0a83e; --crit: #e56b5f;
+      --good-2: #56bd8b; --warn-2: #e0a83e; --crit-2: #e56b5f;
+      --grid: #1e2941;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #eef1f6; --panel: #ffffff; --panel-2: #f5f7fb; --raise: #ffffff;
+    --line: #dde3ec; --line-2: #c6cfdd;
+    --ink: #14202f; --ink-2: #46566d; --muted: #8391a6;
+    --accent: #0c8b9c; --accent-2: #0aa1b6; --accent-ink: #06616e;
+    --good: #2c8a60; --warn: #a9781f; --crit: #ce4a40;
+    --grid: #e6ebf2;
+    --shadow: 0 1px 2px rgba(20,32,47,.06), 0 6px 20px rgba(20,32,47,.06);
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b1019; --panel: #141b28; --panel-2: #1a2231; --raise: #1e283a;
+    --line: #26324a; --line-2: #37475f;
+    --ink: #e8eef7; --ink-2: #9fb1c8; --muted: #647389;
+    --accent: #37b6c4; --accent-2: #63d6e2; --accent-ink: #8fe6f0;
+    --good: #56bd8b; --warn: #e0a83e; --crit: #e56b5f;
+    --grid: #1e2941;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.28);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--ui); font-size: 14px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  h1, h2, h3 { margin: 0; font-weight: 600; }
+  .wrap { max-width: 1500px; margin: 0 auto; padding: 0 22px 44px; }
+
+  /* ---- top status bar ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 40; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar-in {
+    max-width: 1500px; margin: 0 auto; padding: 11px 22px;
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand .logo {
+    font-family: var(--mono); font-weight: 700; font-size: 17px; letter-spacing: -.03em;
+    color: var(--ink);
+  }
+  .brand .logo .flow { color: var(--accent); }
+  .brand .tag {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .coord {
+    display: flex; align-items: center; gap: 14px; font-family: var(--mono); font-size: 12px;
+    color: var(--ink-2);
+  }
+  .coord .k { color: var(--muted); }
+  .coord .sep { width: 1px; height: 15px; background: var(--line-2); }
+  .spacer { flex: 1 1 auto; }
+  .live {
+    display: inline-flex; align-items: center; gap: 7px; font-family: var(--mono);
+    font-size: 12px; color: var(--ink-2);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 0 var(--good); }
+  .dot.pulse { animation: pulse 2.4s ease-out infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 55%, transparent); }
+    70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; }
+  }
+  .ro-chip {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--warn); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    padding: 3px 8px; border-radius: 5px;
+  }
+  .tbtn {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-2); cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 10px; display: inline-flex; gap: 7px; align-items: center;
+  }
+  .tbtn:hover { border-color: var(--line-2); color: var(--ink); }
+  .clock { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+
+  /* ---- KPI strip ---- */
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin: 20px 0; }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 14px 11px; position: relative; overflow: hidden; box-shadow: var(--shadow);
+  }
+  .kpi .label {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); display: flex; align-items: center; gap: 6px;
+  }
+  .kpi .val { font-family: var(--mono); font-size: 25px; font-weight: 600; letter-spacing: -.02em; margin-top: 5px; color: var(--ink); }
+  .kpi .val .u { font-size: 13px; color: var(--ink-2); font-weight: 500; margin-left: 3px; }
+  .kpi .sub { font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin-top: 2px; }
+  .kpi .spark { position: absolute; right: 10px; bottom: 8px; width: 74px; height: 26px; opacity: .9; }
+  .kpi.alert { border-color: color-mix(in srgb, var(--crit) 42%, var(--line)); }
+  .kpi.alert .val { color: var(--crit); }
+  .kpi .stripe { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); }
+  .kpi.alert .stripe { background: var(--crit); }
+  .kpi.good .stripe { background: var(--good); }
+
+  /* ---- layout grid ---- */
+  .grid { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+  .panel > .head {
+    display: flex; align-items: center; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--line);
+  }
+  .panel > .head h2 { font-size: 13.5px; letter-spacing: -.01em; }
+  .panel > .head .eyebrow {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+  }
+  .panel > .body { padding: 6px 8px 12px; }
+
+  /* ---- job list ---- */
+  .jrow {
+    display: grid; grid-template-columns: 14px minmax(140px,1.4fr) 96px 1fr 92px; gap: 12px;
+    align-items: center; padding: 10px 12px; border-radius: 9px; cursor: pointer; position: relative;
+  }
+  .jrow:hover { background: var(--panel-2); }
+  .jrow.sel { background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--line-2); }
+  .jrow .sev { width: 4px; height: 30px; border-radius: 3px; background: var(--line-2); }
+  .jrow.run .sev { background: var(--accent); } .jrow.done .sev { background: var(--good); }
+  .jrow.pause .sev { background: var(--warn); } .jrow.attn .sev { background: var(--crit); }
+  .jname { font-family: var(--mono); font-size: 13px; color: var(--ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .jmeta { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+  .prog { height: 6px; background: var(--panel-2); border-radius: 4px; overflow: hidden; border: 1px solid var(--line); }
+  .prog > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .prog.gdone > i { background: var(--good); }
+  .jr-right { font-family: var(--mono); font-size: 11px; color: var(--ink-2); text-align: right; }
+
+  .pill {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+    padding: 2.5px 7px; border-radius: 20px; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+    border: 1px solid transparent;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.run { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+  .pill.done { color: var(--good); background: color-mix(in srgb, var(--good) 13%, transparent); border-color: color-mix(in srgb, var(--good) 30%, transparent); }
+  .pill.pause { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); border-color: color-mix(in srgb, var(--warn) 32%, transparent); }
+  .pill.attn { color: var(--crit); background: color-mix(in srgb, var(--crit) 14%, transparent); border-color: color-mix(in srgb, var(--crit) 32%, transparent); }
+  .pill.mut { color: var(--muted); background: color-mix(in srgb, var(--muted) 13%, transparent); border-color: color-mix(in srgb, var(--muted) 26%, transparent); }
+  .pill.plain::before { display: none; }
+
+  /* ---- selected job detail ---- */
+  .detail { border-top: 1px solid var(--line); margin-top: 6px; padding: 15px 16px 6px; }
+  .detail .dhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  .detail .dhead .jn { font-family: var(--mono); font-size: 15px; font-weight: 700; }
+  .detail .dhead .acts { margin-left: auto; display: flex; gap: 7px; }
+  .abtn {
+    font-family: var(--mono); font-size: 11px; padding: 4px 9px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); cursor: not-allowed;
+  }
+  .dgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 16px; margin: 12px 0 4px; }
+  .dstat .l { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+  .dstat .v { font-family: var(--mono); font-size: 16px; color: var(--ink); margin-top: 2px; }
+  .dstat .v small { font-size: 11px; color: var(--ink-2); }
+
+  .sect-l { font-family: var(--mono); font-size: 10px; letter-spacing: .13em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; display: flex; align-items: center; gap: 8px; }
+  .sect-l::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+  /* convergence chart */
+  .conv { display: flex; align-items: flex-end; gap: 20px; height: 132px; padding: 6px 4px 0; }
+  .cbar { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 0; height: 100%; justify-content: flex-end; min-width: 0; }
+  .cbar .cval { font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin-bottom: 6px; }
+  .cbar .bar { width: 100%; max-width: 54px; border-radius: 5px 5px 0 0; background: linear-gradient(180deg, var(--accent-2), var(--accent)); position: relative; transition: height .5s cubic-bezier(.2,.7,.2,1); }
+  .cbar.proj .bar { background: repeating-linear-gradient(135deg, color-mix(in srgb,var(--accent) 26%, transparent) 0 6px, transparent 6px 12px); border: 1px dashed color-mix(in srgb,var(--accent) 55%, transparent); }
+  .cbar .clab { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 7px; text-align: center; }
+  .cbar .clab b { color: var(--ink-2); font-weight: 600; display: block; }
+
+  /* pass table */
+  .tbl-wrap { overflow-x: auto; }
+  table.pt { width: 100%; border-collapse: collapse; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  table.pt th { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); text-align: right; padding: 6px 10px; font-weight: 500; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  table.pt th:first-child, table.pt td:first-child { text-align: left; }
+  table.pt th.l, table.pt td.l { text-align: left; }
+  table.pt td { font-size: 12px; padding: 8px 10px; text-align: right; color: var(--ink-2); border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  table.pt td .pf { color: var(--ink); }
+  table.pt tr.tot td { border-top: 2px solid var(--line-2); border-bottom: none; color: var(--ink); font-weight: 600; padding-top: 9px; }
+  table.pt tr.tot td:first-child { letter-spacing: .08em; text-transform: uppercase; font-size: 10px; color: var(--muted); }
+  .cell-crit { color: var(--crit) !important; } .cell-good { color: var(--good) !important; } .cell-warn { color: var(--warn) !important; }
+
+  /* throughput timeline */
+  .tl-wrap { padding: 10px 12px 14px; }
+  .tl-top { display: flex; align-items: baseline; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+  .tl-big { font-family: var(--mono); font-size: 27px; font-weight: 600; color: var(--ink); letter-spacing: -.02em; }
+  .tl-big .u { font-size: 13px; color: var(--ink-2); font-weight: 500; }
+  .tl-leg { font-family: var(--mono); font-size: 11px; color: var(--muted); display: flex; gap: 14px; margin-left: auto; }
+  .tl-leg span { display: inline-flex; align-items: center; gap: 6px; }
+  .tl-leg i { width: 14px; height: 3px; border-radius: 2px; background: var(--accent); display: inline-block; }
+  canvas { display: block; width: 100%; }
+
+  /* ---- fleet table ---- */
+  .fleet-wrap { overflow-x: auto; }
+  table.ft { width: 100%; border-collapse: collapse; font-family: var(--mono); font-variant-numeric: tabular-nums; min-width: 460px; }
+  table.ft th { font-size: 9px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); font-weight: 500; text-align: right; padding: 8px 9px; border-bottom: 1px solid var(--line); }
+  table.ft th:first-child, table.ft td:first-child { text-align: left; }
+  table.ft td { font-size: 11.5px; padding: 9px; text-align: right; color: var(--ink-2); border-bottom: 1px solid var(--grid); }
+  table.ft tr:hover td { background: var(--panel-2); }
+  table.ft tr.drained td { opacity: .62; }
+  .ag { display: flex; flex-direction: column; gap: 1px; }
+  .ag .id { font-size: 12px; color: var(--ink); font-weight: 600; }
+  .ag .host { font-size: 10px; color: var(--muted); }
+  .tp { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .tp .bar { width: 46px; height: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .tp .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .st-dot { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--ink-2); }
+  .st-dot::before { content:""; width:7px;height:7px;border-radius:50%; background: var(--good); }
+  .st-dot.off::before { background: var(--muted); }
+  .st-dot.warn::before { background: var(--warn); }
+
+  /* queue composition */
+  .qbar { display: flex; height: 26px; border-radius: 7px; overflow: hidden; border: 1px solid var(--line); }
+  .qseg { height: 100%; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 10px; color: #fff; min-width: 2px; }
+  .qseg.q { background: var(--accent); } .qseg.l { background: color-mix(in srgb, var(--accent) 55%, var(--warn)); }
+  .qseg.d { background: color-mix(in srgb, var(--good) 78%, black); } .qseg.p { background: var(--crit); }
+  .qleg { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+  .qleg span { display: inline-flex; align-items: center; gap: 6px; } .qleg i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .qleg .q i { background: var(--accent); } .qleg .l i { background: color-mix(in srgb, var(--accent) 55%, var(--warn)); }
+  .qleg .d i { background: color-mix(in srgb, var(--good) 78%, black); } .qleg .p i { background: var(--crit); }
+
+  /* parked + events */
+  .parked { display: flex; flex-direction: column; gap: 7px; padding: 4px 4px 0; }
+  .park {
+    display: grid; grid-template-columns: 6px 1fr auto; gap: 10px; align-items: center;
+    padding: 9px 11px; border-radius: 8px; background: color-mix(in srgb, var(--crit) 8%, var(--panel-2));
+    border: 1px solid color-mix(in srgb, var(--crit) 26%, var(--line));
+  }
+  .park .s { width: 5px; height: 26px; border-radius: 3px; background: var(--crit); }
+  .park .pinf { font-family: var(--mono); font-size: 11px; color: var(--ink); }
+  .park .pinf small { color: var(--muted); }
+  .park .why { font-family: var(--mono); font-size: 10px; color: var(--crit); }
+
+  .feed { display: flex; flex-direction: column; }
+  .ev { display: grid; grid-template-columns: 62px 16px 1fr; gap: 9px; align-items: baseline; padding: 6px 6px; border-bottom: 1px solid var(--grid); font-family: var(--mono); font-size: 11px; }
+  .ev:last-child { border-bottom: none; }
+  .ev .t { color: var(--muted); font-size: 10.5px; }
+  .ev .m { width: 8px; height: 8px; border-radius: 2px; margin-top: 3px; background: var(--accent); }
+  .ev .m.good { background: var(--good); } .ev .m.warn { background: var(--warn); } .ev .m.crit { background: var(--crit); }
+  .ev .x { color: var(--ink-2); } .ev .x b { color: var(--ink); font-weight: 600; }
+
+  .foot { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11px; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+
+  /* ---- nav tabs ---- */
+  .nav { display: flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 3px; }
+  .nav button { font-family: var(--mono); font-size: 12px; color: var(--ink-2); background: transparent; border: none; padding: 5px 11px; border-radius: 6px; cursor: pointer; display: inline-flex; gap: 7px; align-items: center; }
+  .nav button:hover { color: var(--ink); }
+  .nav button.on { background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
+  .nav .badge { font-family: var(--mono); font-size: 9px; background: var(--crit); color: #fff; border-radius: 10px; padding: 1px 5px; line-height: 1.5; }
+
+  /* ---- queue page ---- */
+  table.ft th.l, table.ft td.l { text-align: left; }
+  .kbar { display: flex; flex-direction: column; gap: 11px; }
+  .krow { display: grid; grid-template-columns: 78px 1fr 66px; gap: 10px; align-items: center; font-family: var(--mono); font-size: 11.5px; }
+  .krow .kn { color: var(--ink-2); }
+  .krow .kb { height: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .krow .kb > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .krow .kc { text-align: right; color: var(--ink); }
+  .qshards { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .mini-bar { width: 52px; height: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .mini-bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .path { color: var(--ink-2); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attempts { color: var(--crit); font-weight: 600; }
+  .errpill { font-family: var(--mono); font-size: 10px; padding: 2px 7px; border-radius: 5px; color: var(--crit); background: color-mix(in srgb, var(--crit) 13%, transparent); border: 1px solid color-mix(in srgb, var(--crit) 30%, transparent); }
+  .park-acts { display: inline-flex; gap: 5px; justify-content: flex-end; }
+
+  /* filters */
+  .filters { display: flex; gap: 18px; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .fgroup { display: flex; align-items: center; gap: 8px; }
+  .fgroup .fl { font-family: var(--mono); font-size: 10px; letter-spacing: .11em; text-transform: uppercase; color: var(--muted); }
+  .chips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .chip { font-family: var(--mono); font-size: 11px; color: var(--ink-2); background: var(--panel-2); border: 1px solid var(--line); border-radius: 20px; padding: 3px 11px; cursor: pointer; }
+  .chip:hover { border-color: var(--line-2); color: var(--ink); }
+  .chip.on { background: color-mix(in srgb, var(--accent) 15%, transparent); border-color: color-mix(in srgb, var(--accent) 48%, transparent); color: var(--accent); }
+  .fcount { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+  /* clickable parked rows + landing flash */
+  tr.clickable { cursor: pointer; }
+  #parkedtb tr.clickable:hover td { background: color-mix(in srgb, var(--crit) 10%, var(--panel-2)); }
+  .gojob { color: var(--muted); font-size: 11px; margin-left: 5px; }
+  .gojob.h { opacity: 0; transition: opacity .12s ease; }
+  tr.clickable:hover .gojob { color: var(--accent); }
+  tr.clickable:hover .gojob.h { opacity: 1; }
+  @keyframes detailflash { 0% { box-shadow: inset 0 0 0 2px var(--accent); } 100% { box-shadow: inset 0 0 0 2px transparent; } }
+  .detail.flash { animation: detailflash 1.5s ease-out; }
+  @media (prefers-reduced-motion: reduce) { .detail.flash { animation: none; } }
+
+  @media (max-width: 1120px) {
+    .grid { grid-template-columns: 1fr !important; }
+    .kpis { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 720px) {
+    .kpis { grid-template-columns: repeat(2, 1fr); }
+    .coord { display: none; }
+    .dgrid { grid-template-columns: repeat(2,1fr); }
+  }
+  @media (prefers-reduced-motion: reduce) { .dot.pulse { animation: none; } .cbar .bar { transition: none; } }
+  :focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-in">
+    <div class="brand">
+      <span class="logo">dr<span class="flow">sync</span></span>
+      <span class="tag">cluster console</span>
+    </div>
+    <nav class="nav" aria-label="Views">
+      <button data-v="overview" class="on">▤ overview</button>
+      <button data-v="queue">▦ queue &amp; shards <span class="badge" id="nav-park">3</span></button>
+    </nav>
+    <div class="coord">
+      <span><span class="k">coordinator</span> coord-01.store.corp:7441</span>
+      <span class="sep"></span>
+      <span><span class="k">fleet epoch</span> a3f81c</span>
+      <span class="sep"></span>
+      <span><span class="k">lease ttl</span> 30s</span>
+      <span class="sep"></span>
+      <span><span class="k">mTLS</span> on</span>
+    </div>
+    <span class="spacer"></span>
+    <span class="ro-chip" title="Phase 1 is read-only. Job &amp; agent controls arrive in Phase 2.">read-only</span>
+    <span class="live"><span class="dot pulse"></span> live · <span id="hz">1&#8202;Hz</span></span>
+    <span class="clock mono" id="clock">--:--:--</span>
+    <button class="tbtn" id="theme" aria-label="Toggle color theme"><span id="theme-i">◐</span> theme</button>
+  </div>
+</header>
+
+<div class="wrap">
+
+ <div id="view-overview">
+  <!-- KPI summary strip -->
+  <section class="kpis" aria-label="Cluster summary">
+    <div class="kpi good"><span class="stripe"></span>
+      <div class="label">active jobs</div>
+      <div class="val" id="k-jobs">3<span class="u">/ 5</span></div>
+      <div class="sub">2 converging · 1 scanning</div>
+    </div>
+    <div class="kpi good"><span class="stripe"></span>
+      <div class="label">agents online</div>
+      <div class="val" id="k-agents">6<span class="u">/ 7</span></div>
+      <div class="sub">1 drained</div>
+    </div>
+    <div class="kpi"><span class="stripe"></span>
+      <div class="label">throughput</div>
+      <div class="val" id="k-bw">4.7<span class="u">GiB/s</span></div>
+      <svg class="spark" id="sp-bw" viewBox="0 0 74 26" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="kpi"><span class="stripe"></span>
+      <div class="label">files / sec</div>
+      <div class="val" id="k-files">128<span class="u">k/s</span></div>
+      <svg class="spark" id="sp-files" viewBox="0 0 74 26" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="kpi"><span class="stripe"></span>
+      <div class="label">scan rate</div>
+      <div class="val" id="k-scan">1.02<span class="u">M/s</span></div>
+      <svg class="spark" id="sp-scan" viewBox="0 0 74 26" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="kpi alert"><span class="stripe"></span>
+      <div class="label">parked shards</div>
+      <div class="val" id="k-park">3</div>
+      <div class="sub">across 2 jobs · see queue</div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <!-- MAIN COLUMN -->
+    <div class="col">
+      <section class="panel">
+        <div class="head">
+          <h2>Jobs</h2><span class="eyebrow">migration lifecycle</span>
+          <span class="spacer" style="flex:1"></span>
+          <span class="eyebrow" id="job-hint">select a job for detail</span>
+        </div>
+        <div class="body" id="joblist"></div>
+        <div class="detail" id="detail"></div>
+      </section>
+
+      <section class="panel">
+        <div class="head"><h2>Aggregate throughput</h2><span class="eyebrow">bytes copied · fleet-wide · 90s</span></div>
+        <div class="tl-wrap">
+          <div class="tl-top">
+            <div class="tl-big"><span id="tl-now">4.7</span> <span class="u">GiB/s</span></div>
+            <div class="tl-leg"><span><i></i> bytes/s</span><span id="tl-peak">peak 6.1 GiB/s</span></div>
+          </div>
+          <canvas id="tl" height="150" aria-label="Aggregate throughput timeline"></canvas>
+        </div>
+      </section>
+    </div>
+
+    <!-- RAIL COLUMN -->
+    <div class="col">
+      <section class="panel">
+        <div class="head"><h2>Fleet</h2><span class="eyebrow">agent performance</span>
+          <span class="spacer" style="flex:1"></span>
+          <span class="eyebrow" id="fleet-hb">avg hb 1.1s</span>
+        </div>
+        <div class="body fleet-wrap">
+          <table class="ft" aria-label="Agent performance">
+            <thead><tr>
+              <th>agent</th><th>scan /s</th><th>files /s</th><th>throughput</th><th>rss</th><th>hb</th>
+            </tr></thead>
+            <tbody id="fleet"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="head"><h2>Attention</h2><span class="eyebrow">queue · parked · events</span></div>
+        <div class="body">
+          <div class="sect-l" style="margin-top:6px">shard queue — proj2-migration · pass 2</div>
+          <div class="qbar" id="qbar" role="img" aria-label="Shard queue composition"></div>
+          <div class="qleg">
+            <span class="q"><i></i> queued <b class="mono" id="q-q">241,880</b></span>
+            <span class="l"><i></i> leased <b class="mono" id="q-l">1,912</b></span>
+            <span class="d"><i></i> done <b class="mono" id="q-d">806,204</b></span>
+            <span class="p"><i></i> parked <b class="mono">2</b></span>
+          </div>
+
+          <div class="sect-l">parked shards</div>
+          <div class="parked">
+            <div class="park">
+              <div class="s"></div>
+              <div class="pinf">proj2-migration <small>· shard 88213 · entrylist</small><br><small>projects/legacy/scratch/…</small></div>
+              <div class="why">ESTALE ×5</div>
+            </div>
+            <div class="park">
+              <div class="s"></div>
+              <div class="pinf">proj2-migration <small>· shard 90471 · dir</small><br><small>home/u2231/.cache/…</small></div>
+              <div class="why">EACCES ×5</div>
+            </div>
+          </div>
+
+          <div class="sect-l">event stream</div>
+          <div class="feed" id="feed"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+ </div><!-- /view-overview -->
+
+ <div id="view-queue" hidden>
+  <section class="kpis" aria-label="Queue summary">
+    <div class="kpi"><span class="stripe"></span><div class="label">queued</div><div class="val" id="qk-q">252,904</div><div class="sub">awaiting a grant</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">leased</div><div class="val" id="qk-l">2,046</div><div class="sub">in flight on agents</div></div>
+    <div class="kpi good"><span class="stripe"></span><div class="label">done · cycle</div><div class="val" id="qk-d">852,186</div><div class="sub">completed this pass</div></div>
+    <div class="kpi alert"><span class="stripe"></span><div class="label">parked</div><div class="val" id="qk-p">3</div><div class="sub">need operator action</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">lease requeues</div><div class="val">41</div><div class="sub">expired &amp; retried</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">avg attempts</div><div class="val">1.03</div><div class="sub">max 5 → park</div></div>
+  </section>
+
+  <div class="grid">
+    <div class="col">
+      <section class="panel">
+        <div class="head"><h2>Shard queue</h2><span class="eyebrow">depth by job · pass · kind · state</span>
+          <span class="spacer" style="flex:1"></span><span class="eyebrow" id="q-updated">live · 1&#8202;Hz</span></div>
+        <div class="filters" id="qfilters"></div>
+        <div class="body fleet-wrap">
+          <table class="ft" style="min-width:540px" aria-label="Queue depth">
+            <thead><tr><th class="l">job</th><th class="l">pass</th><th class="l">kind</th><th class="l">state</th><th>shards</th></tr></thead>
+            <tbody id="qdepth"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    <div class="col">
+      <section class="panel">
+        <div class="head"><h2>Work by kind</h2><span class="eyebrow">queued shards</span></div>
+        <div class="body" style="padding:15px 16px"><div class="kbar" id="bykind"></div></div>
+      </section>
+      <section class="panel">
+        <div class="head"><h2>State mix</h2><span class="eyebrow">all active passes</span></div>
+        <div class="body" style="padding:15px 16px">
+          <div class="qbar" id="qbar2" role="img" aria-label="Shard state composition"></div>
+          <div class="qleg">
+            <span class="q"><i></i> queued <b class="mono" id="sm-q"></b></span>
+            <span class="l"><i></i> leased <b class="mono" id="sm-l"></b></span>
+            <span class="d"><i></i> done <b class="mono" id="sm-d"></b></span>
+            <span class="p"><i></i> parked <b class="mono" id="sm-p"></b></span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <section class="panel" style="margin-top:16px">
+    <div class="head"><h2>Parked shards</h2><span class="eyebrow">poison-guarded at 5 attempts</span>
+      <span class="spacer" style="flex:1"></span>
+      <span class="ro-chip" title="Phase 2 — retry re-queues the shard; drop accepts the gap.">phase 2 · retry / drop</span></div>
+    <div class="body fleet-wrap">
+      <table class="ft" style="min-width:760px" aria-label="Parked shards">
+        <thead><tr><th class="l">shard</th><th class="l">job · pass</th><th class="l">kind</th><th class="l">path</th><th>attempts</th><th class="l">error</th><th class="l">last agent</th><th>age</th><th>actions</th></tr></thead>
+        <tbody id="parkedtb"></tbody>
+      </table>
+    </div>
+  </section>
+ </div><!-- /view-queue -->
+
+  <div class="foot">
+    <span>drsync console · phase 1 (read-only)</span>
+    <span>data via <b>/api/v1/events</b> (WebSocket) + <b>/metrics</b></span>
+    <span style="margin-left:auto" id="foot-upd">updated just now</span>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const $ = s => document.querySelector(s);
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  // ---------- theme ----------
+  const themeBtn = $("#theme");
+  themeBtn.addEventListener("click", () => {
+    const cur = document.documentElement.getAttribute("data-theme")
+      || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+    drawTL(); drawSparks();
+  });
+
+  // ---------- clock ----------
+  const clock = $("#clock");
+  const tickClock = () => { clock.textContent = new Date().toTimeString().slice(0,8) + " UTC"; };
+  tickClock();
+
+  // ---------- number helpers ----------
+  const comma = n => Math.round(n).toLocaleString("en-US");
+  const fnum = (n, d=1) => n.toFixed(d);
+
+  // ---------- model: jobs ----------
+  const jobs = [
+    { id:"proj2-migration", cls:"run attn", state:["run","scanning"], pass:"pass 2 · scanning",
+      meta:"1.21B walked · 88.1M copied this pass", prog:72, right:"3h 10m",
+      sel:true,
+      stats:[["walked","1.21","B"],["copied","490","M"],["data","1.63","PiB"],["orphans","3.2","M"]],
+      conv:[ {p:"pass 1", d:402, l:"402M Δfiles"}, {p:"pass 2", d:88, l:"88M Δfiles"}, {p:"pass 3", d:6, l:"~6M proj.", proj:true} ],
+      rows:[
+        ["1","complete","14h 20m","402,110,884","1.40 PiB","3,201,447","402.1M ok","261",""],
+        ["2","scanning","3h 10m ·","88,144,020","240 TiB","—","88.1M ok","56","run"],
+      ],
+      tot:["17h 30m","490,254,904","1.63 PiB","—","490.2M ok","317"] },
+    { id:"home-dirs", cls:"run", state:["run","dirfix"], pass:"pass 4 · dirfix",
+      meta:"312M walked · near converged", prog:96, right:"22m",
+      stats:[["walked","312","M"],["copied","41.8","M"],["data","96","TiB"],["orphans","118","k"]],
+      conv:[ {p:"pass 1",d:31,l:"31M"},{p:"pass 2",d:8.4,l:"8.4M"},{p:"pass 3",d:1.1,l:"1.1M"},{p:"pass 4",d:0.09,l:"90k"} ],
+      rows:[
+        ["1","complete","6h 02m","31,004,112","78 TiB","2,004,551","31.0M ok","44",""],
+        ["2","complete","1h 40m","8,401,220","14 TiB","—","8.4M ok","9",""],
+        ["3","complete","28m","1,100,940","3.1 TiB","—","1.1M ok","2",""],
+        ["4","dirfix","22m ·","90,441","210 GiB","—","90.4k ok","0","run"],
+      ],
+      tot:["8h 32m","40,596,713","95.3 TiB","—","40.6M ok","55"] },
+    { id:"weka-scratch", cls:"run", state:["run","scanning"], pass:"pass 1 · scanning",
+      meta:"just started · 4.1M walked", prog:6, right:"2m",
+      stats:[["walked","4.1","M"],["copied","902","k"],["data","1.2","TiB"],["orphans","0",""]],
+      conv:[ {p:"pass 1",d:0.9,l:"902k so far",proj:false} ],
+      rows:[ ["1","scanning","2m ·","902,410","1.2 TiB","—","0","3","run"] ],
+      tot:["2m","902,410","1.2 TiB","—","0","3"] },
+    { id:"archive-2019", cls:"done", state:["done","complete"], pass:"converged · pass 3",
+      meta:"verify clean · sign-off ready", prog:100, right:"done",
+      stats:[["walked","880","M"],["copied","512","M"],["data","2.10","PiB"],["orphans","0",""]],
+      conv:[ {p:"pass 1",d:512,l:"512M"},{p:"pass 2",d:14,l:"14M"},{p:"pass 3",d:0,l:"0 — converged"} ],
+      rows:[
+        ["1","complete","41h 12m","512,004,110","2.02 PiB","0","512.0M ok","1,204",""],
+        ["2","complete","5h 30m","14,200,540","82 TiB","0","14.2M ok","31",""],
+        ["3","complete","3h 04m","0","0 B","0","526.2M ok","0",""],
+      ],
+      tot:["49h 46m","526,204,650","2.10 PiB","0","526.2M ok","1,235"] },
+    { id:"legacy-nfs", cls:"pause", state:["pause","paused"], pass:"pass 2 · paused",
+      meta:"paused by operator · 14:02", prog:38, right:"paused",
+      stats:[["walked","96","M"],["copied","30.1","M"],["data","44","TiB"],["orphans","512","k"]],
+      conv:[ {p:"pass 1",d:24,l:"24M"},{p:"pass 2",d:6.1,l:"6.1M (partial)",proj:true} ],
+      rows:[
+        ["1","complete","9h 10m","24,110,004","40 TiB","512,004","24.1M ok","88",""],
+        ["2","paused","2h 01m","6,010,441","4 TiB","—","6.0M ok","20","pause"],
+      ],
+      tot:["11h 11m","30,120,445","44 TiB","—","30.1M ok","108"] },
+  ];
+
+  // ---------- render job list ----------
+  const stateLabel = { run:"running", done:"completed", pause:"paused", attn:"attention", scanning:"scanning", dirfix:"dirfix", complete:"complete", paused:"paused" };
+  const joblist = $("#joblist");
+  jobs.forEach((j, i) => {
+    const row = document.createElement("div");
+    const sevcls = j.cls.split(" ").pop();
+    row.className = "jrow " + sevcls + (j.sel ? " sel" : "");
+    row.tabIndex = 0; row.setAttribute("role","button");
+    const pillState = j.state[0];
+    row.innerHTML = `
+      <div class="sev"></div>
+      <div><div class="jname">${j.id}</div><div class="jmeta">${j.meta}</div></div>
+      <div><span class="pill ${pillState}">${stateLabel[pillState]}</span></div>
+      <div><div class="jmeta" style="margin-bottom:5px">${j.pass}</div>
+           <div class="prog ${j.cls.includes('done')?'gdone':''}"><i style="width:${j.prog}%"></i></div></div>
+      <div class="jr-right">${j.right}</div>`;
+    row.addEventListener("click", () => select(i));
+    row.addEventListener("keydown", e => { if (e.key==="Enter"||e.key===" ") { e.preventDefault(); select(i); } });
+    joblist.appendChild(row);
+    j._el = row;
+  });
+
+  let selIdx = jobs.findIndex(j => j.sel);
+  function select(i) {
+    jobs.forEach(j => j._el.classList.remove("sel"));
+    jobs[i]._el.classList.add("sel");
+    selIdx = i; renderDetail(jobs[i]);
+  }
+
+  // ---------- render detail ----------
+  const detail = $("#detail");
+  const cellClass = (h, v) => {
+    if (h==="errors" && v!=="0" && v!=="—") return "cell-warn";
+    if (h==="verify" && String(v).includes("FAIL")) return "cell-crit";
+    return "";
+  };
+  function renderDetail(j) {
+    const maxConv = Math.max(...j.conv.map(c => c.d), 0.001);
+    const bars = j.conv.map(c => {
+      const h = Math.max(4, (c.d / maxConv) * 100);
+      return `<div class="cbar ${c.proj?'proj':''}">
+        <div class="cval">${c.l.split(" ")[0]}</div>
+        <div class="bar" style="height:${h}%"></div>
+        <div class="clab"><b>${c.p}</b></div></div>`;
+    }).join("");
+    const stat = j.stats.map(s => `<div class="dstat"><div class="l">${s[0]}</div><div class="v">${s[1]}<small>${s[2]?(" "+s[2]):""}</small></div></div>`).join("");
+    const rows = j.rows.map(r => {
+      const runTag = r[8] ? ` <span class="pill ${r[8]} plain" style="font-size:9px;padding:1px 6px">${r[8]==='run'?'live':r[8]}</span>` : "";
+      const errCls = (r[7]!=="0") ? "cell-warn" : "";
+      return `<tr>
+        <td class="l"><span class="pf">pass ${r[0]}</span>${runTag}</td>
+        <td class="l" style="color:var(--muted)">${r[1]}</td>
+        <td>${r[2]}</td><td>${r[3]}</td><td>${r[4]}</td>
+        <td>${r[5]}</td><td>${r[6]}</td><td class="${errCls}">${r[7]}</td></tr>`;
+    }).join("");
+    const t = j.tot;
+    detail.innerHTML = `
+      <div class="dhead">
+        <span class="jn">${j.id}</span>
+        <span class="pill ${j.state[0]}">${stateLabel[j.state[0]]}</span>
+        <span class="jmeta">${j.pass}</span>
+        <div class="acts">
+          <button class="abtn" disabled title="Phase 2 — write actions">⏸ pause</button>
+          <button class="abtn" disabled title="Phase 2 — write actions">✕ cancel</button>
+          <button class="abtn" disabled title="Phase 2 — write actions">⤓ report</button>
+        </div>
+      </div>
+      <div class="dgrid">${stat}</div>
+      <div class="sect-l">convergence — Δfiles per pass (fixpoint = 0)</div>
+      <div class="conv">${bars}</div>
+      <div class="sect-l">per-pass ledger</div>
+      <div class="tbl-wrap"><table class="pt">
+        <thead><tr><th class="l">pass</th><th class="l">phase</th><th>duration</th><th>Δ files</th><th>Δ bytes</th><th>orphans</th><th>verify</th><th>errors</th></tr></thead>
+        <tbody>${rows}
+          <tr class="tot"><td>total</td><td></td><td>${t[0]}</td><td>${t[1]}</td><td>${t[2]}</td><td>${t[3]}</td><td>${t[4]}</td><td class="${t[5]!=='0'?'cell-warn':''}">${t[5]}</td></tr>
+        </tbody></table></div>`;
+  }
+  renderDetail(jobs[selIdx]);
+
+  // ---------- fleet ----------
+  const agents = [
+    { id:"agent-01", host:"weka-io-1", scan:214, files:31.2, bw:1.12, rss:512, hb:0, st:"on" },
+    { id:"agent-02", host:"weka-io-2", scan:201, files:29.7, bw:1.04, rss:498, hb:1, st:"on" },
+    { id:"agent-03", host:"weka-io-3", scan:188, files:27.4, bw:0.98, rss:530, hb:0, st:"on" },
+    { id:"agent-04", host:"weka-io-4", scan:176, files:24.1, bw:0.86, rss:471, hb:2, st:"on" },
+    { id:"agent-05", host:"gpfs-gw-1", scan:129, files:9.8,  bw:0.51, rss:604, hb:1, st:"on" },
+    { id:"agent-06", host:"gpfs-gw-2", scan:112, files:8.4,  bw:0.44, rss:588, hb:3, st:"warn" },
+    { id:"agent-07", host:"weka-io-5", scan:0,   files:0,    bw:0,    rss:180, hb:1, st:"off", drained:true },
+  ];
+  const fleet = $("#fleet");
+  const bwMax = Math.max(...agents.map(a => a.bw));
+  function renderFleet() {
+    fleet.innerHTML = agents.map(a => {
+      const stcls = a.drained ? "off" : (a.st==="warn"?"warn":"");
+      const sttxt = a.drained ? "drained" : (a.st==="warn"?"lagging":"connected");
+      const pct = bwMax ? (a.bw / bwMax) * 100 : 0;
+      return `<tr class="${a.drained?'drained':''}">
+        <td><div class="ag"><span class="id">${a.id}</span><span class="host">${a.host} · <span class="st-dot ${stcls}">${sttxt}</span></span></div></td>
+        <td>${a.scan?comma(a.scan)+"k":"—"}</td>
+        <td>${a.files?fnum(a.files):"—"}k</td>
+        <td><div class="tp"><span>${a.bw?fnum(a.bw,2):"0.00"}</span><span style="color:var(--muted);font-size:10px">GiB/s</span><div class="bar"><i style="width:${pct}%"></i></div></div></td>
+        <td>${a.rss}<span style="color:var(--muted);font-size:9px"> MiB</span></td>
+        <td>${a.hb}s</td></tr>`;
+    }).join("");
+  }
+  renderFleet();
+
+  // ---------- queue bar ----------
+  function renderQueue(q, l, d, p) {
+    const tot = q+l+d+p;
+    $("#qbar").innerHTML =
+      `<div class="qseg q" style="width:${q/tot*100}%" title="queued ${comma(q)}"></div>`+
+      `<div class="qseg l" style="width:${Math.max(l/tot*100,1.5)}%" title="leased ${comma(l)}"></div>`+
+      `<div class="qseg d" style="width:${d/tot*100}%">${comma(d).length<9?comma(d):""}</div>`+
+      `<div class="qseg p" style="width:${Math.max(p/tot*100,1)}%" title="parked ${p}"></div>`;
+    $("#q-q").textContent = comma(q); $("#q-l").textContent = comma(l); $("#q-d").textContent = comma(d);
+  }
+  let qState = { q:241880, l:1912, d:806204, p:2 };
+  renderQueue(qState.q, qState.l, qState.d, qState.p);
+
+  // ---------- event feed ----------
+  const feed = $("#feed");
+  const seedEvents = [
+    ["12:04:07","good","<b>proj2-migration</b> pass 1 → complete"],
+    ["12:04:07","","<b>proj2-migration</b> pass 2 scanning started"],
+    ["12:03:51","warn","agent <b>weka-io-5</b> disabled — drained"],
+    ["12:02:19","crit","shard parked <b>proj2</b> #88213 — ESTALE"],
+    ["12:01:44","good","<b>home-dirs</b> verify 1.1M ok"],
+    ["12:00:12","","agent <b>gpfs-gw-2</b> reconnected · epoch a3f81c"],
+  ];
+  let evClock = 12*3600 + 4*60 + 7;
+  function renderFeed(list) {
+    feed.innerHTML = list.map(e => `<div class="ev"><span class="t">${e[0]}</span><span class="m ${e[1]}"></span><span class="x">${e[2]}</span></div>`).join("");
+  }
+  renderFeed(seedEvents);
+  const evPool = [
+    ["","<b>agent-03</b> granted 250k shard split"],
+    ["good","<b>home-dirs</b> pass 4 dirfix +90k"],
+    ["","<b>weka-scratch</b> walked 4.1M entries"],
+    ["good","<b>proj2</b> copied +2.1M files"],
+    ["warn","lease expired · requeued 3 shards"],
+    ["","<b>agent-01</b> heartbeat · rss 512 MiB"],
+  ];
+
+  // ---------- throughput timeline (canvas) ----------
+  const cv = $("#tl"); const ctx = cv.getContext("2d");
+  const N = 90; let series = [];
+  (function seed(){ let v=4.7; for(let i=0;i<N;i++){ v += (Math.random()-.5)*0.5; v=Math.max(2.4,Math.min(6.3,v)); series.push(v);} })();
+  let peak = Math.max(...series);
+  function sizeCanvas() {
+    const dpr = Math.min(devicePixelRatio||1, 2);
+    const w = cv.clientWidth, h = 150;
+    cv.width = w*dpr; cv.height = h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+    return {w,h};
+  }
+  function drawTL() {
+    const {w,h} = sizeCanvas();
+    ctx.clearRect(0,0,w,h);
+    const pad = {t:12,r:6,b:16,l:6};
+    const gw = w-pad.l-pad.r, gh = h-pad.t-pad.b;
+    const lo = 2, hi = 6.6;
+    const x = i => pad.l + (i/(N-1))*gw;
+    const y = v => pad.t + (1-(v-lo)/(hi-lo))*gh;
+    // grid
+    ctx.strokeStyle = css("--grid"); ctx.lineWidth = 1;
+    ctx.font = "10px ui-monospace, monospace"; ctx.fillStyle = css("--muted");
+    for (let g=2; g<=6; g+=2) {
+      ctx.beginPath(); ctx.moveTo(pad.l, y(g)); ctx.lineTo(w-pad.r, y(g)); ctx.stroke();
+      ctx.fillText(g+" GiB/s", pad.l+2, y(g)-3);
+    }
+    // area
+    const acc = css("--accent"), acc2 = css("--accent-2");
+    const grad = ctx.createLinearGradient(0,pad.t,0,h-pad.b);
+    grad.addColorStop(0, hexA(acc,0.34)); grad.addColorStop(1, hexA(acc,0.02));
+    ctx.beginPath(); ctx.moveTo(x(0), y(series[0]));
+    for (let i=1;i<N;i++) ctx.lineTo(x(i), y(series[i]));
+    ctx.lineTo(x(N-1), h-pad.b); ctx.lineTo(x(0), h-pad.b); ctx.closePath();
+    ctx.fillStyle = grad; ctx.fill();
+    // line
+    ctx.beginPath(); ctx.moveTo(x(0), y(series[0]));
+    for (let i=1;i<N;i++) ctx.lineTo(x(i), y(series[i]));
+    ctx.strokeStyle = acc; ctx.lineWidth = 2; ctx.lineJoin="round"; ctx.stroke();
+    // endpoint
+    const ex = x(N-1), ey = y(series[N-1]);
+    ctx.beginPath(); ctx.arc(ex,ey,6,0,7); ctx.fillStyle = hexA(acc2,0.22); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex,ey,3.2,0,7); ctx.fillStyle = acc2; ctx.fill();
+  }
+  function hexA(hex, a) {
+    hex = hex.replace('#',''); if (hex.length===3) hex = hex.split('').map(c=>c+c).join('');
+    const n = parseInt(hex,16); return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+  }
+  addEventListener("resize", drawTL); drawTL();
+
+  // ---------- sparklines ----------
+  const sparks = {
+    "sp-bw": { el:$("#sp-bw"), data: series.slice(-20).map(v=>v/6.6) },
+    "sp-files": { el:$("#sp-files"), data: Array.from({length:20},(_,i)=>0.4+0.4*Math.sin(i/3)+Math.random()*0.1) },
+    "sp-scan": { el:$("#sp-scan"), data: Array.from({length:20},(_,i)=>0.5+0.3*Math.cos(i/4)+Math.random()*0.1) },
+  };
+  function drawSparks() {
+    const acc = css("--accent"), acc2 = css("--accent-2");
+    for (const k in sparks) {
+      const s = sparks[k], d = s.data, n = d.length, W=74, H=26, pad=3;
+      const pts = d.map((v,i)=>[pad+(i/(n-1))*(W-2*pad), H-pad-Math.max(0,Math.min(1,v))*(H-2*pad)]);
+      const line = pts.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ");
+      const [lx,ly] = pts[pts.length-1];
+      s.el.innerHTML =
+        `<polyline points="${line}" fill="none" stroke="${acc}" stroke-width="1.6" stroke-linejoin="round"/>`+
+        `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.1" fill="${acc2}"/>`;
+    }
+  }
+  drawSparks();
+
+  // ================= queue & parked-shards page =================
+  const kindLabel = { dir:"dir", entry_list:"entry-list", chunk:"chunk", dirfix:"dirfix", verify:"verify", "delete":"delete", probe:"probe" };
+  const stPill = { queued:"run", leased:"pause", done:"done", parked:"attn" };
+  const stOrder = { queued:0, leased:1, done:2, parked:3 };
+  // job, pass, kind, state, count  — mirrors GET /api/v1/queue "depth"
+  let queueRows = [
+    ["proj2-migration",2,"dir","queued",188402],
+    ["proj2-migration",2,"entry_list","queued",52140],
+    ["proj2-migration",2,"verify","queued",1338],
+    ["proj2-migration",2,"dir","leased",1740],
+    ["proj2-migration",2,"dir","done",806204],
+    ["proj2-migration",2,"dir","parked",2],
+    ["home-dirs",4,"dirfix","queued",1204],
+    ["home-dirs",4,"dirfix","leased",96],
+    ["home-dirs",4,"dirfix","done",41880],
+    ["home-dirs",4,"dirfix","parked",1],
+    ["weka-scratch",1,"dir","queued",9820],
+    ["weka-scratch",1,"dir","leased",210],
+    ["weka-scratch",1,"dir","done",4102],
+  ];
+  const parkedShards = [
+    { id:88213, job:"proj2-migration", pass:2, kind:"entry_list", path:"projects/legacy/scratch/nightly-2019", attempt:5, err:"ESTALE", agent:"weka-io-3", age:"41m" },
+    { id:90471, job:"proj2-migration", pass:2, kind:"dir", path:"home/u2231/.cache/chromium/Default/Cache", attempt:5, err:"EACCES", agent:"weka-io-1", age:"12m" },
+    { id:73118, job:"home-dirs", pass:4, kind:"dirfix", path:"shared/datasets/imagenet/train/n01530575", attempt:5, err:"EIO", agent:"gpfs-gw-1", age:"6m" },
+  ];
+  const Q = { qdepth:$("#qdepth"), bykind:$("#bykind"), parkedtb:$("#parkedtb"), qbar2:$("#qbar2"),
+    qkQ:$("#qk-q"), qkL:$("#qk-l"), qkD:$("#qk-d"), qkP:$("#qk-p"),
+    smQ:$("#sm-q"), smL:$("#sm-l"), smD:$("#sm-d"), smP:$("#sm-p") };
+  const stateTotals = () => { const t={queued:0,leased:0,done:0,parked:0}; queueRows.forEach(r=>t[r[3]]+=r[4]); return t; };
+
+  // ---- queue table filters (by job / by state) ----
+  const qFilter = { job:"all", state:"all" };
+  const jobNames = [...new Set(queueRows.map(r=>r[0]))];
+  const stateNames = ["queued","leased","done","parked"];
+  const chip = (k,v,label,on) => `<button class="chip ${on?'on':''}" data-fk="${k}" data-fv="${v}">${label}</button>`;
+  function buildFilters() {
+    const jc = ["all",...jobNames].map(j=>chip("job",j,j==="all"?"all jobs":j,qFilter.job===j)).join("");
+    const sc = ["all",...stateNames].map(s=>chip("state",s,s==="all"?"all":s,qFilter.state===s)).join("");
+    $("#qfilters").innerHTML =
+      `<div class="fgroup"><span class="fl">job</span><div class="chips">${jc}</div></div>`+
+      `<div class="fgroup"><span class="fl">state</span><div class="chips">${sc}</div></div>`+
+      `<span class="fcount" id="fcount"></span>`;
+  }
+  $("#qfilters").addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    qFilter[b.dataset.fk] = b.dataset.fv;
+    buildFilters(); renderQueuePage();
+  });
+  buildFilters();
+
+  function renderQueuePage() {
+    const filtered = queueRows.filter(r =>
+      (qFilter.job==="all"   || r[0]===qFilter.job) &&
+      (qFilter.state==="all" || r[3]===qFilter.state));
+    const rows = [...filtered].sort((a,b)=> a[0]<b[0]?-1 : a[0]>b[0]?1 : (a[1]-b[1])||(stOrder[a[3]]-stOrder[b[3]]));
+    const maxc = Math.max(...queueRows.map(r=>r[4]), 1);
+    Q.qdepth.innerHTML = rows.length ? rows.map(r=>`<tr data-job="${r[0]}" class="clickable" title="Open ${r[0]} detail">
+      <td class="l"><span style="color:var(--ink);font-weight:600">${r[0]}</span><span class="gojob h">↗</span></td>
+      <td class="l" style="color:var(--muted)">pass ${r[1]}</td>
+      <td class="l">${kindLabel[r[2]]}</td>
+      <td class="l"><span class="pill ${stPill[r[3]]}">${r[3]}</span></td>
+      <td><div class="qshards"><span>${comma(r[4])}</span><span class="mini-bar"><i style="width:${r[4]/maxc*100}%"></i></span></div></td></tr>`).join("")
+      : `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:22px">no shards match this filter</td></tr>`;
+    const fc = document.getElementById("fcount");
+    if (fc) { const sh = filtered.reduce((s,r)=>s+r[4],0); fc.textContent = `${rows.length} row${rows.length===1?"":"s"} · ${comma(sh)} shards`; }
+
+    const byk = {};
+    queueRows.filter(r=>r[3]==="queued").forEach(r=> byk[r[2]] = (byk[r[2]]||0)+r[4]);
+    const kmax = Math.max(...Object.values(byk),1);
+    Q.bykind.innerHTML = Object.entries(byk).sort((a,b)=>b[1]-a[1]).map(([k,v])=>
+      `<div class="krow"><span class="kn">${kindLabel[k]}</span><span class="kb"><i style="width:${v/kmax*100}%"></i></span><span class="kc">${comma(v)}</span></div>`).join("");
+
+    const t = stateTotals(), sum = t.queued+t.leased+t.done+t.parked;
+    Q.qbar2.innerHTML =
+      `<div class="qseg q" style="width:${t.queued/sum*100}%" title="queued ${comma(t.queued)}"></div>`+
+      `<div class="qseg l" style="width:${Math.max(t.leased/sum*100,1)}%" title="leased ${comma(t.leased)}"></div>`+
+      `<div class="qseg d" style="width:${t.done/sum*100}%" title="done ${comma(t.done)}"></div>`+
+      `<div class="qseg p" style="width:${Math.max(t.parked/sum*100,0.6)}%" title="parked ${t.parked}"></div>`;
+    Q.smQ.textContent=comma(t.queued); Q.smL.textContent=comma(t.leased); Q.smD.textContent=comma(t.done); Q.smP.textContent=comma(t.parked);
+    Q.qkQ.textContent=comma(t.queued); Q.qkL.textContent=comma(t.leased); Q.qkD.textContent=comma(t.done); Q.qkP.textContent=comma(t.parked);
+
+    Q.parkedtb.innerHTML = parkedShards.map(p=>`<tr data-job="${p.job}" class="clickable" title="Open ${p.job} detail">
+      <td class="l" style="color:var(--ink)">#${p.id}</td>
+      <td class="l">${p.job} <span style="color:var(--muted)">· p${p.pass}</span><span class="gojob">↗</span></td>
+      <td class="l"><span class="pill mut plain" style="font-size:9px">${kindLabel[p.kind]}</span></td>
+      <td class="l"><div class="path" title="${p.path}">${p.path}</div></td>
+      <td><span class="attempts">${p.attempt}/5</span></td>
+      <td class="l"><span class="errpill">${p.err}</span></td>
+      <td class="l" style="color:var(--ink-2)">${p.agent}</td>
+      <td>${p.age}</td>
+      <td><div class="park-acts"><button class="abtn" disabled title="Phase 2 — re-queue">↻ retry</button><button class="abtn" disabled title="Phase 2 — accept gap">✕ drop</button></div></td></tr>`).join("");
+  }
+
+  function drainQueue() {
+    const move = 600 + Math.round(Math.random()*500);
+    const qi = queueRows.findIndex(r=>r[0]==="proj2-migration"&&r[2]==="dir"&&r[3]==="queued");
+    const di = queueRows.findIndex(r=>r[0]==="proj2-migration"&&r[2]==="dir"&&r[3]==="done");
+    if (qi>=0 && di>=0 && queueRows[qi][4]>move) { queueRows[qi][4]-=move; queueRows[di][4]+=move; }
+  }
+
+  // ---------- view switching ----------
+  const views = { overview:$("#view-overview"), queue:$("#view-queue") };
+  let curView = "overview";
+  function showView(v, noScroll) {
+    curView = v;
+    for (const k in views) views[k].hidden = (k !== v);
+    document.querySelectorAll(".nav button").forEach(b => b.classList.toggle("on", b.dataset.v === v));
+    if (v === "queue") renderQueuePage();
+    if (!noScroll) scrollTo({ top: 0, behavior: reduce ? "auto" : "smooth" });
+  }
+  document.querySelectorAll(".nav button").forEach(b => b.addEventListener("click", () => showView(b.dataset.v)));
+
+  // click a parked shard → open its job's detail on the overview
+  function jumpToJob(name) {
+    const idx = jobs.findIndex(j => j.id === name);
+    if (idx < 0) return;
+    showView("overview", true);
+    select(idx);
+    const d = document.getElementById("detail");
+    d.classList.remove("flash"); void d.offsetWidth; d.classList.add("flash");
+    requestAnimationFrame(() => d.scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "center" }));
+  }
+  Q.parkedtb.addEventListener("click", e => {
+    if (e.target.closest("button")) return;      // let (future) row actions handle themselves
+    const tr = e.target.closest("tr[data-job]");
+    if (tr) jumpToJob(tr.dataset.job);
+  });
+  Q.qdepth.addEventListener("click", e => {
+    const tr = e.target.closest("tr[data-job]");
+    if (tr) jumpToJob(tr.dataset.job);
+  });
+
+  // ---------- live simulation (1 Hz) ----------
+  const K = { bw:$("#k-bw"), files:$("#k-files"), scan:$("#k-scan") };
+  const tlNow = $("#tl-now"), tlPeak = $("#tl-peak"), footUpd = $("#foot-upd");
+  function tick() {
+    tickClock();
+    // throughput
+    let v = series[N-1] + (Math.random()-.5)*0.5; v = Math.max(2.4, Math.min(6.3, v));
+    series.push(v); series.shift(); peak = Math.max(peak*0.999, v);
+    drawTL();
+    K.bw.innerHTML = fnum(v)+'<span class="u">GiB/s</span>';
+    tlNow.textContent = fnum(v); tlPeak.textContent = "peak "+fnum(peak)+" GiB/s";
+    // files & scan
+    const f = 128 + (Math.random()-.5)*14; K.files.innerHTML = Math.round(f)+'<span class="u">k/s</span>';
+    const sc = 1.02 + (Math.random()-.5)*0.12; K.scan.innerHTML = fnum(sc,2)+'<span class="u">M/s</span>';
+    // sparks
+    sparks["sp-bw"].data.push(v/6.6); sparks["sp-bw"].data.shift();
+    sparks["sp-files"].data.push(0.5+ (f-128)/40); sparks["sp-files"].data.shift();
+    sparks["sp-scan"].data.push(0.5+(sc-1.02)*2); sparks["sp-scan"].data.shift();
+    drawSparks();
+    // agents jitter
+    agents.forEach(a => { if (a.drained) return;
+      a.bw = Math.max(0.3, a.bw + (Math.random()-.5)*0.05);
+      a.files = Math.max(3, a.files + (Math.random()-.5)*1.2);
+      a.scan = Math.max(60, a.scan + (Math.random()-.5)*8);
+      a.hb = Math.random()<0.5?0:(Math.random()<0.7?1:2);
+    });
+    renderFleet();
+    // queue drains slowly
+    qState.d += Math.round(700+Math.random()*400); qState.q = Math.max(0, qState.q - Math.round(500+Math.random()*300));
+    qState.l = 1600 + Math.round(Math.random()*500);
+    renderQueue(qState.q, qState.l, qState.d, qState.p);
+    // queue page (only re-paint when it's the visible view)
+    drainQueue();
+    if (curView === "queue") renderQueuePage();
+    footUpd.textContent = "updated just now";
+  }
+  // occasional new event
+  function pushEvent() {
+    evClock += Math.round(4+Math.random()*10);
+    const hh = String(Math.floor(evClock/3600)%24).padStart(2,"0");
+    const mm = String(Math.floor(evClock/60)%60).padStart(2,"0");
+    const ss = String(evClock%60).padStart(2,"0");
+    const e = evPool[Math.floor(Math.random()*evPool.length)];
+    seedEvents.unshift([`${hh}:${mm}:${ss}`, e[0], e[1]]);
+    if (seedEvents.length>7) seedEvents.pop();
+    renderFeed(seedEvents);
+  }
+
+  if (!reduce) {
+    setInterval(tick, 1000);
+    setInterval(pushEvent, 4200);
+  } else {
+    $("#hz").textContent = "paused"; document.querySelector(".dot").classList.remove("pulse");
+  }
+})();
+</script>
+</body>
+</html>

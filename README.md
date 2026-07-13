@@ -19,6 +19,7 @@ action. File data never crosses the control network. A single **CLI**
 | **[docs/INSTALL.md](docs/INSTALL.md)** | Build, dependencies, topology (dual mounts), mTLS setup, running the coordinator and agents, and **verifying a new setup**. |
 | **[docs/ADMIN.md](docs/ADMIN.md)** | Operator guide: concepts, the job-spec reference, the full CLI, worked use cases (migration, consolidation, cutover, orphan deletion, pathological dirs / huge files), monitoring, and troubleshooting. |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | System design and the ratified decisions (D1–D9). |
+| **[webui/](webui/)** | Read-only monitoring console prototype (jobs, convergence, throughput, agent performance, queue/parked shards) — open `webui/console.html` in a browser. |
 | `docs/DESIGN-*.md` | Deep-dives: protocol, coordinator, agent, jobspec/CLI. |
 
 ## Quick start
