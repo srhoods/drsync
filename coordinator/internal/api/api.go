@@ -22,6 +22,7 @@ import (
 	"drsync/coordinator/internal/model"
 	"drsync/coordinator/internal/passctrl"
 	"drsync/coordinator/internal/store"
+	"drsync/webui"
 )
 
 type Server struct {
@@ -51,6 +52,11 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.met.Registry, promhttp.HandlerOpts{}))
 
+	// Read-only monitoring console (served unauthenticated so the page can load
+	// and then prompt for a token; the data endpoints below still enforce auth).
+	mux.HandleFunc("GET /{$}", s.serveUI)
+	mux.HandleFunc("GET /ui", s.serveUI)
+
 	mux.HandleFunc("POST /api/v1/jobs", s.auth(s.submitJob))
 	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
 	mux.HandleFunc("POST /api/v1/jobs/purge", s.auth(s.purgeJobs))
@@ -70,7 +76,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{id}/disable", s.auth(s.setAgentEnabled(false)))
 	mux.HandleFunc("GET /api/v1/queue", s.auth(s.getQueue))
 	mux.HandleFunc("GET /api/v1/events", s.auth(s.eventsWS))
-	return mux
+	return cors(mux)
+}
+
+// serveUI serves the embedded monitoring console.
+func (s *Server) serveUI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(webui.Console)
+}
+
+// cors adds permissive CORS headers so the console works both same-origin (the
+// coordinator serves it) and standalone (opened from a file against a remote
+// coordinator). Auth is by bearer token in the Authorization header — no cookies
+// — so a wildcard origin carries no credential-leak risk. Preflights are
+// answered here before the method-specific routes would 405 on OPTIONS.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {

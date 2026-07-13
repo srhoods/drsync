@@ -4,11 +4,36 @@ A read-only operations console for monitoring a drsync cluster — jobs, pass
 convergence, aggregate throughput, agent performance, and the shard queue /
 parked-shard triage view.
 
-This is the **phase-1 design prototype** (see `docs/DESIGN-coordinator.md` §6 —
-the REST + WebSocket surface is explicitly the WebUI contract). It is a
-self-contained mockup: open `console.html` in any browser, no build step and no
-server required. The figures are **simulated** at 1 Hz to convey the live feel;
-the console is not yet wired to a coordinator.
+This is the **phase-1 read-only console** (see `docs/DESIGN-coordinator.md` §6 —
+the REST + WebSocket surface is explicitly the WebUI contract). It is wired to a
+live coordinator: no build step, no framework — a single self-contained HTML
+file.
+
+## Running it
+
+The coordinator embeds and serves the console:
+
+```
+drsyncd -listen-http :7441 …      # then browse to
+http://<coordinator>:7441/        # (also /ui)
+```
+
+Served same-origin, `fetch`/WebSocket calls need no configuration. If the
+coordinator sets `-api-token`, open **⚙ connection** (top right) and paste the
+token — it is stored in `localStorage` and sent as a bearer token; the events
+WebSocket receives it as a `?token=` query parameter.
+
+You can also open `webui/console.html` directly from disk against a remote
+coordinator: use **⚙ connection** to set the coordinator URL (and token). The
+coordinator sends permissive CORS headers so this cross-origin case works too.
+The connection indicator (top bar) is green when polling and the event socket
+are healthy, amber while connecting, red when the coordinator is unreachable.
+
+Data refreshes every 2.5 s; live state changes (job/pass transitions, agent
+up/down, parked-shard alerts) arrive over the events WebSocket and trigger an
+immediate refresh. Per-agent rates are derived by differencing successive
+`/metrics` samples, so throughput/scan/copy figures populate after the second
+poll.
 
 ## Views
 
@@ -23,7 +48,7 @@ the console is not yet wired to a coordinator.
   table (attempts N/5, errno, last agent, age). Queue and parked rows click
   through to the owning job's detail.
 
-## Data mapping (when wired to a live coordinator)
+## Data mapping
 
 | Panel | Source |
 |-------|--------|
