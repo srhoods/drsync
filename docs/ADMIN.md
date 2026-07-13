@@ -158,7 +158,9 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 
 | Command | What it does |
 |---------|--------------|
-| `drsync agent list` | Connected agents and liveness. |
+| `drsync agent list` | Connected agents, liveness, and scheduling status (`SCHED` = `enabled`/`DISABLED`). |
+| `drsync agent disable <id>` | Stop granting new shards to an agent. It stays connected and finishes its in-flight leases; nothing new is scheduled onto it. Survives agent reconnects. |
+| `drsync agent enable <id>` | Re-admit a disabled agent to scheduling. |
 | `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, totals, fidelity exceptions. Your go/no-go artifact. |
 | `drsync queue` | Shard queue depth by state, including **parked** shards. |
 | `drsync errors <name> [--pass N\|all] [--class EACCES] [--path prefix] [--limit N] [--offset N]` | Browse errors, filterable by errno class and path prefix. |
@@ -284,6 +286,29 @@ drsync job submit bulk.yaml --start \
   --set spec.limits.bandwidth_per_agent=500MiB \
   --set spec.limits.iops_per_agent=20000
 ```
+
+### 4.7 Draining an agent for maintenance
+
+To take a node out of a running migration without disrupting jobs — e.g. before
+a reboot, kernel patch, or to shift its NIC/mount load elsewhere — disable it
+rather than killing it:
+
+```bash
+drsync agent disable agent-07     # no new shards granted to agent-07
+drsync agent list                 # SCHED shows DISABLED; CONNECTED still true
+# ... agent-07 finishes the leases it already holds, then sits idle ...
+# do the maintenance, then:
+drsync agent enable agent-07      # re-admit it to scheduling
+```
+
+A disabled agent keeps its connection and renews its in-flight leases by
+heartbeat, so work already leased to it completes normally — nothing is
+force-requeued. Only *new* grants stop. The disabled flag is stored on the
+coordinator and **persists across agent restarts/reconnects**, so a bounce
+during the maintenance window won't silently re-admit the node. Contrast with
+killing the agent: that strands its leases until the TTL expires and they
+requeue elsewhere (a `pause` on the *job* stops grants to the whole fleet, not
+one node).
 
 ---
 

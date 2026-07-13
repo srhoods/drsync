@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,7 +86,8 @@ CREATE TABLE IF NOT EXISTS agents (
   state          TEXT NOT NULL,
   caps           BLOB,
   last_heartbeat INTEGER,
-  registered_at  INTEGER
+  registered_at  INTEGER,
+  enabled        INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS splits (
   parent_shard_id INTEGER NOT NULL,
@@ -113,7 +115,22 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// Additive migrations for DBs created before a column existed. ALTER TABLE
+	// ADD COLUMN is a no-op error ("duplicate column name") once applied, so we
+	// swallow that and only fail on anything unexpected.
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
+}
+
+// migrations are additive DDL applied after the base schema; each must be
+// idempotent (guarded by the duplicate-column check in Open).
+var migrations = []string{
+	`ALTER TABLE agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`,
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -512,6 +529,17 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Administratively-disabled agents stay connected and finish in-flight
+	// leases (renewed by heartbeat), but are granted no new shards.
+	var enabled int
+	switch err := s.db.QueryRow(`SELECT enabled FROM agents WHERE id = ?`, agentID).Scan(&enabled); {
+	case errors.Is(err, sql.ErrNoRows): // not yet registered — allow
+	case err != nil:
+		return nil, err
+	case enabled == 0:
+		return nil, nil
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -747,6 +775,7 @@ type Agent struct {
 	Version       string
 	State         string
 	LastHeartbeat int64
+	Enabled       bool
 }
 
 func (s *Store) UpsertAgent(id, hostname, version string) error {
@@ -768,6 +797,26 @@ func (s *Store) SetAgentState(id, state string) error {
 	return err
 }
 
+// SetAgentEnabled flips an agent's administrative scheduling flag. A disabled
+// agent stays connected but receives no new shard grants. Returns sql.ErrNoRows
+// if the agent id is unknown.
+func (s *Store) SetAgentEnabled(id string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := 0
+	if enabled {
+		v = 1
+	}
+	res, err := s.db.Exec(`UPDATE agents SET enabled = ? WHERE id = ?`, v, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) TouchAgent(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -778,7 +827,7 @@ func (s *Store) TouchAgent(id string) error {
 func (s *Store) ListAgents() ([]*Agent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT id, hostname, version, state, COALESCE(last_heartbeat, 0) FROM agents ORDER BY id`)
+	rows, err := s.db.Query(`SELECT id, hostname, version, state, COALESCE(last_heartbeat, 0), enabled FROM agents ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -786,9 +835,11 @@ func (s *Store) ListAgents() ([]*Agent, error) {
 	var out []*Agent
 	for rows.Next() {
 		a := &Agent{}
-		if err := rows.Scan(&a.ID, &a.Hostname, &a.Version, &a.State, &a.LastHeartbeat); err != nil {
+		var enabled int
+		if err := rows.Scan(&a.ID, &a.Hostname, &a.Version, &a.State, &a.LastHeartbeat, &enabled); err != nil {
 			return nil, err
 		}
+		a.Enabled = enabled != 0
 		out = append(out, a)
 	}
 	return out, rows.Err()

@@ -487,30 +487,69 @@ func cmdPass(args []string) error {
 // ---------------------------------------------------------------------------
 
 func cmdAgent(args []string) error {
-	if len(args) < 1 || args[0] != "list" {
-		return fmt.Errorf("usage: drsync agent list")
+	if len(args) < 1 {
+		return fmt.Errorf("usage: drsync agent list | enable <id> | disable <id>")
 	}
+	switch args[0] {
+	case "list":
+		return agentList(args[1:])
+	case "enable", "disable":
+		return agentEnable(args[0], args[1:])
+	default:
+		return fmt.Errorf("usage: drsync agent list | enable <id> | disable <id>")
+	}
+}
+
+func agentList(args []string) error {
 	fs := flag.NewFlagSet("agent list", flag.ExitOnError)
 	mk := connFlags(fs)
-	fs.Parse(args[1:])
+	fs.Parse(args)
 	var agents []struct {
 		ID            string `json:"id"`
 		Hostname      string `json:"hostname"`
 		Version       string `json:"version"`
 		State         string `json:"state"`
 		Connected     bool   `json:"connected"`
+		Enabled       bool   `json:"enabled"`
 		LastHeartbeat int64  `json:"last_heartbeat_ms"`
 	}
 	if err := mk().get("/api/v1/agents", &agents); err != nil {
 		return err
 	}
 	tw := newTable()
-	fmt.Fprintln(tw, "ID\tHOST\tVERSION\tSTATE\tCONNECTED\tLAST-HEARTBEAT")
+	fmt.Fprintln(tw, "ID\tHOST\tVERSION\tSTATE\tCONNECTED\tSCHED\tLAST-HEARTBEAT")
 	for _, a := range agents {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%s\n", a.ID, a.Hostname, a.Version,
-			a.State, a.Connected, msTime(a.LastHeartbeat))
+		sched := "enabled"
+		if !a.Enabled {
+			sched = "DISABLED"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%s\t%s\n", a.ID, a.Hostname, a.Version,
+			a.State, a.Connected, sched, msTime(a.LastHeartbeat))
 	}
 	return tw.Flush()
+}
+
+func agentEnable(action string, args []string) error {
+	fs := flag.NewFlagSet("agent "+action, flag.ExitOnError)
+	mk := connFlags(fs)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drsync agent %s <id>", action)
+	}
+	id := fs.Arg(0)
+	var out struct {
+		Agent   string `json:"agent"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := mk().post("/api/v1/agents/"+url.PathEscape(id)+"/"+action, nil, &out); err != nil {
+		return err
+	}
+	if out.Enabled {
+		fmt.Printf("agent %s enabled (eligible for new shards)\n", out.Agent)
+	} else {
+		fmt.Printf("agent %s disabled (no new shards; in-flight leases finish)\n", out.Agent)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

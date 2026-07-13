@@ -66,6 +66,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs/{name}/journal", s.auth(s.getJournal))
 	mux.HandleFunc("GET /api/v1/jobs/{name}/report", s.auth(s.getReport))
 	mux.HandleFunc("GET /api/v1/agents", s.auth(s.listAgents))
+	mux.HandleFunc("POST /api/v1/agents/{id}/enable", s.auth(s.setAgentEnabled(true)))
+	mux.HandleFunc("POST /api/v1/agents/{id}/disable", s.auth(s.setAgentEnabled(false)))
 	mux.HandleFunc("GET /api/v1/queue", s.auth(s.getQueue))
 	mux.HandleFunc("GET /api/v1/events", s.auth(s.eventsWS))
 	return mux
@@ -363,12 +365,36 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		Version       string `json:"version"`
 		State         string `json:"state"`
 		Connected     bool   `json:"connected"`
+		Enabled       bool   `json:"enabled"`
 		LastHeartbeat int64  `json:"last_heartbeat_ms"`
 	}
 	out := make([]agentView, 0, len(agents))
 	for _, a := range agents {
 		out = append(out, agentView{ID: a.ID, Hostname: a.Hostname, Version: a.Version,
-			State: a.State, Connected: live[a.ID], LastHeartbeat: a.LastHeartbeat})
+			State: a.State, Connected: live[a.ID], Enabled: a.Enabled, LastHeartbeat: a.LastHeartbeat})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// setAgentEnabled toggles an agent's scheduling flag. Disabled agents stay
+// connected and finish in-flight leases but receive no new shard grants.
+func (s *Server) setAgentEnabled(enabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		err := s.st.SetAgentEnabled(id, enabled)
+		if errors.Is(err, sql.ErrNoRows) {
+			httpErr(w, http.StatusNotFound, "no such agent")
+			return
+		}
+		if err != nil {
+			httpErr(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		action := "disable"
+		if enabled {
+			action = "enable"
+		}
+		slog.Info("agent action", "agent", id, "action", action)
+		writeJSON(w, http.StatusOK, map[string]any{"agent": id, "enabled": enabled})
+	}
 }

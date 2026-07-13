@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -150,4 +151,55 @@ func TestPausedJobNotGranted(t *testing.T) {
 	if len(rows) != 0 {
 		t.Fatalf("paused job granted work: %+v", rows)
 	}
+}
+
+func TestDisabledAgentNotGranted(t *testing.T) {
+	s := openTest(t)
+	_, _, shardID := seed(t, s)
+	if err := s.UpsertAgent("agent-a", "host", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAgentEnabled("agent-a", false); err != nil {
+		t.Fatal(err)
+	}
+	// Disabled agent: no grant, even with queued work.
+	rows, err := s.LeaseShards("agent-a", 4, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("disabled agent granted work: %+v", rows)
+	}
+	// Another, enabled agent still gets the shard.
+	rows, err = s.LeaseShards("agent-b", 4, time.Minute)
+	if err != nil || len(rows) != 1 || rows[0].ID != shardID {
+		t.Fatalf("enabled agent grant = %+v, err=%v", rows, err)
+	}
+	// Re-enable: eligible again (seed a fresh queued shard first).
+	if err := s.SetAgentEnabled("agent-a", true); err != nil {
+		t.Fatal(err)
+	}
+	if l := s.enabledFlag(t, "agent-a"); !l {
+		t.Fatal("agent-a still disabled after enable")
+	}
+	// Unknown agent id is a not-found error.
+	if err := s.SetAgentEnabled("ghost", false); err != sql.ErrNoRows {
+		t.Fatalf("SetAgentEnabled(unknown) = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// enabledFlag reads an agent's enabled bit via ListAgents (test helper).
+func (s *Store) enabledFlag(t *testing.T, id string) bool {
+	t.Helper()
+	agents, err := s.ListAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range agents {
+		if a.ID == id {
+			return a.Enabled
+		}
+	}
+	t.Fatalf("agent %q not found", id)
+	return false
 }

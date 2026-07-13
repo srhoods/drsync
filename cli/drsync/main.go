@@ -8,7 +8,7 @@
 //	drsync job start|pause|resume|cancel <name>
 //	drsync job purge <name> | --completed|--state S [--older-than DUR]
 //	drsync pass trigger <name> [--delete-pass --i-know-this-deletes]
-//	drsync agent list
+//	drsync agent list | enable <id> | disable <id>
 //	drsync errors <name> [--pass N|all] [--class EACCES] [--path prefix]
 //	drsync journal cat <name> [--pass N|all] [--type orphan] [--jsonl]
 //	drsync report <name> [--json]
@@ -55,9 +55,16 @@ PASSES
   pass trigger <name> --delete-pass --i-know-this-deletes
         Run a DELETE pass — removes destination orphans (double-gated).
 
-INSPECT & AUDIT
+AGENTS
   agent list
-        Connected agents and liveness.
+        Connected agents, liveness, and scheduling status.
+  agent disable <id>
+        Stop granting new shards to an agent; it stays connected and finishes
+        its in-flight leases (useful to drain a node before maintenance).
+  agent enable <id>
+        Resume granting new shards to a previously-disabled agent.
+
+INSPECT & AUDIT
   report <name> [--json]
         Migration/cutover summary: per-pass delta, convergence curve, totals.
   queue
