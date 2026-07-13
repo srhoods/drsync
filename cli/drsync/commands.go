@@ -32,6 +32,7 @@ type passView struct {
 	FidelityExc   int64  `json:"fidelity_exceptions"`
 	VerifyOK      int64  `json:"verify_ok"`
 	VerifyFail    int64  `json:"verify_fail"`
+	DurationMs    int64  `json:"duration_ms"`
 }
 
 type jobView struct {
@@ -283,12 +284,12 @@ func printStatus(c *client, name string) (*jobView, error) {
 		return &jv, nil
 	}
 	tw := newTable()
-	fmt.Fprintln(tw, "PASS\tSTATE\tWALKED\tCOPIED\tBYTES\tMETA\tORPHANS\tVERIFY\tERRORS")
+	fmt.Fprintln(tw, "PASS\tSTATE\tWALKED\tCOPIED\tBYTES\tMETA\tORPHANS\tVERIFY\tERRORS\tDURATION")
 	for _, p := range jv.Passes {
-		fmt.Fprintf(tw, "%d\t%s\t%d\t%d\t%s\t%d\t%d\t%s\t%d\n",
+		fmt.Fprintf(tw, "%d\t%s\t%d\t%d\t%s\t%d\t%d\t%s\t%d\t%s\n",
 			p.PassNo, p.State, p.EntriesWalked, p.FilesCopied,
 			humanBytes(p.BytesCopied), p.MetaFixed, p.Orphans,
-			verifyCol(p.VerifyOK, p.VerifyFail), p.Errors)
+			verifyCol(p.VerifyOK, p.VerifyFail), p.Errors, humanMS(p.DurationMs))
 	}
 	tw.Flush()
 	return &jv, nil

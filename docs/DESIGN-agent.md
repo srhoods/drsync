@@ -197,6 +197,13 @@ round trips: 8 walkers × 256 in-flight ≈ enough concurrency to hit the NFS cl
 slot-table limit rather than the RTT. Target ≥ 100k stat/s/host; the actual ceiling is
 tunable via `statx_batch` and the host's `nfs4 max_session_slots`.
 
+`statx_batch` sets the per-thread io_uring **ring depth** (the number of statx
+SQEs a walker keeps in flight); io_uring rounds it up to a power of two, and it
+is clamped to [1, 4096]. Size it at or below the backend's outstanding-RPC
+budget (`nfs4 max_session_slots`); pushing it higher only queues client-side.
+Rings are built lazily per walker thread, so a change applies to threads that
+create their ring after the new value is seen.
+
 ### 2.3 Huge single directories (entry-list sharding)
 
 A directory whose entry count passes `dir_split_threshold` (50k) mid-readdir switches

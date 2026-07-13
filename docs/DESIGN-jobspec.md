@@ -91,7 +91,7 @@ spec:
   tuning:                            # rarely touched; sane defaults from D7 sizing
     shard_budget: 250000             # entries processed before pushing subdirs back
     dir_split_threshold: 50000       # single-dir size that triggers entry-list sharding
-    statx_batch: 256                 # in-flight statx per walker thread
+    statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (pow2, 1–4096)
     mtime_slop_ns: 1000000           # 1ms slop for cross-FS timestamp granularity
 ```
 

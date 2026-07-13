@@ -2,10 +2,12 @@
  * dependency; the ring syscalls and mmaps are driven directly. One ring per
  * walker thread (thread-local), so no locking on the submission path.
  *
- * Batched IORING_OP_STATX overlaps NFS getattr round trips: with 256 in
- * flight the walk is bounded by the NFS slot table, not the RTT. Falls back
- * to serial fstatat when io_uring is unavailable (RHEL disables it by
- * default on some releases) or IORING_OP_STATX is unsupported. */
+ * Batched IORING_OP_STATX overlaps NFS getattr round trips: with the ring
+ * kept full the walk is bounded by the NFS slot table, not the RTT. The ring
+ * depth defaults to 256 and is set per job from tuning.statx_batch via
+ * uring_set_depth (kernel rounds up to a power of two). Falls back to serial
+ * fstatat when io_uring is unavailable (RHEL disables it by default on some
+ * releases) or IORING_OP_STATX is unsupported. */
 #include "agent.h"
 
 #include <errno.h>
@@ -20,9 +22,30 @@
 
 #include <linux/io_uring.h>
 
-#define RING_ENTRIES 256
+#define RING_ENTRIES 256 /* default ring depth (statx_batch default matches) */
+#define RING_MIN     1
+#define RING_MAX     4096 /* guard against an absurd spec value */
 
 bool g_uring_enabled = false;
+
+/* Desired ring depth (statx in flight per walker thread). Set from the job's
+ * tuning.statx_batch via uring_set_depth; read when a thread lazily builds its
+ * ring. A change takes effect for rings created afterwards — threads that
+ * already hold a ring keep their depth (they are not torn down mid-session). */
+static unsigned g_ring_depth = RING_ENTRIES;
+
+void uring_set_depth(unsigned depth)
+{
+    if (depth == 0)
+        return; /* unset ⇒ keep default */
+    if (depth < RING_MIN)
+        depth = RING_MIN;
+    if (depth > RING_MAX)
+        depth = RING_MAX;
+    unsigned prev = __atomic_exchange_n(&g_ring_depth, depth, __ATOMIC_RELAXED);
+    if (prev != depth)
+        LOGI("io_uring ring depth set to %u (statx_batch)", depth);
+}
 
 struct ring {
     int      fd;
@@ -67,7 +90,8 @@ static int ring_init(struct ring *r)
     memset(r, 0, sizeof *r);
     struct io_uring_params p;
     memset(&p, 0, sizeof p);
-    r->fd = sys_setup(RING_ENTRIES, &p);
+    unsigned depth = __atomic_load_n(&g_ring_depth, __ATOMIC_RELAXED);
+    r->fd = sys_setup(depth, &p);
     if (r->fd < 0)
         return -1;
 
@@ -239,7 +263,8 @@ void uring_probe(bool allow)
         return;
     }
     g_uring_enabled = true;
-    LOGI("io_uring statx batching enabled (ring depth %d)", RING_ENTRIES);
+    LOGI("io_uring statx batching enabled (default ring depth %u)",
+         __atomic_load_n(&g_ring_depth, __ATOMIC_RELAXED));
 }
 
 /* thread-local ring, lazily created per walker thread */
@@ -257,9 +282,11 @@ void stat_batch(struct statx_req *reqs, size_t n)
         tls_ring_state = ring_init(&tls_ring) == 0 ? 1 : -1;
 
     if (g_uring_enabled && tls_ring_state == 1) {
+        /* One completion buffer per ring slot; sized to this thread's ring,
+         * whose depth was fixed by g_ring_depth at ring_init time. */
         static __thread struct statx *bufs;
         if (!bufs)
-            bufs = calloc(RING_ENTRIES, sizeof *bufs);
+            bufs = calloc(tls_ring.sq_entries, sizeof *bufs);
         if (bufs && ring_statx(&tls_ring, reqs, bufs, n) == 0)
             return;
         LOGW("io_uring statx batch failed (%s); this thread now uses fstatat",

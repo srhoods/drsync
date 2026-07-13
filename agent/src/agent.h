@@ -96,6 +96,10 @@ struct estat {
  * once at startup (RHEL disables io_uring by default on some releases). */
 extern bool g_uring_enabled;
 void uring_probe(bool allow);
+/* Set the io_uring ring depth (statx in flight per walker) from a job's
+ * tuning.statx_batch. Clamped to a sane range; 0 keeps the default. Takes
+ * effect for rings built afterwards. */
+void uring_set_depth(unsigned depth);
 
 struct statx_req {
     int           dirfd;

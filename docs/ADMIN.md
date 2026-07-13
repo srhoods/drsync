@@ -116,7 +116,9 @@ spec:
   tuning:
     shard_budget: 250000          # entries a shard handles before it self-splits
     dir_split_threshold: 50000    # a directory bigger than this is fanned out as entry-list shards
-    statx_batch: 256              # statx in flight per walker (io_uring)
+    statx_batch: 256              # statx in flight per walker = io_uring ring depth
+                                  #   (rounded up to a power of two, clamped 1–4096;
+                                  #   keep ≤ nfs4 max_session_slots)
     mtime_slop_ns: 1000000        # mtimes within this are "equal" (1 ms)
 ```
 
@@ -142,7 +144,7 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 |---------|--------------|
 | `drsync job submit <spec.yaml> [--dry-run] [--start] [--set path=value]...` | Register a job. `--dry-run` walks/diffs/journals but executes nothing. `--start` runs it immediately. `--set` overrides a spec field (repeatable), e.g. `--set spec.tuning.shard_budget=4`. |
 | `drsync job list` | All jobs and their states. |
-| `drsync job status [<name>] [--watch] [--all]` | Job state + per-pass table (walked/copied/bytes/meta/orphans/verify/errors). **With no name**, shows every *active* job (`--all` includes finished ones). `--watch` streams one job's live progress over the WebSocket until it reaches a terminal state. |
+| `drsync job status [<name>] [--watch] [--all]` | Job state + per-pass table (walked/copied/bytes/meta/orphans/verify/errors/**duration**). Duration is each pass's elapsed wall time — frozen once the pass completes, counting up while it runs. **With no name**, shows every *active* job (`--all` includes finished ones). `--watch` streams one job's live progress over the WebSocket until it reaches a terminal state. |
 | `drsync job start\|pause\|resume\|cancel <name>` | Lifecycle control. `pause` stops granting new work (in-flight finishes); `resume` continues; `cancel` ends the job. |
 | `drsync job purge <name>` | Delete one **finished** job — its rows and on-disk journal — to reclaim coordinator disk. Refused for jobs that aren't terminal (cancel first). |
 | `drsync job purge --completed [--older-than 168h] [--dry-run]` | Bulk-purge finished jobs. `--completed` targets `COMPLETED`; `--state completed\|cancelled\|failed\|terminal` selects which finished states; `--older-than` keeps jobs that finished more recently than the given duration; **`--dry-run` lists what would be purged without deleting anything**. |

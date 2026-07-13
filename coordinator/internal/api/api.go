@@ -125,16 +125,33 @@ type passView struct {
 	FidelityExc   int64           `json:"fidelity_exceptions"`
 	VerifyOK      int64           `json:"verify_ok"`
 	VerifyFail    int64           `json:"verify_fail"`
+	StartedAtMs   int64           `json:"started_at_ms,omitempty"`
+	FinishedAtMs  int64           `json:"finished_at_ms,omitempty"`
+	// DurationMs is finished-started for a completed pass, or elapsed-so-far
+	// (now-started) for one still running. Zero if the pass never started.
+	DurationMs int64 `json:"duration_ms"`
 }
 
 func passViewOf(p *store.Pass) passView {
-	return passView{
+	v := passView{
 		PassNo: p.PassNo, State: p.State, EntriesWalked: p.EntriesWalked,
 		FilesCopied: p.FilesCopied, BytesCopied: p.BytesCopied,
 		MetaFixed: p.MetaFixed, Orphans: p.Orphans, Errors: p.Errors,
 		FidelityExc: p.FidelityExceptions,
 		VerifyOK:    p.VerifyOK, VerifyFail: p.VerifyFail,
 	}
+	if p.Started.Valid {
+		v.StartedAtMs = p.Started.Int64
+		end := time.Now().UnixMilli() // running pass: elapsed so far
+		if p.Finished.Valid {
+			v.FinishedAtMs = p.Finished.Int64
+			end = p.Finished.Int64
+		}
+		if d := end - p.Started.Int64; d > 0 {
+			v.DurationMs = d
+		}
+	}
+	return v
 }
 
 func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {

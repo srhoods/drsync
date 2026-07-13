@@ -210,6 +210,8 @@ static int mkdir_p(const char *path)
 
 int opts_store(const struct job_options *o)
 {
+    /* Size the statx ring from this job's tuning knob (no-op if unset). */
+    uring_set_depth(o->statx_batch);
     pthread_mutex_lock(&opts_mu);
     for (size_t i = 0; i < n_opts; i++) {
         if (opts_tab[i].o.job_id == o->job_id) {

@@ -123,6 +123,7 @@ struct job_options {
     /* tuning */
     uint64_t shard_budget;
     uint64_t dir_split_threshold;
+    uint32_t statx_batch; /* target statx in flight per walker ⇒ io_uring ring depth */
     int64_t  mtime_slop_ns;
     bool     dry_run;
     uint64_t options_hash;
