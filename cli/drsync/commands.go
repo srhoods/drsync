@@ -806,12 +806,26 @@ func cmdReport(args []string) error {
 	if passes, ok := rep["passes"].([]any); ok {
 		tw := newTable()
 		fmt.Fprintln(tw, "PASS\tSTATE\tDURATION\tDELTA-FILES\tDELTA-BYTES\tORPHANS\tVERIFY\tERRORS")
+		var totDur, totFiles, totBytes, totVOK, totVFail, totErr int64
 		for _, pv := range passes {
 			p, _ := pv.(map[string]any)
+			totDur += i64(p["duration_ms"])
+			totFiles += i64(p["delta_files"])
+			totBytes += i64(p["delta_bytes"])
+			totVOK += i64(p["verify_ok"])
+			totVFail += i64(p["verify_fail"])
+			totErr += i64(p["errors"])
 			fmt.Fprintf(tw, "%v\t%v\t%s\t%v\t%s\t%v\t%s\t%v\n",
 				p["pass_no"], p["state"], humanMS(i64(p["duration_ms"])),
 				p["delta_files"], humanBytes(i64(p["delta_bytes"])), p["orphans"],
 				verifyCol(i64(p["verify_ok"]), i64(p["verify_fail"])), p["errors"])
+		}
+		if len(passes) > 0 {
+			// Footer summing the additive per-pass columns. Orphans is a
+			// per-scan census (not additive), so it is left as a dash.
+			fmt.Fprintf(tw, "TOTAL\t\t%s\t%d\t%s\t%s\t%s\t%d\n",
+				humanMS(totDur), totFiles, humanBytes(totBytes), "-",
+				verifyCol(totVOK, totVFail), totErr)
 		}
 		tw.Flush()
 	}
