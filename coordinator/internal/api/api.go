@@ -37,6 +37,19 @@ type Server struct {
 	// DropJournal removes a purged job's on-disk journal segments; injected in
 	// main so the API can reclaim disk on `job purge`.
 	DropJournal func(jobID int64) error
+	// Info is static coordinator metadata surfaced by GET /api/v1/info (the
+	// console header). Injected in main.
+	Info CoordinatorInfo
+}
+
+// CoordinatorInfo is the static coordinator identity/config the console header
+// shows. FleetEpoch is a hex string because a uint64 would lose precision as a
+// JSON number in the browser.
+type CoordinatorInfo struct {
+	FleetEpoch string `json:"fleet_epoch"`
+	LeaseTTLS  int    `json:"lease_ttl_s"`
+	MTLS       bool   `json:"mtls"`
+	Version    string `json:"version"`
 }
 
 func New(st *store.Store, pc *passctrl.Controller, met *metrics.Metrics,
@@ -71,12 +84,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs/{name}/errors", s.auth(s.getErrors))
 	mux.HandleFunc("GET /api/v1/jobs/{name}/journal", s.auth(s.getJournal))
 	mux.HandleFunc("GET /api/v1/jobs/{name}/report", s.auth(s.getReport))
+	mux.HandleFunc("GET /api/v1/info", s.auth(s.getInfo))
 	mux.HandleFunc("GET /api/v1/agents", s.auth(s.listAgents))
 	mux.HandleFunc("POST /api/v1/agents/{id}/enable", s.auth(s.setAgentEnabled(true)))
 	mux.HandleFunc("POST /api/v1/agents/{id}/disable", s.auth(s.setAgentEnabled(false)))
 	mux.HandleFunc("GET /api/v1/queue", s.auth(s.getQueue))
 	mux.HandleFunc("GET /api/v1/events", s.auth(s.eventsWS))
 	return cors(mux)
+}
+
+// getInfo returns static coordinator metadata for the console header.
+func (s *Server) getInfo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.Info)
 }
 
 // serveUI serves the embedded monitoring console.

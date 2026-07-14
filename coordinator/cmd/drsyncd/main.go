@@ -28,6 +28,9 @@ import (
 	"drsync/coordinator/internal/store"
 )
 
+// coordinatorVersion is surfaced in the console header and /api/v1/info.
+const coordinatorVersion = "0.1.0-slice5"
+
 func main() {
 	var (
 		agentAddr = flag.String("listen-agent", ":7440", "agent protocol listen address")
@@ -86,16 +89,23 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA string,
 	if err != nil {
 		return err
 	}
+	fleetEpoch := randomEpoch()
 	asrv := agentsrv.New(agentsrv.Config{
 		HeartbeatInterval: hbEvery,
 		LeaseTTL:          leaseTTL,
 		TLS:               tlsConf,
-		FleetEpoch:        randomEpoch(),
+		FleetEpoch:        fleetEpoch,
 	}, st, sched, jw, met)
 
 	apiSrv := api.New(st, pc, met, bus, journalRoot, apiToken)
 	apiSrv.ConnectedAgents = asrv.ConnectedAgents
 	apiSrv.DropJournal = jw.DropJob
+	apiSrv.Info = api.CoordinatorInfo{
+		FleetEpoch: fmt.Sprintf("%016x", fleetEpoch),
+		LeaseTTLS:  int(leaseTTL / time.Second),
+		MTLS:       tlsConf != nil,
+		Version:    coordinatorVersion,
+	}
 	poller.ConnectedAgents = asrv.ConnectedAgents
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

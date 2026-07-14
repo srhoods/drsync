@@ -357,13 +357,15 @@
       <button data-v="queue">▦ queue &amp; shards <span class="badge" id="nav-park">3</span></button>
     </nav>
     <div class="coord">
-      <span><span class="k">coordinator</span> coord-01.store.corp:7441</span>
+      <span><span class="k">coordinator</span> <span id="hdr-coord">—</span></span>
       <span class="sep"></span>
-      <span><span class="k">fleet epoch</span> a3f81c</span>
+      <span><span class="k">fleet epoch</span> <span id="hdr-epoch">—</span></span>
       <span class="sep"></span>
-      <span><span class="k">lease ttl</span> 30s</span>
+      <span><span class="k">lease ttl</span> <span id="hdr-ttl">—</span></span>
       <span class="sep"></span>
-      <span><span class="k">mTLS</span> on</span>
+      <span><span class="k">mTLS</span> <span id="hdr-mtls">—</span></span>
+      <span class="sep"></span>
+      <span><span class="k">version</span> <span id="hdr-ver">—</span></span>
     </div>
     <span class="spacer"></span>
     <span class="ro-chip" title="Phase 1 is read-only. Job &amp; agent controls arrive in Phase 2.">read-only</span>
@@ -631,7 +633,7 @@
 
   // ---------- live state ----------
   const S = { jobs:[], jobDetails:{}, queue:{depth:[],parked:[]}, agents:[],
-              rates:{}, sum:{scan:0,files:0,bytes:0}, selected:null, report:null };
+              rates:{}, sum:{scan:0,files:0,bytes:0}, selected:null, report:null, info:null };
   const HN = 90;
   let bwHist = [], filesHist = [], scanHist = [];
   let curView = "overview";
@@ -697,6 +699,7 @@
         api("/api/v1/jobs"), api("/api/v1/queue"), api("/api/v1/agents"), apiText("/metrics"),
       ]);
       S.jobs = jobs || []; S.queue = queue || {depth:[],parked:[]}; S.agents = agents || [];
+      if (!S.info) S.info = await api("/api/v1/info").catch(() => null);
       const dets = await Promise.all(S.jobs.map(j =>
         api("/api/v1/jobs/" + encodeURIComponent(j.name)).catch(() => null)));
       S.jobDetails = {}; S.jobs.forEach((j, i) => { if (dets[i]) S.jobDetails[j.name] = dets[i]; });
@@ -723,8 +726,20 @@
 
   // ---------- render: everything ----------
   function renderAll() {
-    renderKPIs(); renderJobs(); renderDetail(); renderFleet(); renderRail();
+    renderHeader(); renderKPIs(); renderJobs(); renderDetail(); renderFleet(); renderRail();
     drawTL(); drawSparks(); if (curView === "queue") renderQueuePage();
+  }
+
+  // ---------- header (real coordinator identity) ----------
+  function coordHost() { try { return new URL(cfg.base || location.origin).host; } catch (_) { return cfg.base || location.host; } }
+  function renderHeader() {
+    $("#hdr-coord").textContent = coordHost();
+    const i = S.info, ep = $("#hdr-epoch");
+    ep.textContent = i && i.fleet_epoch ? i.fleet_epoch.slice(0, 8) : "—";
+    ep.title = i && i.fleet_epoch ? "fleet epoch " + i.fleet_epoch : "";
+    $("#hdr-ttl").textContent = i ? i.lease_ttl_s + "s" : "—";
+    $("#hdr-mtls").textContent = i ? (i.mtls ? "on" : "off") : "—";
+    $("#hdr-ver").textContent = i && i.version ? i.version : "—";
   }
 
   function renderKPIs() {
@@ -1045,12 +1060,18 @@
     if (cfg.token) u.searchParams.set("token", cfg.token);
     return u.toString();
   }
+  // Exactly one live socket: tear down any prior one (with its handlers
+  // detached so its onclose can't schedule a rival reconnect) before opening a
+  // new one. Duplicate sockets were the cause of repeated feed entries.
   function connectWS() {
     clearTimeout(wsTimer);
-    try { ws = new WebSocket(wsURL()); } catch (e) { wsTimer = setTimeout(connectWS, 3000); return; }
-    ws.onmessage = ev => { try { handleEvent(JSON.parse(ev.data)); } catch (_) {} };
-    ws.onclose = () => { ws = null; wsTimer = setTimeout(connectWS, 3000); };
-    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+    if (ws) { try { ws.onclose = ws.onerror = ws.onmessage = null; ws.close(); } catch (_) {} ws = null; }
+    let sock;
+    try { sock = new WebSocket(wsURL()); } catch (e) { wsTimer = setTimeout(connectWS, 3000); return; }
+    ws = sock;
+    sock.onmessage = ev => { try { handleEvent(JSON.parse(ev.data)); } catch (_) {} };
+    sock.onclose = () => { if (ws === sock) { ws = null; wsTimer = setTimeout(connectWS, 3000); } };
+    sock.onerror = () => { try { sock.close(); } catch (_) {} };
   }
 
   // ---------- connection settings popover ----------
@@ -1065,11 +1086,11 @@
   $("#cfg-save").addEventListener("click", async () => {
     cfg.base = cfgBase.value.trim().replace(/\/+$/, ""); cfg.token = cfgToken.value.trim();
     localStorage.setItem("drsync.base", cfg.base); localStorage.setItem("drsync.token", cfg.token);
-    cfgMsg.textContent = "connecting…"; cfgMsg.className = "cfg-msg"; lastMetrics = null;
+    cfgMsg.textContent = "connecting…"; cfgMsg.className = "cfg-msg"; lastMetrics = null; S.info = null; renderHeader();
     try {
       await api("/api/v1/jobs");
       cfgMsg.textContent = "connected"; cfgMsg.className = "cfg-msg ok";
-      if (ws) { try { ws.close(); } catch (_) {} } connectWS(); pollAll();
+      connectWS(); pollAll();
       setTimeout(() => { pop.hidden = true; }, 700);
     } catch (e) {
       cfgMsg.textContent = String(e.message) === "401" ? "unauthorized — check the token" : "cannot reach coordinator";
@@ -1078,7 +1099,7 @@
   });
 
   // ---------- init ----------
-  renderFeed(); buildFilters(); setConn("", "connecting…");
+  renderFeed(); buildFilters(); setConn("", "connecting…"); renderHeader();
   connectWS(); pollAll(); setInterval(pollAll, 2500);
 })();
 </script>
