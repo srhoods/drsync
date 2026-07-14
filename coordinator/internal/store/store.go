@@ -522,14 +522,19 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard) 
 
 // LeaseShards grants up to max queued shards to an agent, highest priority
 // first. A retried shard softly avoids the agent whose lease last expired on
-// it: such shards sort *after* all others for that agent, so it takes fresh
-// work first — but they remain grantable if they are all that is queued. This
-// is a preference, never a hard bar: a shard whose last holder is the only
-// eligible agent (common at end-of-job as the fleet shrinks) is still granted
-// rather than stranded QUEUED forever. It then either succeeds or climbs to
-// MaxShardAttempts and parks, becoming operator-visible instead of stalling
-// the pass. (A hard exclusion would freeze attempt below any cap, since attempt
-// only advances on grant — so the avoidance must be soft.)
+// it: it takes fresh work first, but such shards remain grantable if they are
+// all that is queued. This is a preference, never a hard bar — a shard whose
+// last holder is the only eligible agent (common at end-of-job as the fleet
+// shrinks) is still granted rather than stranded QUEUED forever; it then either
+// succeeds or climbs to MaxShardAttempts and parks. (A hard exclusion would
+// freeze attempt below any cap, since attempt only advances on grant.)
+//
+// The preference is implemented as two index-ordered passes rather than a
+// computed ORDER BY: a leading `(attempt>0 AND lease_agent=?)` sort key forces
+// SQLite to sort the WHOLE queued set on every grant (a temp B-tree over
+// hundreds of thousands of verify shards pegs a core under the store lock).
+// Both queries below walk shards_sched (state, priority DESC, id) in order and
+// stop at LIMIT.
 func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*ShardRow, error) {
 	if max <= 0 {
 		return nil, nil
@@ -554,29 +559,43 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT s.id, s.pass_id, s.kind, s.rel_path, s.payload, s.attempt, p.job_id, p.pass_no
+	const selCols = `SELECT s.id, s.pass_id, s.kind, s.rel_path, s.payload, s.attempt, p.job_id, p.pass_no
 		FROM shards s
 		JOIN passes p ON p.id = s.pass_id
 		JOIN jobs   j ON j.id = p.job_id
-		WHERE s.state = ? AND j.state = ?
-		ORDER BY (s.attempt > 0 AND s.lease_agent = ?) ASC, s.priority DESC, s.id
-		LIMIT ?`,
-		string(model.ShardQueued), string(model.JobRunning), agentID, max)
-	if err != nil {
+		WHERE s.state = ? AND j.state = ? `
+
+	var out []*ShardRow
+	scan := func(query string, args ...any) error {
+		rows, err := tx.Query(query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r := &ShardRow{State: model.ShardLeased}
+			if err := rows.Scan(&r.ID, &r.PassID, &r.Kind, &r.RelPath, &r.Payload, &r.Attempt, &r.JobID, &r.PassNo); err != nil {
+				return err
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	}
+
+	// Tier 1: fresh work — shards this agent did NOT last hold.
+	if err := scan(selCols+`AND NOT (s.attempt > 0 AND s.lease_agent = ?)
+		ORDER BY s.priority DESC, s.id LIMIT ?`,
+		string(model.ShardQueued), string(model.JobRunning), agentID, max); err != nil {
 		return nil, err
 	}
-	var out []*ShardRow
-	for rows.Next() {
-		r := &ShardRow{State: model.ShardLeased}
-		if err := rows.Scan(&r.ID, &r.PassID, &r.Kind, &r.RelPath, &r.Payload, &r.Attempt, &r.JobID, &r.PassNo); err != nil {
-			rows.Close()
+	// Tier 2: only if fresh work didn't fill the grant, fall back to shards this
+	// agent last held (disjoint from tier 1, so no dedup needed) — never strand.
+	if len(out) < max {
+		if err := scan(selCols+`AND s.attempt > 0 AND s.lease_agent = ?
+			ORDER BY s.priority DESC, s.id LIMIT ?`,
+			string(model.ShardQueued), string(model.JobRunning), agentID, max-len(out)); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 
 	expiry := time.Now().Add(ttl).UnixMilli()

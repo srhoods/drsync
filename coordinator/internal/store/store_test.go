@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,49 @@ func seed(t *testing.T, s *Store) (jobID, passID, shardID int64) {
 		t.Fatal(err)
 	}
 	return job.ID, pass.ID, ids[0]
+}
+
+// TestLeaseShardsIndexOrdered guards the grant hot path: both tiers of the
+// LeaseShards query must walk shards_sched in order and stop at LIMIT, never
+// sort the whole queued set. A leading computed ORDER BY term (e.g. soft
+// affinity as `(attempt>0 AND lease_agent=?) ASC`) reintroduces a temp B-tree
+// that pegs a core under the store lock at scale — this fails if that returns.
+func TestLeaseShardsIndexOrdered(t *testing.T) {
+	s := openTest(t)
+	// Mirror the two queries inside LeaseShards (kept in sync by this guard).
+	queries := []string{
+		`SELECT s.id FROM shards s JOIN passes p ON p.id = s.pass_id JOIN jobs j ON j.id = p.job_id
+		 WHERE s.state = ? AND j.state = ? AND NOT (s.attempt > 0 AND s.lease_agent = ?)
+		 ORDER BY s.priority DESC, s.id LIMIT ?`,
+		`SELECT s.id FROM shards s JOIN passes p ON p.id = s.pass_id JOIN jobs j ON j.id = p.job_id
+		 WHERE s.state = ? AND j.state = ? AND s.attempt > 0 AND s.lease_agent = ?
+		 ORDER BY s.priority DESC, s.id LIMIT ?`,
+	}
+	for i, q := range queries {
+		rows, err := s.db.Query("EXPLAIN QUERY PLAN "+q, "QUEUED", "RUNNING", "a", 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		usedIndex := false
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(detail, "TEMP B-TREE") {
+				rows.Close()
+				t.Fatalf("tier %d sorts the whole queued set: %q", i+1, detail)
+			}
+			if strings.Contains(detail, "shards_sched") {
+				usedIndex = true
+			}
+		}
+		rows.Close()
+		if !usedIndex {
+			t.Fatalf("tier %d does not use shards_sched", i+1)
+		}
+	}
 }
 
 func TestLeaseLifecycle(t *testing.T) {
