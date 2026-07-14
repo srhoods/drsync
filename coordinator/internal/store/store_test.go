@@ -2,13 +2,170 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"drsync/coordinator/internal/model"
 )
+
+// TestConcurrentReadsDuringWrites exercises the read pool: monitoring reads run
+// concurrently with the writer churning leases, with no errors or deadlock.
+func TestConcurrentReadsDuringWrites(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, _ := seed(t, s)
+	batch := make([]NewShard, 200)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%03d", i)}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 64)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() { // writer: churn leases + expiry on the write connection
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if _, err := s.LeaseShards("w", 16, -time.Second); err != nil {
+					errCh <- err
+					return
+				}
+				if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	readers := []func() error{
+		func() error { _, e := s.ShardStateCounts(passID); return e },
+		func() error { _, e := s.QueueSummary(); return e },
+		func() error { _, e := s.ListJobs(); return e },
+		func() error { _, e := s.ParkedShards(); return e },
+		func() error { _, e := s.ListPasses(jobID); return e },
+	}
+	for _, r := range readers {
+		wg.Add(1)
+		go func(fn func() error) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if err := fn(); err != nil {
+						errCh <- err
+						return
+					}
+				}
+			}
+		}(r)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent op failed: %v", err)
+	}
+}
+
+// assertCountsConsistent verifies the trigger-maintained shard_counts rollup
+// exactly matches an authoritative GROUP BY over the live shards table.
+func assertCountsConsistent(t *testing.T, s *Store, stage string) {
+	t.Helper()
+	read := func(q string) map[string]int64 {
+		rows, err := s.db.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		m := map[string]int64{}
+		for rows.Next() {
+			var pass, n int64
+			var kind, state string
+			if err := rows.Scan(&pass, &kind, &state, &n); err != nil {
+				t.Fatal(err)
+			}
+			m[fmt.Sprintf("%d/%s/%s", pass, kind, state)] = n
+		}
+		return m
+	}
+	want := read(`SELECT pass_id, kind, state, COUNT(*) FROM shards GROUP BY pass_id, kind, state`)
+	got := read(`SELECT pass_id, kind, state, n FROM shard_counts WHERE n <> 0`)
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("%s: shard_counts drift\n  authoritative: %v\n  rollup:        %v", stage, want, got)
+	}
+}
+
+// TestShardCountsRollupConsistent drives every shard transition type and checks
+// the rollup never drifts from the truth.
+func TestShardCountsRollupConsistent(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, shardID := seed(t, s)
+	assertCountsConsistent(t, s, "after seed (1 QUEUED)")
+
+	// Split the root shard into children (parent -> SPLIT, +2 QUEUED children).
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	assertCountsConsistent(t, s, "after lease (1 LEASED)")
+	if _, err := s.RecordSplit(shardID, 1, []NewShard{
+		{Kind: model.KindDir, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertCountsConsistent(t, s, "after split")
+
+	// Lease + complete a child.
+	rows, err := s.LeaseShards("agent-b", 1, time.Minute)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("lease child: %v %v", rows, err)
+	}
+	if err := s.CompleteShard(rows[0].ID, rows[0].LeaseID, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertCountsConsistent(t, s, "after complete child (1 DONE)")
+
+	// Drive the other child to PARKED via repeated lease+expiry.
+	for i := 0; i < MaxShardAttempts+1; i++ {
+		s.LeaseShards("agent-c", 1, -time.Second)
+		s.ExpireLeases(time.Now())
+	}
+	assertCountsConsistent(t, s, "after park")
+
+	// Retry then drop the parked shard.
+	parked, _ := s.ParkedShards()
+	if len(parked) == 1 {
+		if err := s.RetryParkedShard(parked[0].ID); err != nil {
+			t.Fatal(err)
+		}
+		assertCountsConsistent(t, s, "after retry parked")
+	}
+	// Delete the whole job (bulk DELETE — per-row AFTER DELETE triggers).
+	if err := s.SetJobState(jobID, model.JobCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteJob("t1"); err != nil {
+		t.Fatal(err)
+	}
+	assertCountsConsistent(t, s, "after job delete")
+	_ = passID
+}
 
 const specYAML = `
 apiVersion: drsync/v1

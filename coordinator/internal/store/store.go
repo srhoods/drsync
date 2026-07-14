@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +27,9 @@ const MaxShardAttempts = 5
 var ErrLeaseMismatch = errors.New("lease mismatch or shard not leased")
 
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex // single-writer discipline; reads share the same conn
+	db  *sql.DB    // single writer connection; all mutations serialize on mu
+	rdb *sql.DB    // read-only connection pool; pure reads run here, lock-free
+	mu  sync.Mutex // single-writer discipline for db
 }
 
 const schema = `
@@ -79,6 +81,34 @@ CREATE TABLE IF NOT EXISTS shards (
 );
 CREATE INDEX IF NOT EXISTS shards_sched ON shards (state, priority DESC, id);
 CREATE INDEX IF NOT EXISTS shards_pass  ON shards (pass_id, state);
+
+-- shard_counts is an incrementally-maintained rollup of shards by
+-- (pass_id, kind, state), so the queue/pass-progress views are O(states)
+-- instead of a GROUP BY over millions of shard rows. Triggers below keep it
+-- exact and transactional; Open() rebuilds it from shards at startup.
+CREATE TABLE IF NOT EXISTS shard_counts (
+  pass_id INTEGER NOT NULL,
+  kind    TEXT NOT NULL,
+  state   TEXT NOT NULL,
+  n       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (pass_id, kind, state)
+) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS shard_counts_ai AFTER INSERT ON shards BEGIN
+  INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (NEW.pass_id, NEW.kind, NEW.state, 1)
+    ON CONFLICT (pass_id, kind, state) DO UPDATE SET n = n + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS shard_counts_ad AFTER DELETE ON shards BEGIN
+  UPDATE shard_counts SET n = n - 1
+    WHERE pass_id = OLD.pass_id AND kind = OLD.kind AND state = OLD.state;
+END;
+CREATE TRIGGER IF NOT EXISTS shard_counts_au AFTER UPDATE ON shards
+  WHEN OLD.state <> NEW.state OR OLD.kind <> NEW.kind OR OLD.pass_id <> NEW.pass_id
+BEGIN
+  UPDATE shard_counts SET n = n - 1
+    WHERE pass_id = OLD.pass_id AND kind = OLD.kind AND state = OLD.state;
+  INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (NEW.pass_id, NEW.kind, NEW.state, 1)
+    ON CONFLICT (pass_id, kind, state) DO UPDATE SET n = n + 1;
+END;
 CREATE TABLE IF NOT EXISTS agents (
   id             TEXT PRIMARY KEY,
   hostname       TEXT,
@@ -104,8 +134,8 @@ CREATE TABLE IF NOT EXISTS journal_cursors (
 `
 
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
-	db, err := sql.Open("sqlite", dsn)
+	base := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
+	db, err := sql.Open("sqlite", base)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +154,26 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
 	}
-	return &Store{db: db}, nil
+	// Rebuild the shard_counts rollup from the authoritative shards table. Done
+	// once at startup so an upgraded DB (or one that predates the table) is
+	// consistent; the triggers keep it exact from here on.
+	if _, err := db.Exec(`DELETE FROM shard_counts;
+		INSERT INTO shard_counts (pass_id, kind, state, n)
+		SELECT pass_id, kind, state, COUNT(*) FROM shards GROUP BY pass_id, kind, state;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("rebuild shard_counts: %w", err)
+	}
+
+	// Separate read-only connection pool. WAL lets these reads run concurrently
+	// with the single writer, so monitoring/poller queries never block the agent
+	// grant/renew/complete hot path (which holds mu on db).
+	rdb, err := sql.Open("sqlite", base+"&_pragma=query_only(true)")
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	rdb.SetMaxOpenConns(max(4, runtime.NumCPU()))
+	return &Store{db: db, rdb: rdb}, nil
 }
 
 // migrations are additive DDL applied after the base schema; each must be
@@ -133,7 +182,12 @@ var migrations = []string{
 	`ALTER TABLE agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`,
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s.rdb != nil {
+		s.rdb.Close()
+	}
+	return s.db.Close()
+}
 
 func nowMS() int64 { return time.Now().UnixMilli() }
 
@@ -192,21 +246,15 @@ func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 const jobCols = `id, name, spec_yaml, state, dry_run, created_at, updated_at`
 
 func (s *Store) GetJob(name string) (*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return scanJob(s.db.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE name = ?`, name))
+	return scanJob(s.rdb.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE name = ?`, name))
 }
 
 func (s *Store) GetJobByID(id int64) (*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return scanJob(s.db.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
+	return scanJob(s.rdb.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
 }
 
 func (s *Store) ListJobs() ([]*Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT ` + jobCols + ` FROM jobs ORDER BY id`)
+	rows, err := s.rdb.Query(`SELECT ` + jobCols + ` FROM jobs ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -270,10 +318,11 @@ func (s *Store) DeleteJob(name string) (int64, error) {
 		`DELETE FROM splits WHERE parent_shard_id IN
 		   (SELECT id FROM shards WHERE pass_id IN (` + passSel + `))`,
 		`DELETE FROM shards WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM shard_counts WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM passes WHERE job_id = ?`,
 		`DELETE FROM jobs WHERE id = ?`,
 	}
-	args := []any{id, id, id, id, id}
+	args := []any{id, id, id, id, id, id}
 	for i, q := range stmts {
 		if _, err := tx.Exec(q, args[i]); err != nil {
 			return 0, err
@@ -332,9 +381,7 @@ func (s *Store) CreatePass(jobID int64, passNo int, st model.PassState) (*Pass, 
 
 // ActivePass returns the job's newest non-COMPLETE pass, or nil.
 func (s *Store) ActivePass(jobID int64) (*Pass, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, err := scanPass(s.db.QueryRow(`SELECT `+passCols+` FROM passes
+	p, err := scanPass(s.rdb.QueryRow(`SELECT `+passCols+` FROM passes
 		WHERE job_id = ? AND state != ? ORDER BY pass_no DESC LIMIT 1`,
 		jobID, string(model.PassComplete)))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -344,9 +391,7 @@ func (s *Store) ActivePass(jobID int64) (*Pass, error) {
 }
 
 func (s *Store) LatestPass(jobID int64) (*Pass, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, err := scanPass(s.db.QueryRow(`SELECT `+passCols+` FROM passes
+	p, err := scanPass(s.rdb.QueryRow(`SELECT `+passCols+` FROM passes
 		WHERE job_id = ? ORDER BY pass_no DESC LIMIT 1`, jobID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -356,16 +401,12 @@ func (s *Store) LatestPass(jobID int64) (*Pass, error) {
 
 // PassByNo returns one specific pass of a job.
 func (s *Store) PassByNo(jobID int64, passNo int) (*Pass, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return scanPass(s.db.QueryRow(`SELECT `+passCols+` FROM passes
+	return scanPass(s.rdb.QueryRow(`SELECT `+passCols+` FROM passes
 		WHERE job_id = ? AND pass_no = ?`, jobID, passNo))
 }
 
 func (s *Store) ListPasses(jobID int64) ([]*Pass, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT `+passCols+` FROM passes WHERE job_id = ? ORDER BY pass_no`, jobID)
+	rows, err := s.rdb.Query(`SELECT `+passCols+` FROM passes WHERE job_id = ? ORDER BY pass_no`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -686,18 +727,17 @@ func (s *Store) ParkShard(shardID, leaseID int64, errMsg string) error {
 
 // PassOfShard resolves a shard's pass id.
 func (s *Store) PassOfShard(shardID int64) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var passID int64
-	err := s.db.QueryRow(`SELECT pass_id FROM shards WHERE id = ?`, shardID).Scan(&passID)
+	err := s.rdb.QueryRow(`SELECT pass_id FROM shards WHERE id = ?`, shardID).Scan(&passID)
 	return passID, err
 }
 
-// ShardStateCounts returns shard counts by state for a pass.
+// ShardStateCounts returns shard counts by state for a pass. Served from the
+// maintained shard_counts rollup on the read pool — O(states), no full scan,
+// no write-lock contention.
 func (s *Store) ShardStateCounts(passID int64) (map[model.ShardState]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT state, COUNT(*) FROM shards WHERE pass_id = ? GROUP BY state`, passID)
+	rows, err := s.rdb.Query(`SELECT state, SUM(n) FROM shard_counts
+		WHERE pass_id = ? GROUP BY state HAVING SUM(n) > 0`, passID)
 	if err != nil {
 		return nil, err
 	}
@@ -724,16 +764,14 @@ type QueueRow struct {
 }
 
 // QueueSummary reports shard counts by state across every non-terminal pass —
-// the /api/v1/queue depth view.
+// the /api/v1/queue depth view. Served from the shard_counts rollup on the read
+// pool, so it is O(rollup rows) rather than a GROUP BY over every live shard.
 func (s *Store) QueueSummary() ([]QueueRow, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT j.name, p.pass_no, s.kind, s.state, COUNT(*)
-		FROM shards s
-		JOIN passes p ON p.id = s.pass_id
+	rows, err := s.rdb.Query(`SELECT j.name, p.pass_no, sc.kind, sc.state, sc.n
+		FROM shard_counts sc
+		JOIN passes p ON p.id = sc.pass_id
 		JOIN jobs   j ON j.id = p.job_id
-		WHERE p.state != ? OR s.state = ?
-		GROUP BY j.name, p.pass_no, s.kind, s.state
+		WHERE sc.n > 0 AND (p.state != ? OR sc.state = ?)
 		ORDER BY j.name, p.pass_no`,
 		string(model.PassComplete), string(model.ShardParked))
 	if err != nil {
@@ -766,9 +804,7 @@ type ParkedShard struct {
 }
 
 func (s *Store) ParkedShards() ([]ParkedShard, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT s.id, j.name, p.pass_no, s.kind, s.rel_path,
+	rows, err := s.rdb.Query(`SELECT s.id, j.name, p.pass_no, s.kind, s.rel_path,
 		s.attempt, COALESCE(s.error, ''), COALESCE(s.lease_agent, ''), s.updated_at
 		FROM shards s
 		JOIN passes p ON p.id = s.pass_id
@@ -917,9 +953,7 @@ func (s *Store) TouchAgent(id string) error {
 }
 
 func (s *Store) ListAgents() ([]*Agent, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rows, err := s.db.Query(`SELECT id, hostname, version, state, COALESCE(last_heartbeat, 0), enabled FROM agents ORDER BY id`)
+	rows, err := s.rdb.Query(`SELECT id, hostname, version, state, COALESCE(last_heartbeat, 0), enabled FROM agents ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
