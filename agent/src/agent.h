@@ -145,6 +145,10 @@ struct jrn {
 };
 
 /* ---- walk context (shared between walker and copy pool) ---- */
+/* Max split/entry-list batches shipped but not yet acked (pipeline depth).
+ * Bounds the outbox/coordinator burst while overlapping round-trips. */
+#define SPLIT_WINDOW 128
+
 struct walk_ctx {
     const struct opts_entry *oe;
     const struct shard_item *it;
@@ -154,6 +158,11 @@ struct walk_ctx {
     char                   **split;
     size_t                   n_split, cap_split;
     uint64_t                 split_seq;
+    /* In-flight split acks: shipped, awaiting the coordinator's ack. Drained
+     * (all awaited) before the shard result — the ordering invariant (§4.2) —
+     * but shipped without blocking per-batch so round-trips overlap. */
+    struct split_wait       *infl[SPLIT_WINDOW];
+    size_t                   infl_head, infl_count;
     unsigned                 tmp_seq; /* atomic: unique temp names per shard */
     char                     err[256];
     bool                     fatal;

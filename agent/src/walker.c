@@ -317,30 +317,70 @@ static void copy_symlink(struct walk_ctx *ctx, const char *dir_rel, int sfd,
 }
 
 /* ---- split queue ---- */
-#define ENTRYLIST_BATCH 50000 /* names per entry-list shard (design §2.3) */
+/* Names per entry-list shard. Sized to fan a pathological directory out into
+ * MANY shards so walkers and agents chew through it in parallel (design §2.3) —
+ * a large batch would make one giant shard that only one thread can process. */
+#define ENTRYLIST_BATCH 4000
 
 static void handle_orphan(struct walk_ctx *ctx, const char *rel, int dfd,
                           const char *name);
 
-/* Ships a prepared ShardSplit frame (subdirs or an entry list), then blocks
- * until the coordinator acks: the parent shard must not complete before its
- * children are recorded (ordering invariant, protocol §4.2). Consumes seq. */
-static void ship_split(struct walk_ctx *ctx, pb_buf *b)
+/* Awaits one in-flight split ack (timeout => fatal so the shard re-runs), then
+ * unregisters and frees the waiter. */
+static void await_split(struct walk_ctx *ctx, struct split_wait *w)
 {
-    struct split_wait w = { .parent = ctx->it->shard_id, .seq = ctx->split_seq };
-    split_register(&w);
-    out_push(FR_SHARD_SPLIT, b);
-
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += SPLIT_ACK_TIMEOUT_S;
-    if (sem_timedwait(&w.sem, &dl) < 0) {
+    if (sem_timedwait(&w->sem, &dl) < 0) {
         snprintf(ctx->err, sizeof ctx->err, "split ack timeout (seq %llu)",
-                 (unsigned long long)ctx->split_seq);
+                 (unsigned long long)w->seq);
         ctx->fatal = true;
     }
-    split_unregister(&w);
+    split_unregister(w); /* removes from the registry and sem_destroys */
+    free(w);
+}
+
+/* Ships a prepared ShardSplit frame (subdirs or an entry list) WITHOUT blocking:
+ * the ack is awaited later (drain_splits, before the shard result — the ordering
+ * invariant of protocol §4.2), so consecutive round-trips overlap instead of
+ * serialising. Blocks only for backpressure when SPLIT_WINDOW acks are already
+ * outstanding. Consumes seq. */
+static void ship_split(struct walk_ctx *ctx, pb_buf *b)
+{
+    if (ctx->infl_count == SPLIT_WINDOW) {
+        struct split_wait *old = ctx->infl[ctx->infl_head];
+        ctx->infl_head = (ctx->infl_head + 1) % SPLIT_WINDOW;
+        ctx->infl_count--;
+        await_split(ctx, old);
+    }
+    struct split_wait *w = calloc(1, sizeof *w);
+    if (!w) {
+        CTR_ADD(ctx->c.errors, 1);
+        ctx->fatal = true;
+        out_push(FR_SHARD_SPLIT, b); /* still recorded (idempotent); just not awaited */
+        ctx->split_seq++;
+        return;
+    }
+    w->parent = ctx->it->shard_id;
+    w->seq = ctx->split_seq;
+    split_register(w);
+    out_push(FR_SHARD_SPLIT, b);
+    ctx->infl[(ctx->infl_head + ctx->infl_count) % SPLIT_WINDOW] = w;
+    ctx->infl_count++;
     ctx->split_seq++;
+}
+
+/* Awaits every outstanding split ack. Must run before reporting the shard
+ * result so the coordinator has recorded all children first. */
+static void drain_splits(struct walk_ctx *ctx)
+{
+    while (ctx->infl_count > 0) {
+        struct split_wait *w = ctx->infl[ctx->infl_head];
+        ctx->infl_head = (ctx->infl_head + 1) % SPLIT_WINDOW;
+        ctx->infl_count--;
+        await_split(ctx, w);
+    }
 }
 
 static void flush_splits(struct walk_ctx *ctx)
@@ -713,7 +753,8 @@ void process_shard(const struct shard_item *it)
     } else {
         ctx.budget = (int64_t)(ctx.oe->o.shard_budget ? ctx.oe->o.shard_budget : 250000);
         walk_dir(&ctx, it->rel_path);
-        flush_splits(&ctx); /* must be acked before the result (protocol §4.2) */
+        flush_splits(&ctx);
+        drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
         jrn_flush(&ctx);
         if (!jrn_wait_acked(&ctx)) { /* same ordering invariant for journals */
             snprintf(ctx.err, sizeof ctx.err, "journal ack timeout");
@@ -832,6 +873,7 @@ void process_entrylist(const struct shard_item *it)
         ctx.budget = (int64_t)(ctx.oe->o.shard_budget ? ctx.oe->o.shard_budget : 250000);
         entrylist_walk(&ctx, it->rel_path ? it->rel_path : "", it->paths, it->n_paths);
         flush_splits(&ctx);
+        drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
         jrn_flush(&ctx);
         if (!jrn_wait_acked(&ctx)) {
             snprintf(ctx.err, sizeof ctx.err, "journal ack timeout");
