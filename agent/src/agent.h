@@ -37,6 +37,11 @@ extern atomic_uint   g_inflight; /* shards being processed right now */
 /* ---- work queue (control → workers) ---- */
 void wq_push(const struct shard_item *it); /* takes ownership of it->rel_path */
 bool wq_pop(struct shard_item *out);       /* blocks; false = shutdown */
+bool wq_trypop(struct shard_item *out);    /* non-blocking; false = empty/down */
+/* Blocks up to timeout_ms for an item. Returns: 1 = got one, 0 = timed out,
+ * -1 = shutdown. Used by the adaptive stealing loop so an idle thread rechecks
+ * the other pool's queue periodically. */
+int  wq_pop_timed(struct shard_item *out, int timeout_ms);
 int  wq_depth(void);
 void wq_shutdown(void);
 
@@ -187,9 +192,32 @@ void xattr_copy_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *nam
 bool xattr_equal_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *name);
 
 /* ---- copy pool (copy.c) ---- */
-int  cp_init(int threads, int queue_cap);
+/* reserve is the number of copy threads that stay pure drainers (never steal a
+ * shard); the rest may steal shards to help crawl when the copy queue is empty.
+ * A reserve >= 1 guarantees a drainer always exists, so walkers blocked in
+ * dpend_wait on their copies can never deadlock the pool. */
+int  cp_init(int threads, int queue_cap, int reserve);
 void cp_shutdown(void);
 int  cp_depth(void);
+/* Executes one queued copy task if one is available (non-blocking). Returns
+ * true if it ran one. Lets an idle walker help drain the copy backlog. */
+bool cp_drain_one(void);
+
+/* Dispatches one shard item to its executor (main.c); runnable from either
+ * pool so a copy thread can help crawl. Frees it and maintains g_inflight. */
+void process_item(struct shard_item *it);
+
+/* g_steal_enabled toggles the adaptive cross-pool work-stealing (default on;
+ * -S disables it and pins the pools to their fixed sizes). */
+extern bool g_steal_enabled;
+
+/* An idle stealing thread rechecks the other pool's queue this often (ms). */
+#define STEAL_POLL_MS 10
+
+/* Work-stealing telemetry: shards run by copy threads / copies run by walkers.
+ * Non-zero confirms the adaptive tuner rebalanced across the pools. */
+extern atomic_ullong g_steal_shards;
+extern atomic_ullong g_steal_copies;
 /* Blocking bounded submit (backpressure). sfd/dfd stay valid until the task
  * completes: the walker's dpend_wait precedes closing them. */
 void cp_submit(struct walk_ctx *ctx, struct dpend *dp, int sfd, int dfd,

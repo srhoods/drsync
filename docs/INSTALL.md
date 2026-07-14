@@ -188,6 +188,18 @@ drsync-agent \
 | `-w N` | `4` | Walker threads (scan/diff concurrency). |
 | `-C N` | `8` | Copy-pool threads (data movement concurrency). |
 | `-U` | off | Disable io_uring (force serial `fstatat`); A/B testing / escape hatch. |
+| `-S` | off | Disable adaptive work-stealing; pin the walker/copy pools to their fixed `-w`/`-C` sizes. |
+
+**Adaptive work-stealing (default on).** The `-w`/`-C` split is a *starting*
+allocation, not a fixed ceiling: when one phase idles a pool, its threads flex
+to the other kind of work. Idle walkers help drain the copy backlog, and idle
+copy threads pull shards to help crawl — so a job that shifts from data-heavy
+(pass 1) to metadata-heavy (later passes) rebalances automatically instead of
+leaving hosts waiting. One copy thread stays a reserved drainer, which
+guarantees the pool can never deadlock. Total threads are unchanged (no
+overcommit); they just change role. The agent logs `work-stealing: copy threads
+crawled N shards, walkers drained M copies` at shutdown so you can see it act;
+`-S` reverts to fixed pools for A/B comparison.
 | `-A`/`-E`/`-K` | *(none)* | CA bundle / client cert / client key for mTLS. All three or plaintext. |
 
 The agent **auto-reconnects**: if the control connection drops it retries with

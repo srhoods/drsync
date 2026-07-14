@@ -14,10 +14,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define COPY_BUF_SIZE (1 << 20)
@@ -135,33 +137,122 @@ void cp_submit(struct walk_ctx *ctx, struct dpend *dp, int sfd, int dfd,
     pthread_mutex_unlock(&cq_mu);
 }
 
+/* Detach the head task with cq_mu held; caller guarantees cq_head != NULL. */
+static struct copy_task *cq_take_locked(void)
+{
+    struct copy_task *t = cq_head;
+    cq_head = t->next;
+    if (!cq_head)
+        cq_tail = NULL;
+    cq_len--;
+    pthread_cond_signal(&cq_not_full);
+    return t;
+}
+
+static struct copy_task *cq_trypop(void)
+{
+    pthread_mutex_lock(&cq_mu);
+    struct copy_task *t = cq_head ? cq_take_locked() : NULL;
+    pthread_mutex_unlock(&cq_mu);
+    return t;
+}
+
+/* Blocks (no timeout) until a task or shutdown. Returns 1/-1 like the others. */
+static int cq_pop_block(struct copy_task **out)
+{
+    pthread_mutex_lock(&cq_mu);
+    while (!cq_head && !cq_down)
+        pthread_cond_wait(&cq_not_empty, &cq_mu);
+    if (cq_head) {
+        *out = cq_take_locked();
+        pthread_mutex_unlock(&cq_mu);
+        return 1;
+    }
+    pthread_mutex_unlock(&cq_mu);
+    return -1;
+}
+
+static int cq_pop_timed(struct copy_task **out, int timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&cq_mu);
+    while (!cq_head && !cq_down) {
+        if (pthread_cond_timedwait(&cq_not_empty, &cq_mu, &ts) == ETIMEDOUT)
+            break;
+    }
+    if (cq_head) {
+        *out = cq_take_locked();
+        pthread_mutex_unlock(&cq_mu);
+        return 1;
+    }
+    bool down = cq_down;
+    pthread_mutex_unlock(&cq_mu);
+    return down ? -1 : 0;
+}
+
+static void run_copy_task(struct copy_task *t)
+{
+    copy_file_task(t->ctx, t->sfd, t->dfd, t->name, t->rel, &t->ss);
+    dpend_done(t->dp);
+    free(t->rel);
+    free(t);
+}
+
+bool cp_drain_one(void)
+{
+    struct copy_task *t = cq_trypop();
+    if (!t)
+        return false;
+    run_copy_task(t);
+    return true;
+}
+
 static void *copy_thread(void *arg)
 {
-    (void)arg;
-    for (;;) {
-        pthread_mutex_lock(&cq_mu);
-        while (!cq_head && !cq_down)
-            pthread_cond_wait(&cq_not_empty, &cq_mu);
-        if (!cq_head) {
-            pthread_mutex_unlock(&cq_mu);
-            return NULL;
-        }
-        struct copy_task *t = cq_head;
-        cq_head = t->next;
-        if (!cq_head)
-            cq_tail = NULL;
-        cq_len--;
-        pthread_cond_signal(&cq_not_full);
-        pthread_mutex_unlock(&cq_mu);
+    bool may_steal = (bool)(intptr_t)arg;
+    struct shard_item it;
 
-        copy_file_task(t->ctx, t->sfd, t->dfd, t->name, t->rel, &t->ss);
-        dpend_done(t->dp);
-        free(t->rel);
-        free(t);
+    if (!may_steal) { /* pure drainer: always available to drain the copy queue */
+        for (;;) {
+            struct copy_task *t;
+            if (cq_pop_block(&t) < 0)
+                return NULL;
+            run_copy_task(t);
+        }
+    }
+
+    /* Generalist: prefer copies, but when the copy queue is empty steal a shard
+     * and help crawl. The reserved drainer(s) guarantee this thread's own
+     * enqueued copies (and everyone's) still drain while it blocks in
+     * dpend_wait, so the pool cannot deadlock. */
+    for (;;) {
+        struct copy_task *t = cq_trypop();
+        if (t) {
+            run_copy_task(t);
+            continue;
+        }
+        if (wq_trypop(&it)) {
+            atomic_fetch_add(&g_steal_shards, 1);
+            process_item(&it);
+            continue;
+        }
+        int r = cq_pop_timed(&t, STEAL_POLL_MS);
+        if (r < 0)
+            return NULL;
+        if (r > 0)
+            run_copy_task(t);
+        /* r == 0: timed out — loop to recheck the shard queue */
     }
 }
 
-int cp_init(int threads, int queue_cap)
+int cp_init(int threads, int queue_cap, int reserve)
 {
     cq_nthreads = threads;
     cq_cap = queue_cap;
@@ -169,7 +260,9 @@ int cp_init(int threads, int queue_cap)
     if (!cq_threads)
         return -1;
     for (int i = 0; i < threads; i++) {
-        if (pthread_create(&cq_threads[i], NULL, copy_thread, NULL) != 0)
+        bool may_steal = i >= reserve; /* first `reserve` stay pure drainers */
+        if (pthread_create(&cq_threads[i], NULL, copy_thread,
+                           (void *)(intptr_t)may_steal) != 0)
             return -1;
     }
     return 0;

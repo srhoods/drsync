@@ -85,6 +85,55 @@ bool wq_pop(struct shard_item *out)
     return true;
 }
 
+/* Pop the head node's item with wq_mu held; caller guarantees wq_head != NULL. */
+static void wq_take_locked(struct shard_item *out)
+{
+    struct wq_node *n = wq_head;
+    wq_head = n->next;
+    if (!wq_head)
+        wq_tail = NULL;
+    wq_len--;
+    *out = n->it;
+    free(n);
+}
+
+bool wq_trypop(struct shard_item *out)
+{
+    pthread_mutex_lock(&wq_mu);
+    if (!wq_head) {
+        pthread_mutex_unlock(&wq_mu);
+        return false;
+    }
+    wq_take_locked(out);
+    pthread_mutex_unlock(&wq_mu);
+    return true;
+}
+
+int wq_pop_timed(struct shard_item *out, int timeout_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&wq_mu);
+    while (!wq_head && !wq_down) {
+        if (pthread_cond_timedwait(&wq_cv, &wq_mu, &ts) == ETIMEDOUT)
+            break;
+    }
+    if (wq_head) {
+        wq_take_locked(out);
+        pthread_mutex_unlock(&wq_mu);
+        return 1;
+    }
+    bool down = wq_down;
+    pthread_mutex_unlock(&wq_mu);
+    return down ? -1 : 0;
+}
+
 int wq_depth(void)
 {
     pthread_mutex_lock(&wq_mu);

@@ -34,6 +34,11 @@ struct agent_cfg {
 
 static struct agent_cfg cfg = { .workers = 4, .copy_threads = 8 };
 
+/* Adaptive cross-pool work-stealing: on by default, -S pins the pools. */
+bool g_steal_enabled = true;
+atomic_ullong g_steal_shards; /* shards a copy thread crawled */
+atomic_ullong g_steal_copies; /* copies a walker drained */
+
 /* control-thread state */
 static struct conn g_conn = { .fd = -1 };
 static bool     g_pause, g_drain, g_request_pending, g_starved;
@@ -41,26 +46,56 @@ static uint64_t g_hb_seq;
 static uint32_t g_hb_interval_s = 5;
 static uint64_t g_fleet_epoch;    /* from the first HelloAck */
 static bool     g_have_epoch;
-static bool     g_want_exit;      /* coordinator asked us to shut down */
+static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to stop */
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_want_exit = 1;
+}
+
+void process_item(struct shard_item *it)
+{
+    atomic_fetch_add(&g_inflight, 1);
+    if (it->kind == WI_DELETE)
+        process_delete(it);
+    else if (it->kind == WI_VERIFY)
+        process_verify(it);
+    else if (it->kind == WI_ENTRYLIST)
+        process_entrylist(it);
+    else
+        process_shard(it);
+    shard_item_free(it);
+    atomic_fetch_sub(&g_inflight, 1);
+}
 
 static void *worker_main(void *arg)
 {
     (void)arg;
     struct shard_item it;
-    while (wq_pop(&it)) {
-        atomic_fetch_add(&g_inflight, 1);
-        if (it.kind == WI_DELETE)
-            process_delete(&it);
-        else if (it.kind == WI_VERIFY)
-            process_verify(&it);
-        else if (it.kind == WI_ENTRYLIST)
-            process_entrylist(&it);
-        else
-            process_shard(&it);
-        shard_item_free(&it);
-        atomic_fetch_sub(&g_inflight, 1);
+    if (!g_steal_enabled) { /* fixed pools: plain blocking crawl loop */
+        while (wq_pop(&it))
+            process_item(&it);
+        return NULL;
     }
-    return NULL;
+    /* Adaptive: crawl first, but when no shards are queued help drain the copy
+     * backlog instead of idling (safe — copies never wait on anything). */
+    for (;;) {
+        if (wq_trypop(&it)) {
+            process_item(&it);
+            continue;
+        }
+        if (cp_drain_one()) {
+            atomic_fetch_add(&g_steal_copies, 1);
+            continue;
+        }
+        int r = wq_pop_timed(&it, STEAL_POLL_MS);
+        if (r < 0)
+            return NULL;
+        if (r > 0)
+            process_item(&it);
+        /* r == 0: timed out — loop to recheck the copy queue */
+    }
 }
 
 static uint64_t read_rss(void)
@@ -133,7 +168,11 @@ static void maybe_request_work(bool from_timer)
     if (g_starved && !from_timer)
         return; /* empty grant last time; retry only on the 1 Hz tick */
     g_starved = false;
-    int cap = cfg.workers * 2;
+    /* Prefetch window. With work-stealing on, copy threads can also crawl, so
+     * size the window to the whole pool — otherwise the extra crawl capacity
+     * starves for shards during metadata-heavy phases. */
+    int crawlers = cfg.workers + (g_steal_enabled ? cfg.copy_threads : 0);
+    int cap = crawlers * 2;
     int avail = cap - wq_depth() - (int)atomic_load(&g_inflight);
     if (avail <= 0)
         return;
@@ -347,7 +386,7 @@ int main(int argc, char **argv)
     default_agent_id(cfg.agent_id, sizeof cfg.agent_id);
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:i:w:C:UA:E:K:h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:i:w:C:USA:E:K:h")) != -1) {
         switch (opt) {
         case 'c':
             snprintf(cfg.coordinator, sizeof cfg.coordinator, "%s", optarg);
@@ -381,16 +420,21 @@ int main(int argc, char **argv)
         case 'U':
             cfg.no_uring = true; /* A/B benchmarking + emergency escape hatch */
             break;
+        case 'S':
+            g_steal_enabled = false; /* pin the walker/copy pools to fixed sizes */
+            break;
         default:
             fprintf(stderr,
                     "usage: drsync-agent [-c host:port] [-i agent-id] [-w walkers]"
-                    " [-C copy-threads] [-U(no io_uring)]\n"
+                    " [-C copy-threads] [-U(no io_uring)] [-S(no work-stealing)]\n"
                     "                    [-A ca.crt -E agent.crt -K agent.key (mTLS)]\n");
             return 2;
         }
     }
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, on_signal); /* clean drain on Ctrl-C / systemd stop */
+    signal(SIGTERM, on_signal);
     uring_probe(!cfg.no_uring);
 
     /* mTLS: all three of CA, cert and key together, or none (plaintext dev). */
@@ -412,7 +456,11 @@ int main(int argc, char **argv)
         LOGE("outbox init failed");
         return 1;
     }
-    if (cp_init(cfg.copy_threads, cfg.copy_threads * 8) < 0) {
+    /* Reserve one copy thread as a pure drainer when stealing is on (and there
+     * are >= 2), so shard-stealing copy threads can never starve their own
+     * copies. Stealing off (or a lone copy thread) => all pure drainers. */
+    int cp_reserve = (g_steal_enabled && cfg.copy_threads >= 2) ? 1 : cfg.copy_threads;
+    if (cp_init(cfg.copy_threads, cfg.copy_threads * 8, cp_reserve) < 0) {
         LOGE("copy pool init failed");
         return 1;
     }
@@ -557,6 +605,10 @@ int main(int argc, char **argv)
     for (int i = 0; i < cfg.workers; i++)
         pthread_join(threads[i], NULL);
     cp_shutdown();
+    if (g_steal_enabled)
+        LOGI("work-stealing: copy threads crawled %llu shards, walkers drained %llu copies",
+             (unsigned long long)atomic_load(&g_steal_shards),
+             (unsigned long long)atomic_load(&g_steal_copies));
     free(threads);
     session_teardown();
     return exit_code;
