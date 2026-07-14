@@ -250,6 +250,42 @@ func TestLeaseShardsIndexOrdered(t *testing.T) {
 	}
 }
 
+// TestRenewLeasesByIDOnlyHeld is the end-of-scan stall regression: a heartbeat
+// renews only the leases the agent still holds; a lease the agent no longer
+// holds (lost grant / dropped result) is left to expire and requeue.
+func TestRenewLeasesByIDOnlyHeld(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+	if _, err := s.InsertShards(passID, 0, []NewShard{{Kind: model.KindDir, RelPath: "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Lease both shards to agent-a with an already-past TTL (due to expire).
+	rows, err := s.LeaseShards("agent-a", 4, -time.Second)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("want 2 leased, got %v err=%v", rows, err)
+	}
+	// The agent's heartbeat reports holding only the first lease.
+	if err := s.RenewLeasesByID("agent-a", []int64{rows[0].LeaseID}, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	// Sweep: exactly the un-renewed lease requeues; the renewed one survives.
+	requeued, parked, err := s.ExpireLeases(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requeued != 1 || parked != 0 {
+		t.Fatalf("want 1 requeued (the unheld lease), got requeued=%d parked=%d", requeued, parked)
+	}
+	counts, _ := s.ShardStateCounts(passID)
+	if counts[model.ShardLeased] != 1 || counts[model.ShardQueued] != 1 {
+		t.Fatalf("counts=%+v, want 1 LEASED (renewed) + 1 QUEUED (expired)", counts)
+	}
+	// Empty held list must renew nothing (never fall back to renew-all).
+	if err := s.RenewLeasesByID("agent-a", nil, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLeaseLifecycle(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)

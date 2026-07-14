@@ -226,7 +226,14 @@ func (s *Server) dispatch(ac *agentConn, ft drsyncpb.FrameType, payload []byte) 
 }
 
 func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
-	if err := s.st.RenewLeases(ac.id, s.cfg.LeaseTTL); err != nil {
+	// Renew only the leases the agent still holds (per the heartbeat), so a
+	// lost grant or a dropped result frame is left to expire and requeue rather
+	// than renewed forever (which stalls the pass).
+	held := make([]int64, len(hb.HeldLeaseIds))
+	for i, id := range hb.HeldLeaseIds {
+		held[i] = int64(id)
+	}
+	if err := s.st.RenewLeasesByID(ac.id, held, s.cfg.LeaseTTL); err != nil {
 		return err
 	}
 	if err := s.st.TouchAgent(ac.id); err != nil {

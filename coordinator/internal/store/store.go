@@ -652,12 +652,34 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	return out, tx.Commit()
 }
 
-// RenewLeases extends every lease held by the agent (heartbeat side effect).
-func (s *Store) RenewLeases(agentID string, ttl time.Duration) error {
+// RenewLeasesByID extends only the leases the agent reports still holding in
+// its heartbeat (held_lease_ids), scoped to leases actually assigned to it.
+//
+// Renewing every lease by agent id (the old behaviour) kept alive shards the
+// agent does NOT actually hold — a WorkGrant frame lost in flight, or a shard
+// the agent finished whose ShardResult was dropped (it has already done
+// lease_remove). Those leases would be renewed forever, so inFlight never
+// reaches 0 and the pass stalls until the agent is stopped. Honouring the held
+// list lets such a lease expire, so the sweeper requeues it and it is re-granted
+// (re-execution is idempotent) — the stall self-heals within one TTL.
+func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Duration) error {
+	if len(leaseIDs) == 0 {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE shards SET lease_expiry = ? WHERE state = ? AND lease_agent = ?`,
-		time.Now().Add(ttl).UnixMilli(), string(model.ShardLeased), agentID)
+	args := make([]any, 0, len(leaseIDs)+3)
+	args = append(args, time.Now().Add(ttl).UnixMilli(), string(model.ShardLeased), agentID)
+	ph := make([]byte, 0, len(leaseIDs)*2)
+	for i, id := range leaseIDs {
+		if i > 0 {
+			ph = append(ph, ',')
+		}
+		ph = append(ph, '?')
+		args = append(args, id)
+	}
+	_, err := s.db.Exec(`UPDATE shards SET lease_expiry = ?
+		WHERE state = ? AND lease_agent = ? AND lease_id IN (`+string(ph)+`)`, args...)
 	return err
 }
 
