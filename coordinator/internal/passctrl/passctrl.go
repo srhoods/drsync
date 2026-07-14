@@ -199,81 +199,82 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) error {
 // sides. META_FIXED entries get metadata-only verification. The journal is
 // complete here because shard results arrive only after their journal batches
 // are acked (protocol §4.2), and this runs only once the pass has drained.
+//
+// It STREAMS the journal into fixed-size batches, inserting each verify shard
+// as its batch fills — memory is O(verifyBatchSize), never O(files-copied), so
+// it scales to hundred-million-file passes (state is sized by shards, not
+// files). Journaling is at-least-once, so a re-run shard may re-emit a path;
+// the resulting duplicate verify entry is idempotent (the file is simply
+// verified twice), which we accept rather than hold a whole-pass dedup map in
+// the heap. verify.mode=off skips the phase entirely.
 func (c *Controller) seedVerify(job *store.Job, pass *store.Pass) (int, error) {
 	spec, err := model.ParseSpec(job.SpecYAML)
 	if err != nil {
 		return 0, err
 	}
+	if spec.Spec.Verify.Mode == "off" {
+		return 0, nil // verification disabled by spec
+	}
 	ppm := uint64(spec.Spec.Verify.Checksum.SampleRate * 1_000_000)
 
-	type ventry struct {
-		rel      string
-		checksum bool
+	total := 0
+	batch := make([]*drsyncpb.VerifyEntry, 0, verifyBatchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		payload, err := proto.Marshal(&drsyncpb.VerifyBatch{Entries: batch})
+		if err != nil {
+			return err
+		}
+		if _, err := c.st.InsertShards(pass.ID, 0,
+			[]store.NewShard{{Kind: model.KindVerify, Payload: payload}}); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
 	}
-	seen := map[string]bool{} // rel → checksum (dedup: at-least-once journal)
+
+	// Floor: a pass that copies data never verifies zero bytes. With O(1)
+	// memory we cannot retroactively flip a bit in an already-flushed batch, so
+	// force-checksum the first COPIED entry whenever sampling is on. This is a
+	// superset of "checksum one if the sample picked none" — at most one extra
+	// file is hashed — and needs no whole-pass state.
+	firstCopied := true
+
 	err = journal.ReadRecords(c.journalRoot, job.ID, pass.PassNo,
 		func(r *drsyncpb.JournalRecord) error {
+			var checksum bool
 			switch r.Type {
 			case drsyncpb.JournalRecord_JR_COPIED:
-				rel := string(r.RelPath)
 				h := fnv.New64a()
 				h.Write(r.RelPath)
-				seen[rel] = seen[rel] || h.Sum64()%1_000_000 < ppm
-			case drsyncpb.JournalRecord_JR_META_FIXED:
-				rel := string(r.RelPath)
-				if _, ok := seen[rel]; !ok {
-					seen[rel] = false
+				checksum = h.Sum64()%1_000_000 < ppm
+				if firstCopied && ppm > 0 {
+					checksum = true
 				}
+				firstCopied = false
+			case drsyncpb.JournalRecord_JR_META_FIXED:
+				checksum = false
+			default:
+				return nil
+			}
+			// r.RelPath is a fresh slice per record (proto.Unmarshal copies
+			// bytes fields), so it is safe to retain past this callback.
+			batch = append(batch, &drsyncpb.VerifyEntry{RelPath: r.RelPath, Checksum: checksum})
+			total++
+			if len(batch) >= verifyBatchSize {
+				return flush()
 			}
 			return nil
 		})
 	if err != nil {
 		return 0, fmt.Errorf("read journal for verify: %w", err)
 	}
-	if len(seen) == 0 {
-		return 0, nil // nothing was written this pass
-	}
-	entries := make([]ventry, 0, len(seen))
-	nChecksum := 0
-	for rel, cs := range seen {
-		entries = append(entries, ventry{rel, cs})
-		if cs {
-			nChecksum++
-		}
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
-	// Floor: if the sample selected nothing but data was copied, checksum one
-	// file — a pass that copies data never verifies zero bytes.
-	if nChecksum == 0 && ppm > 0 {
-		for i := range entries {
-			if !entries[i].checksum {
-				entries[i].checksum = true
-				break
-			}
-		}
-	}
-
-	var shards []store.NewShard
-	for start := 0; start < len(entries); start += verifyBatchSize {
-		end := start + verifyBatchSize
-		if end > len(entries) {
-			end = len(entries)
-		}
-		batch := &drsyncpb.VerifyBatch{}
-		for _, e := range entries[start:end] {
-			batch.Entries = append(batch.Entries, &drsyncpb.VerifyEntry{
-				RelPath: []byte(e.rel), Checksum: e.checksum})
-		}
-		payload, err := proto.Marshal(batch)
-		if err != nil {
-			return 0, err
-		}
-		shards = append(shards, store.NewShard{Kind: model.KindVerify, Payload: payload})
-	}
-	if _, err := c.st.InsertShards(pass.ID, 0, shards); err != nil {
+	if err := flush(); err != nil {
 		return 0, err
 	}
-	return len(entries), nil
+	return total, nil
 }
 
 // TriggerPass starts the next pass manually. Works on RUNNING jobs between

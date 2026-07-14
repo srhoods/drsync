@@ -87,6 +87,7 @@ type JobSpec struct {
 			Specials *bool `yaml:"specials"`
 		} `yaml:"metadata"`
 		Verify struct {
+			Mode     string `yaml:"mode"` // on (default) | off — off skips the verify phase entirely
 			Checksum struct {
 				SampleRate float64 `yaml:"sample_rate"`
 				OnMismatch string  `yaml:"on_mismatch"`
@@ -166,6 +167,9 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Metadata.ACLs.Untranslatable = "warn"
 	}
 	boolDefault(&sp.Metadata.Specials, true)
+	if sp.Verify.Mode == "" {
+		sp.Verify.Mode = "on"
+	}
 	if sp.Verify.Checksum.SampleRate == 0 {
 		sp.Verify.Checksum.SampleRate = 0.01
 	}
@@ -224,6 +228,11 @@ func (s *JobSpec) Validate() error {
 	case "report", "mirror":
 	default:
 		return fmt.Errorf("deletes.mode must be report|mirror")
+	}
+	switch s.Spec.Verify.Mode {
+	case "on", "off":
+	default:
+		return fmt.Errorf("verify.mode must be on|off")
 	}
 	if r := s.Spec.Verify.Checksum.SampleRate; r < 0 || r > 1 {
 		return fmt.Errorf("verify.checksum.sample_rate must be in [0,1]")

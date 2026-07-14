@@ -72,6 +72,7 @@ spec:
     specials: true                   # device nodes, FIFOs, sockets (needs root)
 
   verify:
+    mode: on                         # on (default) | off — off skips the verify phase
     metadata: all                    # every entry re-checked after copy pass
     checksum:
       algorithm: xxh3-128

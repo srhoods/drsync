@@ -119,6 +119,7 @@ spec:
     specials: true                # device nodes, FIFOs, sockets
 
   verify:
+    mode: on                      # on (default) | off — "off" skips the verify phase entirely
     checksum:
       sample_rate: 0.01           # fraction of copied entries re-read + checksummed (0..1)
       on_mismatch: recopy         # recopy | fail
