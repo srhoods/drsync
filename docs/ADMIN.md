@@ -34,8 +34,25 @@ fixpoint), or until `passes.converge_when` thresholds are met, or the
 
 **Shards & leases.** The coordinator splits the walk into *shards* granted to
 agents under a lease (TTL `-lease-ttl`). If an agent dies, its lease expires and
-the shard is requeued elsewhere. A shard that fails repeatedly is **parked** for
-operator attention rather than retried forever.
+the shard is requeued. A requeued shard *softly* avoids the agent whose lease
+just expired on it — it sorts after fresh work for that agent, so the shard
+prefers a different agent — but the avoidance is only a preference: if that
+agent is the only one available (common at the tail of a job as the fleet
+idles), the shard is still granted rather than stranded. A shard that fails its
+max attempts is **parked** for operator attention rather than retried forever.
+
+**Resolving parked shards.** A parked shard blocks its pass (and thus the job)
+from completing — the coordinator will not silently skip work. List parked
+shards with `drsync queue`; fix the underlying cause (remount, permissions,
+etc.); then either **retry** them for a fresh attempt or **drop** them to accept
+the gap and let the pass finish:
+
+```
+drsync queue retry <shard-id>      # requeue one shard (attempt reset; any agent)
+drsync queue drop  <shard-id>      # discard one shard, accept the gap
+drsync queue retry --job <name>    # retry every parked shard of a job
+drsync queue drop  --job <name>    # drop  every parked shard of a job
+```
 
 **Journals.** Every copy, meta-fix, orphan, error and verify result is journaled
 durably on the coordinator. This is your audit trail and the input to the verify
@@ -165,6 +182,8 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 | `drsync agent enable <id>` | Re-admit a disabled agent to scheduling. |
 | `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, fidelity exceptions. The per-pass table ends with a **TOTAL** footer row summing the additive columns (duration, delta-files, delta-bytes, verify, errors; orphans is a per-scan census so it is dashed). Your go/no-go artifact. |
 | `drsync queue` | Shard queue depth by state, including **parked** shards. |
+| `drsync queue retry <shard-id> \| --job <name>` | Requeue parked shard(s) for a fresh attempt on any agent (attempt counter reset). Use after fixing the underlying cause. `--job` retries every parked shard of a job. |
+| `drsync queue drop <shard-id> \| --job <name>` | Permanently discard parked shard(s), accepting the gap and unblocking the pass so the job can complete. `--job` drops every parked shard of a job. |
 | `drsync errors <name> [--pass N\|all] [--class EACCES] [--path prefix] [--limit N] [--offset N]` | Browse errors, filterable by errno class and path prefix. |
 | `drsync journal cat <name> [--pass N\|all] [--type orphan] [--path prefix] [--summary] [--jsonl]` | Page the journal. `--type` filters record kind (`orphan`, `error`, `copied`, `meta_fixed`, `verify_fail`, …); `--summary` counts records by type instead of listing them (color-coded: **green** nominal, **yellow** informational — `would_copy`/`would_delete`/`nlink_dup`/`orphan`/`src_changed`, **red** failures — `error`/`fidelity_exception`/`verify_fail`); `--jsonl` emits raw records (or the summary histogram) for scripting. |
 | `drsync events [--job name]` | Tail the live event stream (state changes, agent connect/disconnect, parked-shard alerts, 1 Hz stats). |
@@ -382,7 +401,7 @@ anything you need first (`drsync report <name> --json`, `drsync journal cat
 | Symptom | Likely cause & fix |
 |---------|--------------------|
 | Agent shows `CONNECTED false` / never appears in `drsync agent list` | mTLS failure. Check the agent log: a cert not signed by the fleet CA is rejected by the coordinator; a server-cert SAN that doesn't match the dialed host/IP is rejected by the agent. Re-issue with the right `--dns`/`--ip`. A plaintext agent against a TLS coordinator is refused. |
-| Job stuck, `drsync queue` shows **parked** shards | A shard failed its max attempts (permissions, a sick mount, a path that keeps erroring). `drsync errors <name>` to see why; fix the underlying issue (e.g. remount, chmod) and the coordinator retries after the lease/park logic, or cancel and resubmit. |
+| Job stuck, `drsync queue` shows **parked** shards | A shard failed its max attempts (permissions, a sick mount, a path that keeps erroring). `drsync errors <name>` to see why; fix the underlying issue (e.g. remount, chmod), then `drsync queue retry <shard-id>` (or `--job <name>`) to re-run it, or `drsync queue drop <shard-id>` to accept the gap and let the pass finish. |
 | Errors with `class MOUNT_SICK` / `ESTALE` | An agent's mount is unhealthy; that shard is requeued to another agent. Check `RequiresMountsFor` and NFS health on the offending host. |
 | Job runs to `passes.max` without `COMPLETED` | The source is changing faster than it converges, or `converge_when` is too strict. A pass that changes nothing always converges; if the delta never reaches zero, quiesce the source for a final pass (§4.3) or relax `converge_when`. |
 | A single huge directory or file dominates runtime | Lower `tuning.dir_split_threshold` (fan the directory out) and/or `copy.chunk_threshold` (parallelize the file). See §4.5. |

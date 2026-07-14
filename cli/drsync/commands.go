@@ -843,6 +843,9 @@ func cmdReport(args []string) error {
 }
 
 func cmdQueue(args []string) error {
+	if len(args) > 0 && (args[0] == "retry" || args[0] == "drop") {
+		return queueParked(args[0], args[1:])
+	}
 	fs := flag.NewFlagSet("queue", flag.ExitOnError)
 	mk := connFlags(fs)
 	fs.Parse(args)
@@ -874,6 +877,50 @@ func cmdQueue(args []string) error {
 			p["shard_id"], p["job"], p["pass_no"], p["kind"], p["rel_path"],
 			p["error"], p["attempt"], p["last_agent"])
 	}
+	if len(out.Parked) > 0 {
+		fmt.Println("\nresolve with: drsync queue retry <shard-id> | drsync queue drop <shard-id>" +
+			"  (or --job <name> for all of a job's parked shards)")
+	}
+	return nil
+}
+
+// queueParked retries or drops PARKED shards: a single shard by id, or every
+// parked shard of a job with --job. Retry requeues for a fresh attempt (any
+// agent); drop discards the shard, accepting the gap and unblocking the pass.
+func queueParked(action string, args []string) error {
+	fs := flag.NewFlagSet("queue "+action, flag.ExitOnError)
+	mk := connFlags(fs)
+	job := fs.String("job", "", "act on ALL parked shards of this job instead of one shard id")
+	fs.Parse(args)
+	c := mk()
+	past := map[string]string{"retry": "retried", "drop": "dropped"}[action]
+
+	if *job != "" {
+		if fs.NArg() != 0 {
+			return fmt.Errorf("give a shard id or --job, not both")
+		}
+		var out struct {
+			Job   string `json:"job"`
+			Count int64  `json:"count"`
+		}
+		if err := c.post("/api/v1/jobs/"+url.PathEscape(*job)+"/parked/"+action, nil, &out); err != nil {
+			return err
+		}
+		fmt.Printf("%s %d parked shard(s) for job %s\n", past, out.Count, out.Job)
+		return nil
+	}
+
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drsync queue %s <shard-id> | --job <name>", action)
+	}
+	id := fs.Arg(0)
+	var out struct {
+		ShardID int64 `json:"shard_id"`
+	}
+	if err := c.post("/api/v1/parked/"+url.PathEscape(id)+"/"+action, nil, &out); err != nil {
+		return err
+	}
+	fmt.Printf("%s parked shard %d\n", past, out.ShardID)
 	return nil
 }
 

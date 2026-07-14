@@ -521,7 +521,15 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard) 
 }
 
 // LeaseShards grants up to max queued shards to an agent, highest priority
-// first. Retried shards avoid the agent whose lease last expired on them.
+// first. A retried shard softly avoids the agent whose lease last expired on
+// it: such shards sort *after* all others for that agent, so it takes fresh
+// work first — but they remain grantable if they are all that is queued. This
+// is a preference, never a hard bar: a shard whose last holder is the only
+// eligible agent (common at end-of-job as the fleet shrinks) is still granted
+// rather than stranded QUEUED forever. It then either succeeds or climbs to
+// MaxShardAttempts and parks, becoming operator-visible instead of stalling
+// the pass. (A hard exclusion would freeze attempt below any cap, since attempt
+// only advances on grant — so the avoidance must be soft.)
 func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*ShardRow, error) {
 	if max <= 0 {
 		return nil, nil
@@ -551,8 +559,7 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 		JOIN passes p ON p.id = s.pass_id
 		JOIN jobs   j ON j.id = p.job_id
 		WHERE s.state = ? AND j.state = ?
-		  AND NOT (s.attempt > 0 AND s.lease_agent = ?)
-		ORDER BY s.priority DESC, s.id
+		ORDER BY (s.attempt > 0 AND s.lease_agent = ?) ASC, s.priority DESC, s.id
 		LIMIT ?`,
 		string(model.ShardQueued), string(model.JobRunning), agentID, max)
 	if err != nil {
@@ -763,6 +770,72 @@ func (s *Store) ParkedShards() ([]ParkedShard, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ErrNotParked is returned when a retry/drop targets a shard that is not
+// PARKED (unknown id, or still in flight).
+var ErrNotParked = errors.New("shard not found or not parked")
+
+// RetryParkedShard returns a single PARKED shard to the queue for a fresh
+// attempt: attempt and agent affinity are reset so any agent may take it, and
+// the recorded error is cleared. The shard's pass/job must still exist; a
+// completed job's pass will not schedule it until the job runs again.
+func (s *Store) RetryParkedShard(shardID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, err := s.execCount(`UPDATE shards
+		SET state = ?, attempt = 0, lease_id = NULL, lease_agent = NULL,
+		    lease_expiry = NULL, error = NULL, updated_at = ?
+		WHERE id = ? AND state = ?`,
+		string(model.ShardQueued), nowMS(), shardID, string(model.ShardParked))
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotParked
+	}
+	return nil
+}
+
+// RetryParkedByJob requeues every PARKED shard belonging to a job. Returns the
+// number requeued.
+func (s *Store) RetryParkedByJob(jobName string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.execCount(`UPDATE shards
+		SET state = ?, attempt = 0, lease_id = NULL, lease_agent = NULL,
+		    lease_expiry = NULL, error = NULL, updated_at = ?
+		WHERE state = ? AND pass_id IN (
+			SELECT p.id FROM passes p JOIN jobs j ON j.id = p.job_id WHERE j.name = ?)`,
+		string(model.ShardQueued), nowMS(), string(model.ShardParked), jobName)
+}
+
+// DropParkedShard permanently discards a single PARKED shard, accepting the
+// gap it represents. This unblocks a pass that advance() is holding open on
+// parked work.
+func (s *Store) DropParkedShard(shardID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, err := s.execCount(`DELETE FROM shards WHERE id = ? AND state = ?`,
+		shardID, string(model.ShardParked))
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotParked
+	}
+	return nil
+}
+
+// DropParkedByJob permanently discards every PARKED shard of a job. Returns the
+// number dropped.
+func (s *Store) DropParkedByJob(jobName string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.execCount(`DELETE FROM shards
+		WHERE state = ? AND pass_id IN (
+			SELECT p.id FROM passes p JOIN jobs j ON j.id = p.job_id WHERE j.name = ?)`,
+		string(model.ShardParked), jobName)
 }
 
 // ---------------------------------------------------------------------------

@@ -69,6 +69,12 @@ INSPECT & AUDIT
         Migration/cutover summary: per-pass delta, convergence curve, totals.
   queue
         Shard queue depth by state, including PARKED shards needing attention.
+  queue retry <shard-id> | --job <name>
+        Requeue parked shard(s) for a fresh attempt on any agent (after fixing
+        the cause). --job retries every parked shard of a job.
+  queue drop <shard-id> | --job <name>
+        Permanently discard parked shard(s), accepting the gap and unblocking
+        the pass. --job drops every parked shard of a job.
   errors <name> [--pass N|all] [--class EACCES] [--path prefix] [--limit N] [--offset N]
         Browse errors; --class filters by errno name (EACCES, ENOENT, ESTALE, ...).
   journal cat <name> [--pass N|all] [--type T] [--path prefix] [--summary] [--jsonl]

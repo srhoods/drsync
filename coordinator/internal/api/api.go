@@ -89,6 +89,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/agents/{id}/enable", s.auth(s.setAgentEnabled(true)))
 	mux.HandleFunc("POST /api/v1/agents/{id}/disable", s.auth(s.setAgentEnabled(false)))
 	mux.HandleFunc("GET /api/v1/queue", s.auth(s.getQueue))
+	mux.HandleFunc("POST /api/v1/parked/{id}/retry", s.auth(s.parkedShardAction("retry")))
+	mux.HandleFunc("POST /api/v1/parked/{id}/drop", s.auth(s.parkedShardAction("drop")))
+	mux.HandleFunc("POST /api/v1/jobs/{name}/parked/retry", s.auth(s.parkedJobAction("retry")))
+	mux.HandleFunc("POST /api/v1/jobs/{name}/parked/drop", s.auth(s.parkedJobAction("drop")))
 	mux.HandleFunc("GET /api/v1/events", s.auth(s.eventsWS))
 	return cors(mux)
 }
@@ -463,5 +467,57 @@ func (s *Server) setAgentEnabled(enabled bool) http.HandlerFunc {
 		}
 		slog.Info("agent action", "agent", id, "action", action)
 		writeJSON(w, http.StatusOK, map[string]any{"agent": id, "enabled": enabled})
+	}
+}
+
+// parkedShardAction retries or drops a single PARKED shard by id.
+//
+//	POST /api/v1/parked/{id}/retry — requeue for a fresh attempt (any agent)
+//	POST /api/v1/parked/{id}/drop  — discard, accepting the gap
+func (s *Server) parkedShardAction(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			httpErr(w, http.StatusBadRequest, "invalid shard id")
+			return
+		}
+		if action == "retry" {
+			err = s.st.RetryParkedShard(id)
+		} else {
+			err = s.st.DropParkedShard(id)
+		}
+		if errors.Is(err, store.ErrNotParked) {
+			httpErr(w, http.StatusNotFound, "no parked shard with id %d", id)
+			return
+		}
+		if err != nil {
+			httpErr(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		slog.Info("parked shard action", "shard", id, "action", action)
+		writeJSON(w, http.StatusOK, map[string]any{"shard_id": id, "action": action})
+	}
+}
+
+// parkedJobAction retries or drops every PARKED shard of one job.
+//
+//	POST /api/v1/jobs/{name}/parked/retry
+//	POST /api/v1/jobs/{name}/parked/drop
+func (s *Server) parkedJobAction(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		var n int64
+		var err error
+		if action == "retry" {
+			n, err = s.st.RetryParkedByJob(name)
+		} else {
+			n, err = s.st.DropParkedByJob(name)
+		}
+		if err != nil {
+			httpErr(w, http.StatusInternalServerError, "%v", err)
+			return
+		}
+		slog.Info("parked job action", "job", name, "action", action, "count", n)
+		writeJSON(w, http.StatusOK, map[string]any{"job": name, "action": action, "count": n})
 	}
 }

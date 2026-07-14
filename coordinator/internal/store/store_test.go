@@ -188,6 +188,174 @@ func TestDisabledAgentNotGranted(t *testing.T) {
 	}
 }
 
+// TestSoleAgentRequeuedShardNotStranded is the end-of-job stall regression.
+// With only one agent, a shard requeued after that agent's lease expired must
+// still be re-granted to it (soft affinity, not a hard bar) and ultimately
+// park — never sit QUEUED forever with no eligible taker.
+func TestSoleAgentRequeuedShardNotStranded(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	granted := 0
+	for i := 0; i < MaxShardAttempts+2; i++ {
+		rows, err := s.LeaseShards("agent-a", 1, -time.Second) // sole agent, expired ttl
+		if err != nil {
+			t.Fatal(err)
+		}
+		granted += len(rows)
+		if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if granted < 2 {
+		t.Fatalf("sole agent re-granted its own requeued shard only %d time(s); it was stranded", granted)
+	}
+	counts, _ := s.ShardStateCounts(passID)
+	if counts[model.ShardQueued] != 0 {
+		t.Fatalf("shard still QUEUED (counts=%+v): the pass would stall forever", counts)
+	}
+	if counts[model.ShardParked] != 1 {
+		t.Fatalf("shard did not reach PARKED (counts=%+v)", counts)
+	}
+}
+
+// TestSoftAffinityPrefersFreshWork proves the avoidance is still a preference:
+// given fresh work, an agent takes that before a shard it last failed on.
+func TestSoftAffinityPrefersFreshWork(t *testing.T) {
+	s := openTest(t)
+	_, _, shard1 := seed(t, s)
+	ids, err := s.InsertShards(mustPass(t, s, shard1), 0, []NewShard{{Kind: model.KindDir, RelPath: "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard2 := ids[0]
+
+	// Poison shard1 for agent-a: lease then expire it.
+	if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// agent-a, one credit: must get the fresh shard2, not its poisoned shard1.
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != shard2 {
+		t.Fatalf("soft affinity: agent-a got %+v, want fresh shard %d", rows, shard2)
+	}
+}
+
+func TestRetryAndDropParkedShard(t *testing.T) {
+	s := openTest(t)
+	_, passID, shardID := seed(t, s)
+	parkShard(t, s) // drive the shard to PARKED
+
+	// Unknown / non-parked id is a typed error.
+	if err := s.RetryParkedShard(shardID + 999); err != ErrNotParked {
+		t.Fatalf("RetryParkedShard(unknown) = %v, want ErrNotParked", err)
+	}
+
+	// Retry returns it to the queue, reset for a fresh attempt on any agent.
+	if err := s.RetryParkedShard(shardID); err != nil {
+		t.Fatal(err)
+	}
+	counts, _ := s.ShardStateCounts(passID)
+	if counts[model.ShardParked] != 0 || counts[model.ShardQueued] != 1 {
+		t.Fatalf("after retry counts=%+v, want 1 queued 0 parked", counts)
+	}
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil || len(rows) != 1 || rows[0].Attempt != 1 {
+		t.Fatalf("retried shard not grantable fresh: rows=%+v err=%v", rows, err)
+	}
+
+	// Park it again, then drop it: the row is gone, pass unblocked.
+	if err := s.ExpireLeasesForce(t); err != nil { // helper drives to park quickly
+		t.Fatal(err)
+	}
+	parked, _ := s.ParkedShards()
+	if len(parked) != 1 {
+		t.Fatalf("want 1 parked before drop, got %d", len(parked))
+	}
+	if err := s.DropParkedShard(parked[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DropParkedShard(parked[0].ID); err != ErrNotParked {
+		t.Fatalf("second drop = %v, want ErrNotParked", err)
+	}
+	counts, _ = s.ShardStateCounts(passID)
+	if counts[model.ShardParked] != 0 || counts[model.ShardQueued] != 0 {
+		t.Fatalf("after drop counts=%+v, want empty", counts)
+	}
+}
+
+func TestRetryAndDropParkedByJob(t *testing.T) {
+	s := openTest(t)
+	_, _, _ = seed(t, s)
+	parkShard(t, s)
+
+	n, err := s.RetryParkedByJob("t1")
+	if err != nil || n != 1 {
+		t.Fatalf("RetryParkedByJob = %d, %v; want 1", n, err)
+	}
+	if n, _ := s.RetryParkedByJob("nope"); n != 0 {
+		t.Fatalf("RetryParkedByJob(unknown job) = %d, want 0", n)
+	}
+
+	parkShard(t, s) // park it again
+	n, err = s.DropParkedByJob("t1")
+	if err != nil || n != 1 {
+		t.Fatalf("DropParkedByJob = %d, %v; want 1", n, err)
+	}
+}
+
+// mustPass resolves the pass id owning a shard (test helper).
+func mustPass(t *testing.T, s *Store, shardID int64) int64 {
+	t.Helper()
+	p, err := s.PassOfShard(shardID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// parkShard drives the seeded job's single shard to PARKED via repeated
+// lease+expiry up to the attempt ceiling.
+func parkShard(t *testing.T, s *Store) {
+	t.Helper()
+	for i := 0; i < MaxShardAttempts+1; i++ {
+		if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parked, _ := s.ParkedShards()
+	if len(parked) != 1 {
+		t.Fatalf("parkShard: want 1 parked, got %d", len(parked))
+	}
+}
+
+// ExpireLeasesForce leases then expires the seeded shard until it parks (test
+// helper used to re-park after a retry).
+func (s *Store) ExpireLeasesForce(t *testing.T) error {
+	t.Helper()
+	for i := 0; i < MaxShardAttempts+2; i++ {
+		if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
+			return err
+		}
+		// A far-future "now" expires any outstanding lease, including one still
+		// held under a normal ttl from a prior grant.
+		if _, _, err := s.ExpireLeases(time.Now().Add(time.Hour)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // enabledFlag reads an agent's enabled bit via ListAgents (test helper).
 func (s *Store) enabledFlag(t *testing.T, id string) bool {
 	t.Helper()
