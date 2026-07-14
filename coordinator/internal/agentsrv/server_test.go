@@ -179,3 +179,60 @@ func TestAgentSession(t *testing.T) {
 		t.Fatalf("pass counters = %+v", pass2)
 	}
 }
+
+// newTestServer builds a Server with a seeded, started job (root shard queued).
+func newTestServer(t *testing.T) *Server {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	jw, err := journal.NewWriter(filepath.Join(dir, "journals"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { jw.Close() })
+	met := metrics.New()
+	sched := scheduler.New(st, met, 30*time.Second)
+	pc := passctrl.New(st, dir)
+	if _, err := st.CreateJob("e2e", []byte(specYAML), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.StartJob("e2e"); err != nil {
+		t.Fatal(err)
+	}
+	return New(Config{HeartbeatInterval: 5 * time.Second, LeaseTTL: 30 * time.Second},
+		st, sched, jw, met)
+}
+
+// TestReadLoopNotBlockedByWrites is the end-of-scan deadlock regression. Over an
+// unbuffered pipe, an agent that keeps sending frames without reading responses
+// used to wedge the coordinator: its read loop blocked writing a reply, so it
+// stopped draining the agent and both sides deadlocked (stalling journal-acks
+// and heartbeats). With a dedicated writer goroutine the read loop keeps
+// consuming, so the agent's writes never block.
+func TestReadLoopNotBlockedByWrites(t *testing.T) {
+	srv := newTestServer(t)
+	coordSide, agentSide := net.Pipe()
+	defer agentSide.Close()
+	go srv.handle(coordSide)
+
+	a := &fakeAgent{t: t, conn: agentSide}
+	a.send(drsyncpb.FrameType_FRAME_HELLO, &drsyncpb.Hello{
+		AgentId: "flood", Hostname: "h", ProtoMajor: 1, AgentVersion: "0.0.1"})
+	a.recv(drsyncpb.FrameType_FRAME_HELLO_ACK, &drsyncpb.HelloAck{})
+
+	// Flood heartbeats and never read the acks. Each write must complete because
+	// the coordinator keeps reading; if the read loop stalled on a reply, the
+	// unbuffered pipe would block this write and trip the deadline.
+	const n = 300 // < outBuffer, so the writer's backlog never blocks the reader
+	for i := 0; i < n; i++ {
+		agentSide.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := wire.WriteFrame(agentSide, drsyncpb.FrameType_FRAME_HEARTBEAT,
+			&drsyncpb.Heartbeat{Seq: uint64(i)}); err != nil {
+			t.Fatalf("heartbeat %d blocked/failed — read loop stalled on a write: %v", i, err)
+		}
+	}
+}

@@ -47,10 +47,24 @@ type agentConn struct {
 	id       string
 	hostname string
 	conn     net.Conn
-	wmu      sync.Mutex // serializes frames on the write side
+	wmu      sync.Mutex     // serializes handshake (pre-writer) frames
+	out      chan sendFrame // steady-state frames handed to the writer goroutine
+	stop     chan struct{}  // closed on teardown to stop the writer
+	done     chan struct{}  // closed when the writer has exited
 	drain    bool
 	pause    bool
 }
+
+type sendFrame struct {
+	ft  drsyncpb.FrameType
+	msg proto.Message
+}
+
+// outBuffer bounds the per-agent write queue. Generously sized: with the writer
+// goroutine draining independently the read loop never stalls on a write, so
+// this only fills if the agent has genuinely stopped reading (then the socket
+// write errors and the session is torn down).
+const outBuffer = 1024
 
 func New(cfg Config, st *store.Store, sched *scheduler.Scheduler, jw *journal.Writer, met *metrics.Metrics) *Server {
 	return &Server{cfg: cfg, st: st, sched: sched, jw: jw, met: met,
@@ -86,10 +100,42 @@ func (s *Server) ConnectedAgents() []string {
 	return out
 }
 
-func (ac *agentConn) send(ft drsyncpb.FrameType, msg proto.Message) error {
+// writeSync writes one frame inline. Used only for the HELLO handshake, before
+// the writer goroutine starts — no concurrency and no deadlock risk there.
+func (ac *agentConn) writeSync(ft drsyncpb.FrameType, msg proto.Message) error {
 	ac.wmu.Lock()
 	defer ac.wmu.Unlock()
 	return wire.WriteFrame(ac.conn, ft, msg)
+}
+
+// send queues a frame for the dedicated writer goroutine. The read loop calls
+// this to respond, and MUST NOT block on the socket: if it did, a large agent
+// write burst (end-of-scan journals/results) plus the coordinator's replies can
+// fill both socket buffers so neither side reads — a bidirectional deadlock that
+// stalls journal-acks (shard requeues) and heartbeats (lease expiry). Handing
+// the write to a separate goroutine keeps the read loop draining the agent.
+func (ac *agentConn) send(ft drsyncpb.FrameType, msg proto.Message) error {
+	select {
+	case ac.out <- sendFrame{ft, msg}:
+		return nil
+	case <-ac.done:
+		return net.ErrClosed
+	}
+}
+
+func (ac *agentConn) writeLoop() {
+	defer close(ac.done)
+	for {
+		select {
+		case f := <-ac.out:
+			if err := wire.WriteFrame(ac.conn, f.ft, f.msg); err != nil {
+				ac.conn.Close() // unblock the read loop's ReadFrame
+				return
+			}
+		case <-ac.stop:
+			return
+		}
+	}
 }
 
 func (s *Server) handle(conn net.Conn) {
@@ -110,7 +156,10 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	ac := &agentConn{id: hello.AgentId, hostname: hello.Hostname, conn: conn}
+	ac := &agentConn{
+		id: hello.AgentId, hostname: hello.Hostname, conn: conn,
+		out: make(chan sendFrame, outBuffer), stop: make(chan struct{}), done: make(chan struct{}),
+	}
 	ack := &drsyncpb.HelloAck{
 		Accepted:           true,
 		ProtoMajor:         ProtoMajor,
@@ -121,7 +170,7 @@ func (s *Server) handle(conn net.Conn) {
 	if hello.ProtoMajor != ProtoMajor {
 		ack.Accepted = false
 		ack.RejectReason = fmt.Sprintf("protocol major %d unsupported (want %d)", hello.ProtoMajor, ProtoMajor)
-		ac.send(drsyncpb.FrameType_FRAME_HELLO_ACK, ack)
+		ac.writeSync(drsyncpb.FrameType_FRAME_HELLO_ACK, ack)
 		return
 	}
 
@@ -136,13 +185,17 @@ func (s *Server) handle(conn net.Conn) {
 		slog.Error("agent upsert failed", "agent", ac.id, "err", err)
 		return
 	}
-	if err := ac.send(drsyncpb.FrameType_FRAME_HELLO_ACK, ack); err != nil {
+	if err := ac.writeSync(drsyncpb.FrameType_FRAME_HELLO_ACK, ack); err != nil {
 		return
 	}
+	// Steady state: a dedicated writer drains ac.out so dispatch never blocks on
+	// a write (see send()).
+	go ac.writeLoop()
 	s.met.AgentUp.WithLabelValues(ac.id).Set(1)
 	slog.Info("agent connected", "agent", ac.id, "host", ac.hostname, "version", hello.AgentVersion)
 
 	defer func() {
+		close(ac.stop) // stop the writer goroutine
 		s.mu.Lock()
 		if s.agents[ac.id] == ac {
 			delete(s.agents, ac.id)
