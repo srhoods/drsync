@@ -155,6 +155,7 @@ drsyncd \
   -tls-cert /etc/drsync/coord.example.com.crt \
   -tls-key  /etc/drsync/coord.example.com.key \
   -tls-ca   /etc/drsync/ca.crt \
+  -smtp-config /etc/drsync/smtp.yaml \
   -lease-ttl 30s -heartbeat-interval 5s -log-level info
 ```
 
@@ -165,9 +166,39 @@ drsyncd \
 | `-listen-http` | `:7441` | REST API, `/metrics`, `/healthz`, WebSocket. |
 | `-api-token` | *(empty)* | Bearer token for the REST API. Empty = no auth (dev only). |
 | `-tls-cert`/`-tls-key`/`-tls-ca` | *(empty)* | Server cert/key and the CA bundle used to verify agent client certs. All three or none. |
+| `-smtp-config` | `/etc/drsync/smtp.yaml` | SMTP server settings for email notifications. The **default path is optional**: if it is absent, notifications are silently disabled. A path given explicitly must exist and validate. |
 | `-lease-ttl` | `30s` | Shard lease TTL; a dead agent's work is requeued after this. |
 | `-heartbeat-interval` | `5s` | Expected agent heartbeat cadence. |
 | `-log-level` | `info` | `debug`\|`info`\|`warn`\|`error`. |
+
+### 5.1 Email notifications (optional)
+
+To enable the per-pass / end-of-job emails a job spec can request
+(`spec.notifications`, see DESIGN-jobspec.md §1.2), give the coordinator an SMTP
+config. It is read **once at startup**; changes need a coordinator restart.
+
+`/etc/drsync/smtp.yaml`:
+
+```yaml
+host: smtp.example.com          # required
+port: 587                       # optional; default per security: starttls→587, tls→465, none→25
+security: starttls              # starttls (default) | tls (implicit, ~465) | none (plaintext, dev only)
+username: drsync@example.com    # optional; omit for an unauthenticated relay
+password: "s3cr3t"              # PLAIN auth (send over starttls/tls only)
+from: "drsync <drsync@example.com>"   # required; header + envelope sender
+subject_prefix: "[drsync]"      # optional; prepended to every subject
+helo: coord.example.com         # optional; defaults to the coordinator hostname
+timeout_seconds: 30             # optional; bounds the whole SMTP exchange
+```
+
+- The file holds a password, so restrict it: `chown drsyncd:drsyncd /etc/drsync/smtp.yaml && chmod 600 /etc/drsync/smtp.yaml`.
+- Recipients are **per job** (`spec.notifications.recipients`), not here — this
+  file only describes *how* to send.
+- Unknown keys are rejected (typo safety), matching the job-spec decoder.
+- Delivery is best-effort and asynchronous: a send failure is logged
+  (`notify: email send failed …`) and never affects the migration. On startup
+  the coordinator logs `email notifications enabled` (or `… disabled …`) so you
+  can confirm the config was picked up.
 
 ### Agent (on every agent host)
 

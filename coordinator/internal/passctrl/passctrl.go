@@ -16,6 +16,7 @@ import (
 
 	"drsync/coordinator/internal/journal"
 	"drsync/coordinator/internal/model"
+	"drsync/coordinator/internal/notify"
 	"drsync/coordinator/internal/store"
 	drsyncpb "drsync/proto/gen/drsyncpb"
 )
@@ -29,11 +30,16 @@ const verifyBatchSize = 500
 type Controller struct {
 	st          *store.Store
 	journalRoot string
+	notifier    *notify.Sender // nil when email is disabled (no SMTP config)
 }
 
 func New(st *store.Store, journalRoot string) *Controller {
 	return &Controller{st: st, journalRoot: journalRoot}
 }
+
+// SetNotifier wires an email sender for pass/job completion notifications. A
+// nil sender leaves notifications disabled (the Sender methods are no-ops).
+func (c *Controller) SetNotifier(n *notify.Sender) { c.notifier = n }
 
 // StartJob transitions READY→RUNNING and seeds pass 1 with the root shard.
 func (c *Controller) StartJob(name string) error {
@@ -146,7 +152,15 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassComplete); err != nil {
 			return err
 		}
-		return c.decideNextPass(job, pass)
+		jobDone, converged, err := c.decideNextPass(job, pass)
+		if err != nil {
+			return err
+		}
+		c.notifyPassComplete(job, pass, false, jobDone, converged)
+		if jobDone {
+			c.notifyJobComplete(job)
+		}
+		return nil
 	case model.PassDelete:
 		slog.Info("delete pass complete", "job", job.Name, "pass", pass.PassNo,
 			"removed", pass.Orphans, "errors", pass.Errors)
@@ -155,17 +169,24 @@ func (c *Controller) advance(job *store.Job) error {
 		}
 		// A delete pass never auto-seeds another pass: back to COMPLETED,
 		// further passes are explicit operator triggers.
-		return c.st.SetJobState(job.ID, model.JobCompleted)
+		if err := c.st.SetJobState(job.ID, model.JobCompleted); err != nil {
+			return err
+		}
+		c.notifyPassComplete(job, pass, true, true, false)
+		c.notifyJobComplete(job)
+		return nil
 	}
 	return nil
 }
 
 // decideNextPass applies the convergence rule: stop when the pass delta is
-// under the configured thresholds or the pass ceiling is reached.
-func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) error {
+// under the configured thresholds or the pass ceiling is reached. It reports
+// whether the job reached COMPLETED (jobDone) and, if so, whether it did so by
+// converging (vs. hitting the pass ceiling) so the caller can notify.
+func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) (jobDone, converged bool, err error) {
 	spec, err := model.ParseSpec(job.SpecYAML)
 	if err != nil {
-		return err
+		return false, false, err
 	}
 	cw := spec.Spec.Passes.ConvergeWhen
 	// A pass that copied and fixed nothing is a fixpoint: the trees agree and no
@@ -174,7 +195,7 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) error {
 	// thresholds spins to Passes.Max after the delta already hit zero. Explicit
 	// converge_when thresholds only loosen this, letting a job stop earlier while
 	// a small nonzero delta remains.
-	converged := done.FilesCopied == 0 && done.MetaFixed == 0 && done.BytesCopied == 0
+	converged = done.FilesCopied == 0 && done.MetaFixed == 0 && done.BytesCopied == 0
 	if cw.DeltaFilesBelow > 0 && uint64(done.FilesCopied+done.MetaFixed) < cw.DeltaFilesBelow {
 		converged = true
 	}
@@ -184,13 +205,13 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) error {
 	if converged || done.PassNo >= spec.Spec.Passes.Max {
 		slog.Info("job converged", "job", job.Name, "passes", done.PassNo,
 			"last_delta_files", done.FilesCopied, "last_delta_bytes", done.BytesCopied)
-		return c.st.SetJobState(job.ID, model.JobCompleted)
+		return true, converged, c.st.SetJobState(job.ID, model.JobCompleted)
 	}
 	if spec.Spec.Passes.Schedule == "manual" {
 		slog.Info("awaiting manual pass trigger", "job", job.Name, "next_pass", done.PassNo+1)
-		return nil // operator triggers via POST /passes
+		return false, false, nil // operator triggers via POST /passes
 	}
-	return c.seedPass(job.ID, done.PassNo+1)
+	return false, false, c.seedPass(job.ID, done.PassNo+1)
 }
 
 // seedVerify builds VerifyBatch shards from this pass's own journal (D4):
@@ -275,6 +296,106 @@ func (c *Controller) seedVerify(job *store.Job, pass *store.Pass) (int, error) {
 		return 0, err
 	}
 	return total, nil
+}
+
+// notifyPassComplete emails a per-pass report when the job spec opts in. It is
+// best-effort: parse/aggregate failures are logged and swallowed so a
+// notification never disturbs the lifecycle. Delivery itself is async.
+func (c *Controller) notifyPassComplete(job *store.Job, pass *store.Pass, isDelete, jobDone, converged bool) {
+	if c.notifier == nil {
+		return
+	}
+	spec, err := model.ParseSpec(job.SpecYAML)
+	if err != nil {
+		slog.Warn("notify: parse spec failed", "job", job.Name, "err", err)
+		return
+	}
+	n := spec.Spec.Notifications
+	if !n.OnPassComplete || len(n.Recipients) == 0 {
+		return
+	}
+	var dur int64
+	if pass.Started.Valid { // finished_at was just stamped; now ≈ finished_at
+		dur = time.Now().UnixMilli() - pass.Started.Int64
+	}
+	c.notifier.PassComplete(n.Recipients, notify.PassReport{
+		Job: job.Name, PassNo: pass.PassNo, IsDelete: isDelete, DryRun: job.DryRun,
+		DurationMS: dur, FilesCopied: pass.FilesCopied, BytesCopied: pass.BytesCopied,
+		MetaFixed: pass.MetaFixed, Orphans: pass.Orphans, VerifyOK: pass.VerifyOK,
+		VerifyFail: pass.VerifyFail, Errors: pass.Errors,
+		JobDone: jobDone, Converged: converged,
+	})
+}
+
+// notifyJobComplete emails the end-of-job summary when the spec opts in.
+func (c *Controller) notifyJobComplete(job *store.Job) {
+	if c.notifier == nil {
+		return
+	}
+	spec, err := model.ParseSpec(job.SpecYAML)
+	if err != nil {
+		slog.Warn("notify: parse spec failed", "job", job.Name, "err", err)
+		return
+	}
+	n := spec.Spec.Notifications
+	if !n.OnJobComplete || len(n.Recipients) == 0 {
+		return
+	}
+	rep, err := c.buildJobReport(job)
+	if err != nil {
+		slog.Warn("notify: build job report failed", "job", job.Name, "err", err)
+		return
+	}
+	c.notifier.JobComplete(n.Recipients, rep)
+}
+
+// buildJobReport aggregates the same view the /report endpoint serves (per-pass
+// deltas, totals, outstanding orphans and parked shards) for the summary email.
+func (c *Controller) buildJobReport(job *store.Job) (notify.JobReport, error) {
+	passes, err := c.st.ListPasses(job.ID)
+	if err != nil {
+		return notify.JobReport{}, err
+	}
+	rep := notify.JobReport{
+		Job: job.Name, State: string(job.State), DryRun: job.DryRun,
+		Converged: job.State == model.JobCompleted,
+	}
+	for _, p := range passes {
+		var dur int64
+		if p.Finished.Valid && p.Started.Valid {
+			dur = p.Finished.Int64 - p.Started.Int64
+		}
+		rep.Passes = append(rep.Passes, notify.JobPass{
+			PassNo: p.PassNo, State: string(p.State),
+			IsDelete:   p.State == model.PassDelete || (p.EntriesWalked == 0 && p.Orphans > 0),
+			DurationMS: dur,
+			DeltaFiles: p.FilesCopied + p.MetaFixed, DeltaBytes: p.BytesCopied,
+			Orphans: p.Orphans, VerifyOK: p.VerifyOK, VerifyFail: p.VerifyFail, Errors: p.Errors,
+		})
+		rep.FilesCopied += p.FilesCopied
+		rep.BytesCopied += p.BytesCopied
+		rep.MetaFixed += p.MetaFixed
+		rep.Errors += p.Errors
+		rep.FidelityExc += p.FidelityExceptions
+		rep.VerifyOK += p.VerifyOK
+		rep.VerifyFail += p.VerifyFail
+		if p.EntriesWalked > 0 { // scan pass: latest orphan census supersedes
+			rep.OrphansRemaining = p.Orphans
+		} else if p.Orphans > 0 { // delete pass reclaimed orphans
+			rep.DeletePassRan = true
+			rep.OrphansRemaining = 0
+		}
+	}
+	parked, err := c.st.ParkedShards()
+	if err != nil {
+		return notify.JobReport{}, err
+	}
+	for _, sh := range parked {
+		if sh.Job == job.Name {
+			rep.ParkedShards++
+		}
+	}
+	return rep, nil
 }
 
 // TriggerPass starts the next pass manually. Works on RUNNING jobs between

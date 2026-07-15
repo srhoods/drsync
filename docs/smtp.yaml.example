@@ -1,0 +1,25 @@
+# drsync coordinator SMTP configuration.
+#
+# Install to /etc/drsync/smtp.yaml (or point -smtp-config elsewhere). Read once
+# at coordinator startup — restart drsyncd after changing it. When the default
+# path (/etc/drsync/smtp.yaml) is absent, email notifications are simply
+# disabled; a path passed explicitly must exist and validate.
+#
+# This file contains a password: chmod 600 and own it by the drsyncd user.
+#
+# Recipients and which events fire are set PER JOB in the job spec
+# (spec.notifications), not here — this file only describes how to send.
+
+host: smtp.example.com                 # required: SMTP server hostname
+port: 587                              # optional: default depends on `security`
+                                       #   starttls -> 587, tls -> 465, none -> 25
+security: starttls                     # starttls (default) | tls (implicit TLS) | none
+
+username: drsync@example.com           # optional: omit for an unauthenticated relay
+password: "change-me"                  # PLAIN auth; only sent over starttls/tls
+
+from: "drsync <drsync@example.com>"    # required: From header + envelope sender
+
+subject_prefix: "[drsync]"             # optional: prepended to every subject
+helo: coordinator.example.com          # optional: EHLO name; defaults to hostname
+timeout_seconds: 30                    # optional: bounds the whole SMTP exchange

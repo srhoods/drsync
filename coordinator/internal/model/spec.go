@@ -106,8 +106,25 @@ type JobSpec struct {
 			StatxBatch        uint32 `yaml:"statx_batch"`
 			MtimeSlopNS       int64  `yaml:"mtime_slop_ns"`
 		} `yaml:"tuning"`
+		Notifications NotificationSpec `yaml:"notifications,omitempty"`
 	} `yaml:"spec"`
 }
+
+// NotificationSpec configures email notifications for a job. Delivery depends
+// on the coordinator having a valid SMTP config (see -smtp-config); when it
+// does not, these flags are inert (the coordinator logs a warning). Sending is
+// always best-effort and never affects job outcome.
+type NotificationSpec struct {
+	// Recipients receive every notification for the job (To: header).
+	Recipients []string `yaml:"recipients,omitempty"`
+	// OnPassComplete sends a mail as each pass finishes (the convergence trace).
+	OnPassComplete bool `yaml:"on_pass_complete,omitempty"`
+	// OnJobComplete sends a single summary mail when the job reaches COMPLETED.
+	OnJobComplete bool `yaml:"on_job_complete,omitempty"`
+}
+
+// Enabled reports whether the spec asks for any email at all.
+func (n NotificationSpec) Enabled() bool { return n.OnPassComplete || n.OnJobComplete }
 
 // ParseSpec strictly decodes, defaults and validates a YAML job spec.
 func ParseSpec(data []byte) (*JobSpec, error) {
@@ -237,8 +254,22 @@ func (s *JobSpec) Validate() error {
 	if r := s.Spec.Verify.Checksum.SampleRate; r < 0 || r > 1 {
 		return fmt.Errorf("verify.checksum.sample_rate must be in [0,1]")
 	}
+	n := s.Spec.Notifications
+	if n.Enabled() && len(n.Recipients) == 0 {
+		return fmt.Errorf("notifications: on_pass_complete/on_job_complete set but recipients is empty")
+	}
+	for i, addr := range n.Recipients {
+		if !emailRe.MatchString(addr) {
+			return fmt.Errorf("notifications.recipients[%d]: %q is not a valid email address", i, addr)
+		}
+	}
 	return nil
 }
+
+// emailRe is a deliberately permissive sanity check (not RFC 5322) — it rejects
+// obvious typos (missing @, spaces, no dot in the domain) without pretending to
+// fully validate addressing, which the SMTP server does authoritatively.
+var emailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 
 // ToJobOptions resolves the spec into the protobuf options agents consume,
 // stamping job identity and the options hash (DESIGN-jobspec.md §3).

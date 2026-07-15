@@ -23,26 +23,32 @@ import (
 	"drsync/coordinator/internal/events"
 	"drsync/coordinator/internal/journal"
 	"drsync/coordinator/internal/metrics"
+	"drsync/coordinator/internal/notify"
 	"drsync/coordinator/internal/passctrl"
 	"drsync/coordinator/internal/scheduler"
 	"drsync/coordinator/internal/store"
 )
+
+// defaultSMTPConfig is the conventional location for SMTP server settings.
+// When it is absent, email notifications are simply disabled.
+const defaultSMTPConfig = "/etc/drsync/smtp.yaml"
 
 // coordinatorVersion is surfaced in the console header and /api/v1/info.
 const coordinatorVersion = "0.1.0-slice5"
 
 func main() {
 	var (
-		agentAddr = flag.String("listen-agent", ":7440", "agent protocol listen address")
-		httpAddr  = flag.String("listen-http", ":7441", "REST/metrics listen address")
-		dataDir   = flag.String("data-dir", "/var/lib/drsync", "state store + journal directory")
-		apiToken  = flag.String("api-token", "", "bearer token for the REST API (empty = no auth, dev only)")
-		tlsCert   = flag.String("tls-cert", "", "coordinator TLS certificate (PEM)")
-		tlsKey    = flag.String("tls-key", "", "coordinator TLS key (PEM)")
-		tlsCA     = flag.String("tls-ca", "", "CA bundle for verifying agent client certs (PEM)")
-		leaseTTL  = flag.Duration("lease-ttl", 30*time.Second, "shard lease TTL")
-		hbEvery   = flag.Duration("heartbeat-interval", 5*time.Second, "agent heartbeat interval")
-		logLevel  = flag.String("log-level", "info", "debug|info|warn|error")
+		agentAddr  = flag.String("listen-agent", ":7440", "agent protocol listen address")
+		httpAddr   = flag.String("listen-http", ":7441", "REST/metrics listen address")
+		dataDir    = flag.String("data-dir", "/var/lib/drsync", "state store + journal directory")
+		apiToken   = flag.String("api-token", "", "bearer token for the REST API (empty = no auth, dev only)")
+		tlsCert    = flag.String("tls-cert", "", "coordinator TLS certificate (PEM)")
+		tlsKey     = flag.String("tls-key", "", "coordinator TLS key (PEM)")
+		tlsCA      = flag.String("tls-ca", "", "CA bundle for verifying agent client certs (PEM)")
+		leaseTTL   = flag.Duration("lease-ttl", 30*time.Second, "shard lease TTL")
+		hbEvery    = flag.Duration("heartbeat-interval", 5*time.Second, "agent heartbeat interval")
+		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
+		smtpConfig = flag.String("smtp-config", defaultSMTPConfig, "SMTP config for email notifications (absent default = disabled)")
 	)
 	flag.Parse()
 
@@ -54,13 +60,13 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 
 	if err := run(*agentAddr, *httpAddr, *dataDir, *apiToken,
-		*tlsCert, *tlsKey, *tlsCA, *leaseTTL, *hbEvery); err != nil {
+		*tlsCert, *tlsKey, *tlsCA, *smtpConfig, *leaseTTL, *hbEvery); err != nil {
 		slog.Error("drsyncd exiting", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA string,
+func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpConfig string,
 	leaseTTL, hbEvery time.Duration) error {
 
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
@@ -82,6 +88,21 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA string,
 	sched := scheduler.New(st, met, leaseTTL)
 	journalRoot := filepath.Join(dataDir, "journals")
 	pc := passctrl.New(st, journalRoot)
+
+	// Email notifications. An absent default config disables them silently; an
+	// explicitly-configured path that is missing or invalid is a hard error.
+	smtpCfg, err := notify.LoadConfig(smtpConfig, smtpConfig == defaultSMTPConfig)
+	if err != nil {
+		return fmt.Errorf("smtp config: %w", err)
+	}
+	if smtpCfg != nil {
+		pc.SetNotifier(notify.NewSender(smtpCfg))
+		slog.Info("email notifications enabled", "smtp_host", smtpCfg.Host,
+			"security", smtpCfg.Security, "config", smtpConfig)
+	} else {
+		slog.Info("email notifications disabled (no SMTP config)", "config", smtpConfig)
+	}
+
 	bus := events.NewBus()
 	poller := events.NewPoller(st, bus)
 

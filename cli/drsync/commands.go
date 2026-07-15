@@ -815,10 +815,10 @@ func cmdReport(args []string) error {
 			totVOK += i64(p["verify_ok"])
 			totVFail += i64(p["verify_fail"])
 			totErr += i64(p["errors"])
-			fmt.Fprintf(tw, "%v\t%v\t%s\t%v\t%s\t%v\t%s\t%v\n",
-				p["pass_no"], p["state"], humanMS(i64(p["duration_ms"])),
-				p["delta_files"], humanBytes(i64(p["delta_bytes"])), p["orphans"],
-				verifyCol(i64(p["verify_ok"]), i64(p["verify_fail"])), p["errors"])
+			fmt.Fprintf(tw, "%d\t%v\t%s\t%d\t%s\t%d\t%s\t%d\n",
+				i64(p["pass_no"]), p["state"], humanMS(i64(p["duration_ms"])),
+				i64(p["delta_files"]), humanBytes(i64(p["delta_bytes"])), i64(p["orphans"]),
+				verifyCol(i64(p["verify_ok"]), i64(p["verify_fail"])), i64(p["errors"]))
 		}
 		if len(passes) > 0 {
 			// Footer summing the additive per-pass columns. Orphans is a
@@ -830,12 +830,12 @@ func cmdReport(args []string) error {
 		tw.Flush()
 	}
 	t, _ := rep["totals"].(map[string]any)
-	fmt.Printf("\ntotals: %v files / %s copied, %v meta-fixed, %v errors, %v fidelity exceptions\n",
-		t["files_copied"], humanBytes(i64(t["bytes_copied"])), t["meta_fixed"],
-		t["errors"], t["fidelity_exceptions"])
-	fmt.Printf("verify: %v ok, %v fail\n", t["verify_ok"], t["verify_fail"])
-	fmt.Printf("converged: %v   orphans remaining: %v   delete pass ran: %v\n",
-		rep["converged"], rep["orphans_remaining"], rep["delete_pass_ran"])
+	fmt.Printf("\ntotals: %d files / %s copied, %d meta-fixed, %d errors, %d fidelity exceptions\n",
+		i64(t["files_copied"]), humanBytes(i64(t["bytes_copied"])), i64(t["meta_fixed"]),
+		i64(t["errors"]), i64(t["fidelity_exceptions"]))
+	fmt.Printf("verify: %d ok, %d fail\n", i64(t["verify_ok"]), i64(t["verify_fail"]))
+	fmt.Printf("converged: %v   orphans remaining: %d   delete pass ran: %v\n",
+		rep["converged"], i64(rep["orphans_remaining"]), rep["delete_pass_ran"])
 	if n := i64(rep["parked_shard_count"]); n > 0 {
 		fmt.Printf("PARKED SHARDS: %d (operator attention required — see drsync queue)\n", n)
 	}

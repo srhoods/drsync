@@ -21,3 +21,6 @@ id_rsa*
 # Editor / OS cruft
 *~
 .DS_Store
+
+# Local working notes — intentionally untracked
+docs/PROJECT-SUMMARY.md

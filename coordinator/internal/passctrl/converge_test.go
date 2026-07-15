@@ -64,7 +64,7 @@ func TestConvergeZeroDeltaNoThreshold(t *testing.T) {
 
 	done := &store.Pass{ID: 1, JobID: job.ID, PassNo: 1,
 		FilesCopied: 0, MetaFixed: 0, BytesCopied: 0}
-	if err := c.decideNextPass(job, done); err != nil {
+	if _, _, err := c.decideNextPass(job, done); err != nil {
 		t.Fatal(err)
 	}
 	if got := jobState(t, c, job.ID); got != model.JobCompleted {
@@ -79,7 +79,7 @@ func TestNonzeroDeltaSeedsNextPass(t *testing.T) {
 	job := makeJob(t, c, []byte(baseSpec))
 
 	done := &store.Pass{ID: 1, JobID: job.ID, PassNo: 1, FilesCopied: 42}
-	if err := c.decideNextPass(job, done); err != nil {
+	if _, _, err := c.decideNextPass(job, done); err != nil {
 		t.Fatal(err)
 	}
 	if got := jobState(t, c, job.ID); got != model.JobRunning {
@@ -97,7 +97,7 @@ func TestMetaOnlyDeltaNotConverged(t *testing.T) {
 	job := makeJob(t, c, []byte(baseSpec))
 
 	done := &store.Pass{ID: 1, JobID: job.ID, PassNo: 1, MetaFixed: 3}
-	if err := c.decideNextPass(job, done); err != nil {
+	if _, _, err := c.decideNextPass(job, done); err != nil {
 		t.Fatal(err)
 	}
 	if got := jobState(t, c, job.ID); got != model.JobRunning {
@@ -111,7 +111,7 @@ func TestPassCeilingStops(t *testing.T) {
 	job := makeJob(t, c, withConverge("    max: 3\n"))
 
 	done := &store.Pass{ID: 1, JobID: job.ID, PassNo: 3, FilesCopied: 99}
-	if err := c.decideNextPass(job, done); err != nil {
+	if _, _, err := c.decideNextPass(job, done); err != nil {
 		t.Fatal(err)
 	}
 	if got := jobState(t, c, job.ID); got != model.JobCompleted {
@@ -126,7 +126,7 @@ func TestThresholdConvergesEarly(t *testing.T) {
 	job := makeJob(t, c, withConverge("    converge_when:\n      delta_files_below: 10\n"))
 
 	done := &store.Pass{ID: 1, JobID: job.ID, PassNo: 1, FilesCopied: 5}
-	if err := c.decideNextPass(job, done); err != nil {
+	if _, _, err := c.decideNextPass(job, done); err != nil {
 		t.Fatal(err)
 	}
 	if got := jobState(t, c, job.ID); got != model.JobCompleted {

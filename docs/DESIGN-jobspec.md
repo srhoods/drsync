@@ -94,6 +94,13 @@ spec:
     dir_split_threshold: 50000       # single-dir size that triggers entry-list sharding
     statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (pow2, 1–4096)
     mtime_slop_ns: 1000000           # 1ms slop for cross-FS timestamp granularity
+
+  notifications:                     # optional email; needs an SMTP config on the coordinator
+    recipients:                      # one or more addresses (required if any flag is set)
+      - ops@example.com
+      - migrations-lead@example.com
+    on_pass_complete: true           # email as each pass finishes (the convergence trace)
+    on_job_complete: true            # single summary email when the job reaches COMPLETED
 ```
 
 Quantity suffixes: `KiB/MiB/GiB/TiB` (binary), plain integers are bytes/counts.
@@ -108,7 +115,29 @@ Quantity suffixes: `KiB/MiB/GiB/TiB` (binary), plain integers are bytes/counts.
 - src ≠ dst and neither is a prefix of the other,
 - destination mount has plausible free space (statfs vs. src estimate once pass 1 has a
   running total; hard check is per-write ENOSPC handling),
-- filters compile.
+- filters compile,
+- `notifications`: if `on_pass_complete`/`on_job_complete` is set, `recipients` is non-empty
+  and every address is well-formed (a permissive sanity check — the SMTP server validates
+  authoritatively).
+
+### 1.2 Email notifications
+
+`spec.notifications` opts a job into email. The SMTP server itself is configured **once on
+the coordinator**, not per job (see INSTALL.md §5.1 — `/etc/drsync/smtp.yaml`, overridable
+with `-smtp-config`); the spec only names recipients and which events fire:
+
+- `on_pass_complete` — one email as each pass finishes, carrying that pass's delta (files,
+  bytes, metadata fixes, orphans, verify, errors) and duration. This is the convergence
+  trace, arriving pass by pass.
+- `on_job_complete` — a single summary email when the job reaches `COMPLETED`: the full
+  per-pass trajectory table plus totals, convergence status, orphans remaining and any
+  parked shards. (For the last pass of a converging job, both a pass email and the summary
+  arrive.)
+
+Delivery is **best-effort and asynchronous**: it never blocks or fails a pass, and a
+transport error is logged on the coordinator, not surfaced to the job. If the coordinator
+has no SMTP config, these flags are inert and a warning is logged. Emails are sent as
+`multipart/alternative` (a styled HTML part with a plain-text fallback).
 
 ## 2. CLI
 
