@@ -356,6 +356,15 @@ scan, so review-then-delete is always a two-step, auditable operation.
 `spec.deletes.mode: mirror` expresses intent in the spec, but the CLI gate is
 still required to actually delete — there is no "just delete" switch.
 
+**Directory deletes are recursive.** An orphaned *directory* (present on the
+destination, gone from the source) is removed along with its **entire subtree** —
+every file and sub-directory beneath it, then the directory itself. It is
+journaled as a single `orphan` record but each removed entry is journaled as a
+`deleted` record, so the report's orphans count and `drsync journal cat myjob
+--type deleted` reflect the full recursive removal. Preview it exactly with a
+dry-run first (`drsync journal cat myjob --type would_delete`), since dropping one
+orphaned directory can remove a large tree.
+
 ---
 
 ## 6. Monitoring
