@@ -245,6 +245,10 @@ ExecStart=/usr/local/bin/drsync-agent -c coord.example.com:7440 -i %H -w 8 -C 16
   -A /etc/drsync/ca.crt -E /etc/drsync/%H.crt -K /etc/drsync/%H.key
 Restart=always
 RestartSec=2
+# Open-file limit. The agent's fd use scales with -w/-C (io_uring rings, held
+# directory fds, concurrent copies), so high-core hosts can exhaust a low
+# default (systemd's DefaultLimitNOFILE is often 1024).
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -252,6 +256,16 @@ WantedBy=multi-user.target
 
 Because the agent reconnects on its own, `Restart=always` is a backstop, not the
 primary recovery path.
+
+> **Open files (`EMFILE` / "too many open files").** `/etc/security/limits.conf`
+> and `/etc/security/limits.d/*` are applied by **pam_limits — login sessions
+> only**. **systemd services do not go through PAM**, so raising the limit there
+> has *no effect* on the agent; set **`LimitNOFILE=`** in the unit (above) and
+> `systemctl daemon-reload && systemctl restart drsync-agent`. As a safety net
+> the agent also raises its own soft limit to the hard ceiling at startup (it
+> logs `open-file limit soft=… hard=…`), so a high `LimitNOFILE` *or* a high
+> `DefaultLimitNOFILE`/hard limit is enough; check the startup log to confirm
+> the effective value.
 
 ---
 

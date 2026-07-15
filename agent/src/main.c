@@ -14,9 +14,11 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -380,6 +382,35 @@ static void default_agent_id(char *dst, size_t cap)
     snprintf(dst, cap, "agent-%s", host);
 }
 
+/* Raise the open-file soft limit to the hard ceiling. The agent's fd use grows
+ * with the pool sizes (io_uring rings, held directory fds, concurrent copies),
+ * so high-core hosts can exceed a low default. Doing it in-process is robust:
+ * systemd services never read /etc/security/limits.d (that is pam_limits, login
+ * sessions only), so the soft limit is whatever LimitNOFILE / DefaultLimitNOFILE
+ * gives — but the hard limit is usually high, and we can lift the soft to it. */
+static void raise_nofile(void)
+{
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        LOGW("getrlimit(NOFILE): %s", strerror(errno));
+        return;
+    }
+    rlim_t was = rl.rlim_cur;
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+            LOGW("setrlimit(NOFILE=%ju): %s", (uintmax_t)rl.rlim_max, strerror(errno));
+            rl.rlim_cur = was;
+        }
+    }
+    LOGI("open-file limit soft=%ju hard=%ju%s", (uintmax_t)rl.rlim_cur,
+         (uintmax_t)rl.rlim_max, rl.rlim_cur > was ? " (raised)" : "");
+    if (rl.rlim_cur < 65536)
+        LOGW("open-file soft limit is only %ju — high-core hosts may hit EMFILE; "
+             "set LimitNOFILE= in the systemd unit (limits.d does NOT apply to services)",
+             (uintmax_t)rl.rlim_cur);
+}
+
 int main(int argc, char **argv)
 {
     strcpy(cfg.coordinator, "127.0.0.1:7440");
@@ -435,6 +466,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal); /* clean drain on Ctrl-C / systemd stop */
     signal(SIGTERM, on_signal);
+    raise_nofile();
     uring_probe(!cfg.no_uring);
 
     /* mTLS: all three of CA, cert and key together, or none (plaintext dev). */
