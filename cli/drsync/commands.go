@@ -559,7 +559,7 @@ func agentEnable(action string, args []string) error {
 // ---------------------------------------------------------------------------
 
 func journalQuery(fs *flag.FlagSet) (pass, path *string, limit, offset *int) {
-	pass = fs.String("pass", "", "pass number, or 'all' (default: latest)")
+	pass = fs.String("pass", "", "pass number, 'latest', or 'all' (default: all passes)")
 	path = fs.String("path", "", "filter by rel-path prefix")
 	limit = fs.Int("limit", 1000, "page size")
 	offset = fs.Int("offset", 0, "page offset")
@@ -713,7 +713,7 @@ func journalSummary(c *client, name, pass, typ, path string, limit, offset int, 
 	}
 	scope := pass
 	if scope == "" {
-		scope = "latest"
+		scope = "all"
 	}
 	printJournalSummary(name, scope, out.Summary, out.Total)
 	return nil

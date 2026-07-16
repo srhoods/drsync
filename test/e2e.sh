@@ -38,6 +38,10 @@ head -c 1000 /dev/urandom > "$SRC/projects/beta/nested/deep/leaf"
 for i in $(seq 1 40); do echo "file $i" > "$SRC/home/u1/f$i.txt"; done
 echo "exec me" > "$SRC/home/u2/tool.sh"; chmod 0750 "$SRC/home/u2/tool.sh"
 ln -s ../alpha/readme.txt "$SRC/projects/beta/link"
+# a special file (FIFO): exercises the mknod path + metadata fidelity on
+# specials. mode/mtime set last so they are what we assert on.
+mkfifo "$SRC/home/u2/pipe"; chmod 0640 "$SRC/home/u2/pipe"
+touch -d '2020-09-13 13:26:40' "$SRC/home/u2/pipe"
 touch -d '2020-05-04 03:02:01' "$SRC/projects/alpha/readme.txt"
 chmod 0640 "$SRC/projects/alpha/readme.txt"
 
@@ -133,7 +137,8 @@ done
 JOB=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/e2e")
 
 # 1. content: every src file identical in dst; only the orphan may be extra
-DIFF=$(diff -r "$SRC" "$DST" 2>&1 | grep -v "^Only in $DST" || true)
+# (diff notes matching FIFOs/sockets with an "is a fifo" line, not a real diff)
+DIFF=$(diff -r "$SRC" "$DST" 2>&1 | grep -v "^Only in $DST" | grep -v " is a fifo " || true)
 [[ -z "$DIFF" ]] || fail "content mismatch:"$'\n'"$DIFF"
 
 # 2. orphan preserved (report-only deletes), temp residue reclaimed
@@ -175,6 +180,14 @@ cmp -s "$SRC/projects/beta/sparse.img" "$DST/projects/beta/sparse.img" \
 DBLK=$(stat -c '%b' "$DST/projects/beta/sparse.img")
 [[ $((DBLK * 512)) -lt 1048576 ]] \
     || fail "sparseness lost: dst uses $((DBLK * 512)) bytes for 16MiB logical"
+
+# 4e. special file (FIFO) recreated with matching type + metadata. The mtime is
+#     the regression that matters: specials were created without utimens, so
+#     verify failed on "mtime mismatch" and never converged (they are not
+#     recopied). Section 7 below asserts verify_fail==0, which covers that.
+[[ -p "$DST/home/u2/pipe" ]] || fail "FIFO not recreated as a fifo"
+s=$(stat -c '%a %Y' "$SRC/home/u2/pipe"); d=$(stat -c '%a %Y' "$DST/home/u2/pipe")
+[[ "$s" == "$d" ]] || fail "special-file metadata mismatch: src=($s) dst=($d)"
 
 # 5. convergence: pass 1 copied files, final pass copied none
 P1=$(echo "$JOB" | grep -o '"pass_no":1,[^}]*' | grep -o '"files_copied":[0-9]*' | cut -d: -f2)
@@ -268,7 +281,8 @@ echo "$JOB" | grep -q '"state":"COMPLETED"' || fail "delete pass did not complet
 # orphans (incl. recursive orphan dir) removed; synced content untouched
 [[ ! -e "$DST/keepme" ]] || fail "orphan dir keepme/ not removed recursively"
 [[ ! -e "$DST/home/u1-orphan.txt" ]] || fail "nested orphan file not removed"
-diff -r "$SRC" "$DST" >/dev/null || fail "delete pass damaged synced content"
+POSTDIFF=$(diff -r "$SRC" "$DST" 2>&1 | grep -v " is a fifo " || true)
+[[ -z "$POSTDIFF" ]] || fail "delete pass damaged synced content:"$'\n'"$POSTDIFF"
 DP=$(echo "$JOB" | grep -o '"state":"COMPLETE"[^}]*"orphans":[0-9]*' | tail -1 | grep -o '"orphans":[0-9]*' | cut -d: -f2)
 DELP=$(echo "$JOB" | grep -o '"pass_no":[0-9]*' | tail -1 | cut -d: -f2)
 [[ "${DP:-0}" -ge 4 ]] || fail "delete pass removed only ${DP:-0} objects (want >=4)"

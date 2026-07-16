@@ -601,6 +601,20 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
         if (o->meta_owner &&
             fchownat(dfd, name, ss->uid, ss->gid, AT_SYMLINK_NOFOLLOW) < 0)
             walk_err(ctx, "chown special", name);
+        /* mknodat's mode is masked by umask, so restore the exact permission
+         * bits; copy xattrs/ACLs; and set times LAST (chmod/chown/setxattr bump
+         * ctime, not mtime). Without the utimens the node keeps its creation
+         * mtime and every verify pass fails with "mtime mismatch" — and specials
+         * are not recopied (recopy is regular-file only), so it never converges. */
+        if (o->meta_mode && fchmodat(dfd, name, ss->mode & 07777, 0) < 0)
+            walk_err(ctx, "chmod special", name);
+        if (o->meta_xattrs)
+            xattr_copy_at(ctx, sfd, dfd, name, false);
+        if (o->meta_times) {
+            struct timespec ts[2] = { ss->atim, ss->mtim };
+            if (utimensat(dfd, name, ts, 0) < 0)
+                walk_err(ctx, "utimens special", name);
+        }
         CTR_ADD(ctx->c.files_copied, 1);
         {
             char sprel[PATH_MAX];
@@ -684,11 +698,23 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel)
 
     /* Pathological directory: source entry count over dir_split_threshold.
      * Ship the names as entry-list shards for fleet-wide fan-out instead of
-     * statting and copying millions of entries in this one shard (§2.3). Dir
-     * metadata is journaled but applied on convergence (children land via the
-     * fanned-out shards, not here). */
+     * statting and copying millions of entries in this one shard (§2.3).
+     *
+     * The directory's OWN metadata must still be applied here — the fanned-out
+     * entrylist shards process the dir's ENTRIES, never the dir itself, and
+     * DIRFIX is currently a no-op, so without this the split dir's owner/mode/
+     * times/xattrs/ACLs never land. Those entrylist shards rename entries into
+     * this dir asynchronously, which bumps its mtime after we set it; on a
+     * non-final pass the mtime is therefore left dirty and the next pass
+     * re-applies it, and by the converging pass nothing is copied so it sticks
+     * (dir metadata converges over passes — the same property the non-split
+     * path relies on for cross-shard subdirectories). */
     if (o->dir_split_threshold && sn > o->dir_split_threshold && !o->dry_run) {
         split_entrylist(ctx, rel, sv, sn, dv, dn, dfd);
+        if (dfd >= 0 && !ctx->fatal) {
+            xattr_copy_fd(ctx, sfd, dfd, rel[0] ? rel : "<root>"); /* incl. ACLs */
+            apply_meta_dirfd(ctx, dfd, &sst, rel[0] ? rel : "<root>");
+        }
         jrn_emit(ctx, JR_DIR_META, rel, &sst, NULL, 0, NULL);
         free_entries(sv, sn);
         free_entries(dv, dn);

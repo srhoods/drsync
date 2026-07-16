@@ -38,6 +38,16 @@ echo orphan > "$DST/bigdir/zzz-orphan.txt"   # dst-only → orphan (report-only)
 head -c 629145600 /dev/urandom > "$SRC/huge.bin"   # 600 MiB → 3 ranges
 HUGE_SUM=$(sha256sum "$SRC/huge.bin" | cut -d' ' -f1)
 
+# Distinctive metadata on the split dir itself: a directory over
+# dir_split_threshold is fanned out into entry-list shards, but its OWN
+# owner/mode/times/xattrs must still converge (they are applied by the splitting
+# shard, not the fanned-out children). Set these last so file creation does not
+# perturb the dir mtime we assert on.
+setfattr -n user.dirtag -v splitdir "$SRC/bigdir"
+chmod 0751 "$SRC/bigdir"
+touch -d '2021-06-07 08:09:10' "$SRC/bigdir"
+BD_MODE=$(stat -c '%a' "$SRC/bigdir"); BD_MTIME=$(stat -c '%Y' "$SRC/bigdir")
+
 # --- services ----------------------------------------------------------------
 "$ROOT/bin/drsyncd" -data-dir "$WORK/coord" -listen-agent 127.0.0.1:$CP \
     -listen-http 127.0.0.1:$HP -api-token scaletok -log-level warn \
@@ -99,6 +109,15 @@ DIFF=$(diff -r "$SRC" "$DST" 2>&1 | grep -v "zzz-orphan" || true)
 curl -sf -H "$AUTH" "$API/api/v1/jobs/scale" | grep -q '"verify_fail":[1-9]' \
     && fail "verify failures reported"
 
-echo "entrylist shards: $NEL; huge.bin chunk-copied; content byte-exact; verify clean"
+# 5. split-dir's OWN metadata converged: mode, mtime and xattrs on a directory
+#    over dir_split_threshold must match the source (regression — was skipped on
+#    the split path, so the dir kept its creation mtime/mode forever).
+GM=$(stat -c '%a' "$DST/bigdir"); GT=$(stat -c '%Y' "$DST/bigdir")
+[[ "$GM" == "$BD_MODE" ]]  || fail "split-dir mode not applied: src=$BD_MODE dst=$GM"
+[[ "$GT" == "$BD_MTIME" ]] || fail "split-dir mtime not applied: src=$BD_MTIME dst=$GT"
+GX=$(getfattr -n user.dirtag --only-values "$DST/bigdir" 2>/dev/null || true)
+[[ "$GX" == "splitdir" ]] || fail "split-dir xattr not applied (got '$GX')"
+
+echo "entrylist shards: $NEL; huge.bin chunk-copied; content byte-exact; verify clean; split-dir meta converged"
 PASS=1
 echo "PASS: entry-list + chunked-copy task types OK"

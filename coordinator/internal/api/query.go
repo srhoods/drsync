@@ -83,7 +83,13 @@ const (
 	maxPageLimit     = 10000
 )
 
-// pageParams: ?pass=N|all (default latest), ?limit, ?offset.
+// pageParams: ?pass=N|latest|all, ?limit, ?offset.
+//
+// The default (no pass= given) is ALL passes, not the latest one: errors and
+// verify failures are recorded in whichever pass produced them, and a converged
+// job's latest pass is typically the clean one — so a latest-only default would
+// hide exactly the records an operator opens these views to find. `latest` is
+// still available explicitly.
 func (s *Server) pageParams(w http.ResponseWriter, r *http.Request, job *store.Job) (passes []int, limit, offset int, ok bool) {
 	all, err := s.st.ListPasses(job.ID)
 	if err != nil {
@@ -95,12 +101,12 @@ func (s *Server) pageParams(w http.ResponseWriter, r *http.Request, job *store.J
 		return nil, 0, 0, false
 	}
 	switch q := r.URL.Query().Get("pass"); q {
-	case "", "latest":
-		passes = []int{all[len(all)-1].PassNo}
-	case "all":
+	case "", "all":
 		for _, p := range all {
 			passes = append(passes, p.PassNo)
 		}
+	case "latest":
+		passes = []int{all[len(all)-1].PassNo}
 	default:
 		n, err := strconv.Atoi(q)
 		if err != nil {
@@ -214,24 +220,35 @@ func (s *Server) getErrors(w http.ResponseWriter, r *http.Request) {
 	class := r.URL.Query().Get("class")
 	pathPrefix := r.URL.Query().Get("path")
 
+	// A verify failure is an error condition (mtime/mode/checksum/... mismatch);
+	// it carries a reason in Detail rather than an errno, so it is grouped under
+	// a synthetic "VERIFY_FAIL" class instead of an errnoClass.
+	classOf := func(rec *drsyncpb.JournalRecord) string {
+		if rec.Type == drsyncpb.JournalRecord_JR_VERIFY_FAIL {
+			return "VERIFY_FAIL"
+		}
+		return errnoClass(rec.Errno)
+	}
+
 	records := []map[string]any{}
 	byClass := map[string]int64{}
 	truncated, err := s.scanJournal(job, passes, limit, offset,
 		func(rec *drsyncpb.JournalRecord) bool {
 			if rec.Type != drsyncpb.JournalRecord_JR_ERROR &&
-				rec.Type != drsyncpb.JournalRecord_JR_FIDELITY_EXCEPTION {
+				rec.Type != drsyncpb.JournalRecord_JR_FIDELITY_EXCEPTION &&
+				rec.Type != drsyncpb.JournalRecord_JR_VERIFY_FAIL {
 				return false
 			}
 			if pathPrefix != "" && !strings.HasPrefix(string(rec.RelPath), pathPrefix) {
 				return false
 			}
-			if class != "" && errnoClass(rec.Errno) != class {
+			if class != "" && classOf(rec) != class {
 				return false
 			}
 			return true
 		},
 		func(pn int, rec *drsyncpb.JournalRecord) {
-			byClass[errnoClass(rec.Errno)]++
+			byClass[classOf(rec)]++
 			records = append(records, recView(pn, rec))
 		})
 	if err != nil {
