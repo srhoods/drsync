@@ -138,7 +138,10 @@ A shard = one directory subtree slice. Pseudocode of the dual-tree walk:
 ```
 walk_shard(shard):
   work = stack of rel_paths, seeded with shard.rel_path
-  budget = opts.shard_budget                     # default 250k entries
+  # The coordinator's per-shard override wins when present: it knows the fleet
+  # size and queue depth, and sends budget 0 to fan a job out across the fleet
+  # (coordinator §4.1). Absent, the job's own tuning applies.
+  budget = shard.overrides.walk_budget ?? opts.shard_budget   # default 250k entries
   while (rel = pop(work)):
     src_fd = openat_chain(src_root_fd, rel, O_NOFOLLOW|O_DIRECTORY)
     dst_fd = openat_chain(dst_root_fd, rel, ...) # may be ENOENT → all-create mode
@@ -162,7 +165,9 @@ walk_shard(shard):
 ```
 
 - **Depth-first with a budget:** small subtrees complete inline (no coordinator round
-  trip); anything beyond the budget fans out. Self-tuning to tree shape.
+  trip); anything beyond the budget fans out. Self-tuning to tree shape — but *only*
+  to tree shape: the agent cannot see the fleet, so the coordinator overrides the
+  budget while there is too little work queued to keep every agent busy.
 - **fd-relative everything:** `openat` chains anchored at `src_root_fd`/`dst_root_fd`
   opened once at job start with `O_PATH|O_DIRECTORY`; `O_NOFOLLOW` on every component.
   No absolute-path resolution after startup ⇒ immune to symlink swaps and rename races

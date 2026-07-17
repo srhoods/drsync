@@ -77,7 +77,13 @@ message EntryListShard {       // slice of a huge directory (see agent doc §4.3
   uint64 shard_id   = 1;
   string dir_rel    = 2;
   repeated string names = 3;   // the entries this shard is responsible for
+  WalkOverrides overrides = 4;
   // walk/diff/copy proceeds exactly as a Shard, minus the readdir
+}
+
+message WalkOverrides {        // per-shard fan-out, set by the coordinator
+  optional uint64 walk_budget     = 1;  // entries before the shard pushes subdirs back
+  optional uint64 split_threshold = 2;  // dir size that becomes entry-list shards
 }
 
 message ChunkTask {            // one range of a large file
@@ -91,6 +97,14 @@ message ChunkTask {            // one range of a large file
 
 `JobOptions` (filters, thresholds, ACL policy, verify rate, etc.) is versioned by a hash;
 `WorkGrant` sends the full options blob only when the agent's cached hash differs.
+
+`WalkOverrides` is the exception to "options are per job": it is decided per *grant*,
+because it depends on the fleet and queue at that instant rather than on the job (see
+coordinator doc §4.1). Both fields use explicit presence — `walk_budget = 0` is the
+instruction "descend nothing, push every subdirectory back", which is not the same as
+an absent field ("use the job's `shard_budget`"). The *policy* behind the decision
+(`tuning.spread_mode`) is deliberately not on the wire: agents receive the resolved
+result, never the rule (D9).
 
 ## 4. Interaction Flows
 

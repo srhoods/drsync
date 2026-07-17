@@ -265,11 +265,23 @@ message FileGen {
   int64  mtime_ns = 2;
 }
 
+// Per-shard walk overrides. The coordinator is the only party that knows the
+// fleet size and queue depth, so it — not the agent — decides how eagerly a
+// shard fans out (docs/DESIGN-coordinator.md §4.1). Unset = use the job's
+// tuning.shard_budget / tuning.dir_split_threshold. Explicit presence matters:
+// walk_budget = 0 means "descend nothing, push every subdirectory back", which
+// is not the same as "unset".
+message WalkOverrides {
+  optional uint64 walk_budget     = 1;
+  optional uint64 split_threshold = 2;
+}
+
 message Shard {
   uint64 shard_id = 1;
   uint64 job_id   = 2;
   uint32 pass_no  = 3;
   string rel_path = 4;  // "" = job root
+  WalkOverrides overrides = 5;
 }
 
 // A slice of a huge directory: enumeration already done, names supplied.
@@ -279,6 +291,7 @@ message EntryListShard {
   uint32 pass_no        = 3;
   string dir_rel        = 4;
   repeated bytes names  = 5;  // bytes: names are not guaranteed UTF-8
+  WalkOverrides overrides = 6;
 }
 
 message ChunkTask {

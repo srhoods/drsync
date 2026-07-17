@@ -993,6 +993,53 @@ func (s *Store) ListAgents() ([]*Agent, error) {
 	return out, rows.Err()
 }
 
+// CountSchedulableAgents counts the agents that could be granted work right
+// now: connected and administratively enabled. It is the divisor for the
+// scheduler's fan-out and fair-share decisions, so on success it never reports
+// less than 1 — an empty fleet has nobody to spread across, and a zero divisor
+// must not reach the caller.
+func (s *Store) CountSchedulableAgents() (int64, error) {
+	var n int64
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM agents
+		WHERE enabled = 1 AND state = ?`, "connected").Scan(&n); err != nil {
+		return 0, err
+	}
+	return max(n, 1), nil
+}
+
+// SchedulerCounts is a snapshot of the global queue driving the scheduler's
+// fan-out and fair-share decisions (docs/DESIGN-coordinator.md §4.1).
+type SchedulerCounts struct {
+	// WalkPending is queued+leased dir/entrylist shards across running jobs:
+	// how much parallel tree-walking the fleet already has to chew on. Leased
+	// shards count — an agent busy on one is not starved.
+	WalkPending int64
+	// Queued is grantable shards of every kind. The fair-share cap divides
+	// this, so it must not be walk-only: during the verify phase the walk
+	// queue is empty while hundreds of thousands of verify shards wait, and a
+	// walk-only divisor would throttle every agent to one shard per poll.
+	Queued int64
+}
+
+// SchedulerCounts reads both counters in one query off the trigger-maintained
+// shard_counts rollup, so the cost is O(kinds × states × running passes)
+// rather than a scan of the shards table.
+func (s *Store) SchedulerCounts() (SchedulerCounts, error) {
+	var c SchedulerCounts
+	err := s.rdb.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN sc.kind IN (?,?) AND sc.state IN (?,?) THEN sc.n ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN sc.state = ? THEN sc.n ELSE 0 END), 0)
+		FROM shard_counts sc
+		JOIN passes p ON p.id = sc.pass_id
+		JOIN jobs   j ON j.id = p.job_id
+		WHERE j.state = ?`,
+		string(model.KindDir), string(model.KindEntryList),
+		string(model.ShardQueued), string(model.ShardLeased),
+		string(model.ShardQueued), string(model.JobRunning),
+	).Scan(&c.WalkPending, &c.Queued)
+	return c, err
+}
+
 // ---------------------------------------------------------------------------
 // Journal cursors (flow control / replay dedup)
 // ---------------------------------------------------------------------------

@@ -608,3 +608,116 @@ func (s *Store) enabledFlag(t *testing.T, id string) bool {
 	t.Fatalf("agent %q not found", id)
 	return false
 }
+
+// TestSchedulerCounts covers the inputs to the fan-out and fair-share
+// decisions: walk shards must count queued AND leased (an agent busy on a
+// shard is not starved), while Queued spans every kind, since the fair-share
+// divisor must not go blind during a walk-free phase such as verify.
+func TestSchedulerCounts(t *testing.T) {
+	s := openTest(t)
+	_, passID, rootID := seed(t, s)
+
+	c, err := s.SchedulerCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.WalkPending != 1 || c.Queued != 1 {
+		t.Fatalf("seeded root: got %+v, want WalkPending=1 Queued=1", c)
+	}
+
+	// Leasing the root must not make the fleet look starved.
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if c, err = s.SchedulerCounts(); err != nil {
+		t.Fatal(err)
+	}
+	if c.WalkPending != 1 {
+		t.Errorf("leased root: WalkPending = %d, want 1 (leased still counts)", c.WalkPending)
+	}
+	if c.Queued != 0 {
+		t.Errorf("leased root: Queued = %d, want 0 (nothing grantable)", c.Queued)
+	}
+
+	// Children pushed back by a split.
+	if _, err := s.InsertShards(passID, rootID, []NewShard{
+		{Kind: model.KindDir, RelPath: "a"},
+		{Kind: model.KindEntryList, RelPath: "b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Verify tasks are not walk work, but are grantable.
+	if _, err := s.InsertShards(passID, 0, []NewShard{
+		{Kind: model.KindVerify, RelPath: "v1"},
+		{Kind: model.KindVerify, RelPath: "v2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if c, err = s.SchedulerCounts(); err != nil {
+		t.Fatal(err)
+	}
+	if c.WalkPending != 3 {
+		t.Errorf("WalkPending = %d, want 3 (leased root + dir + entrylist)", c.WalkPending)
+	}
+	if c.Queued != 4 {
+		t.Errorf("Queued = %d, want 4 (dir + entrylist + 2 verify)", c.Queued)
+	}
+}
+
+// Only a RUNNING job's shards are schedulable, so a paused job's backlog must
+// not suppress fan-out for the job that is actually running.
+func TestSchedulerCountsIgnoresNonRunningJobs(t *testing.T) {
+	s := openTest(t)
+	jobID, _, _ := seed(t, s)
+	if err := s.SetJobState(jobID, model.JobPaused); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.SchedulerCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.WalkPending != 0 || c.Queued != 0 {
+		t.Fatalf("paused job: got %+v, want zeroes", c)
+	}
+}
+
+func TestCountSchedulableAgents(t *testing.T) {
+	s := openTest(t)
+
+	// An empty fleet reports 1, never 0: the count is a divisor.
+	n, err := s.CountSchedulableAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("empty fleet: got %d, want 1", n)
+	}
+
+	for _, id := range []string{"a", "b", "c"} {
+		if err := s.UpsertAgent(id, id+".host", "v1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err = s.CountSchedulableAgents(); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("got %d, want 3", n)
+	}
+
+	// A drained agent finishes its leases but takes no new work, so it must
+	// not inflate the divisor.
+	if err := s.SetAgentEnabled("b", false); err != nil {
+		t.Fatal(err)
+	}
+	// Nor may a disconnected one.
+	if err := s.SetAgentState("c", "disconnected"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = s.CountSchedulableAgents(); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("after disable+disconnect: got %d, want 1", n)
+	}
+}

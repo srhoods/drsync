@@ -583,7 +583,7 @@ func (x JournalRecord_Type) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use JournalRecord_Type.Descriptor instead.
 func (JournalRecord_Type) EnumDescriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{36, 0}
+	return file_drsync_proto_rawDescGZIP(), []int{37, 0}
 }
 
 type StatInfo struct {
@@ -2091,19 +2091,78 @@ func (x *FileGen) GetMtimeNs() int64 {
 	return 0
 }
 
+// Per-shard walk overrides. The coordinator is the only party that knows the
+// fleet size and queue depth, so it — not the agent — decides how eagerly a
+// shard fans out (docs/DESIGN-coordinator.md §4.1). Unset = use the job's
+// tuning.shard_budget / tuning.dir_split_threshold. Explicit presence matters:
+// walk_budget = 0 means "descend nothing, push every subdirectory back", which
+// is not the same as "unset".
+type WalkOverrides struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	WalkBudget     *uint64                `protobuf:"varint,1,opt,name=walk_budget,json=walkBudget,proto3,oneof" json:"walk_budget,omitempty"`
+	SplitThreshold *uint64                `protobuf:"varint,2,opt,name=split_threshold,json=splitThreshold,proto3,oneof" json:"split_threshold,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *WalkOverrides) Reset() {
+	*x = WalkOverrides{}
+	mi := &file_drsync_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WalkOverrides) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WalkOverrides) ProtoMessage() {}
+
+func (x *WalkOverrides) ProtoReflect() protoreflect.Message {
+	mi := &file_drsync_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WalkOverrides.ProtoReflect.Descriptor instead.
+func (*WalkOverrides) Descriptor() ([]byte, []int) {
+	return file_drsync_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *WalkOverrides) GetWalkBudget() uint64 {
+	if x != nil && x.WalkBudget != nil {
+		return *x.WalkBudget
+	}
+	return 0
+}
+
+func (x *WalkOverrides) GetSplitThreshold() uint64 {
+	if x != nil && x.SplitThreshold != nil {
+		return *x.SplitThreshold
+	}
+	return 0
+}
+
 type Shard struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ShardId       uint64                 `protobuf:"varint,1,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
 	JobId         uint64                 `protobuf:"varint,2,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
 	PassNo        uint32                 `protobuf:"varint,3,opt,name=pass_no,json=passNo,proto3" json:"pass_no,omitempty"`
 	RelPath       string                 `protobuf:"bytes,4,opt,name=rel_path,json=relPath,proto3" json:"rel_path,omitempty"` // "" = job root
+	Overrides     *WalkOverrides         `protobuf:"bytes,5,opt,name=overrides,proto3" json:"overrides,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Shard) Reset() {
 	*x = Shard{}
-	mi := &file_drsync_proto_msgTypes[19]
+	mi := &file_drsync_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2115,7 +2174,7 @@ func (x *Shard) String() string {
 func (*Shard) ProtoMessage() {}
 
 func (x *Shard) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[19]
+	mi := &file_drsync_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2128,7 +2187,7 @@ func (x *Shard) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Shard.ProtoReflect.Descriptor instead.
 func (*Shard) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{19}
+	return file_drsync_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *Shard) GetShardId() uint64 {
@@ -2159,6 +2218,13 @@ func (x *Shard) GetRelPath() string {
 	return ""
 }
 
+func (x *Shard) GetOverrides() *WalkOverrides {
+	if x != nil {
+		return x.Overrides
+	}
+	return nil
+}
+
 // A slice of a huge directory: enumeration already done, names supplied.
 type EntryListShard struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -2167,13 +2233,14 @@ type EntryListShard struct {
 	PassNo        uint32                 `protobuf:"varint,3,opt,name=pass_no,json=passNo,proto3" json:"pass_no,omitempty"`
 	DirRel        string                 `protobuf:"bytes,4,opt,name=dir_rel,json=dirRel,proto3" json:"dir_rel,omitempty"`
 	Names         [][]byte               `protobuf:"bytes,5,rep,name=names,proto3" json:"names,omitempty"` // bytes: names are not guaranteed UTF-8
+	Overrides     *WalkOverrides         `protobuf:"bytes,6,opt,name=overrides,proto3" json:"overrides,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *EntryListShard) Reset() {
 	*x = EntryListShard{}
-	mi := &file_drsync_proto_msgTypes[20]
+	mi := &file_drsync_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2185,7 +2252,7 @@ func (x *EntryListShard) String() string {
 func (*EntryListShard) ProtoMessage() {}
 
 func (x *EntryListShard) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[20]
+	mi := &file_drsync_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2198,7 +2265,7 @@ func (x *EntryListShard) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EntryListShard.ProtoReflect.Descriptor instead.
 func (*EntryListShard) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{20}
+	return file_drsync_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *EntryListShard) GetShardId() uint64 {
@@ -2236,6 +2303,13 @@ func (x *EntryListShard) GetNames() [][]byte {
 	return nil
 }
 
+func (x *EntryListShard) GetOverrides() *WalkOverrides {
+	if x != nil {
+		return x.Overrides
+	}
+	return nil
+}
+
 type ChunkTask struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TaskId        uint64                 `protobuf:"varint,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
@@ -2254,7 +2328,7 @@ type ChunkTask struct {
 
 func (x *ChunkTask) Reset() {
 	*x = ChunkTask{}
-	mi := &file_drsync_proto_msgTypes[21]
+	mi := &file_drsync_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2266,7 +2340,7 @@ func (x *ChunkTask) String() string {
 func (*ChunkTask) ProtoMessage() {}
 
 func (x *ChunkTask) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[21]
+	mi := &file_drsync_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2279,7 +2353,7 @@ func (x *ChunkTask) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChunkTask.ProtoReflect.Descriptor instead.
 func (*ChunkTask) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{21}
+	return file_drsync_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ChunkTask) GetTaskId() uint64 {
@@ -2366,7 +2440,7 @@ type DirMeta struct {
 
 func (x *DirMeta) Reset() {
 	*x = DirMeta{}
-	mi := &file_drsync_proto_msgTypes[22]
+	mi := &file_drsync_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2378,7 +2452,7 @@ func (x *DirMeta) String() string {
 func (*DirMeta) ProtoMessage() {}
 
 func (x *DirMeta) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[22]
+	mi := &file_drsync_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2391,7 +2465,7 @@ func (x *DirMeta) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirMeta.ProtoReflect.Descriptor instead.
 func (*DirMeta) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{22}
+	return file_drsync_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *DirMeta) GetRelPath() []byte {
@@ -2448,7 +2522,7 @@ type DirFixBatch struct {
 
 func (x *DirFixBatch) Reset() {
 	*x = DirFixBatch{}
-	mi := &file_drsync_proto_msgTypes[23]
+	mi := &file_drsync_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2460,7 +2534,7 @@ func (x *DirFixBatch) String() string {
 func (*DirFixBatch) ProtoMessage() {}
 
 func (x *DirFixBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[23]
+	mi := &file_drsync_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2473,7 +2547,7 @@ func (x *DirFixBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DirFixBatch.ProtoReflect.Descriptor instead.
 func (*DirFixBatch) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{23}
+	return file_drsync_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *DirFixBatch) GetTaskId() uint64 {
@@ -2514,7 +2588,7 @@ type VerifyEntry struct {
 
 func (x *VerifyEntry) Reset() {
 	*x = VerifyEntry{}
-	mi := &file_drsync_proto_msgTypes[24]
+	mi := &file_drsync_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2526,7 +2600,7 @@ func (x *VerifyEntry) String() string {
 func (*VerifyEntry) ProtoMessage() {}
 
 func (x *VerifyEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[24]
+	mi := &file_drsync_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2539,7 +2613,7 @@ func (x *VerifyEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyEntry.ProtoReflect.Descriptor instead.
 func (*VerifyEntry) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{24}
+	return file_drsync_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *VerifyEntry) GetRelPath() []byte {
@@ -2568,7 +2642,7 @@ type VerifyBatch struct {
 
 func (x *VerifyBatch) Reset() {
 	*x = VerifyBatch{}
-	mi := &file_drsync_proto_msgTypes[25]
+	mi := &file_drsync_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2580,7 +2654,7 @@ func (x *VerifyBatch) String() string {
 func (*VerifyBatch) ProtoMessage() {}
 
 func (x *VerifyBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[25]
+	mi := &file_drsync_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2593,7 +2667,7 @@ func (x *VerifyBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VerifyBatch.ProtoReflect.Descriptor instead.
 func (*VerifyBatch) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{25}
+	return file_drsync_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *VerifyBatch) GetTaskId() uint64 {
@@ -2636,7 +2710,7 @@ type DeleteBatch struct {
 
 func (x *DeleteBatch) Reset() {
 	*x = DeleteBatch{}
-	mi := &file_drsync_proto_msgTypes[26]
+	mi := &file_drsync_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2648,7 +2722,7 @@ func (x *DeleteBatch) String() string {
 func (*DeleteBatch) ProtoMessage() {}
 
 func (x *DeleteBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[26]
+	mi := &file_drsync_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2661,7 +2735,7 @@ func (x *DeleteBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteBatch.ProtoReflect.Descriptor instead.
 func (*DeleteBatch) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{26}
+	return file_drsync_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *DeleteBatch) GetTaskId() uint64 {
@@ -2703,7 +2777,7 @@ type ProbeTask struct {
 
 func (x *ProbeTask) Reset() {
 	*x = ProbeTask{}
-	mi := &file_drsync_proto_msgTypes[27]
+	mi := &file_drsync_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2715,7 +2789,7 @@ func (x *ProbeTask) String() string {
 func (*ProbeTask) ProtoMessage() {}
 
 func (x *ProbeTask) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[27]
+	mi := &file_drsync_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2728,7 +2802,7 @@ func (x *ProbeTask) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProbeTask.ProtoReflect.Descriptor instead.
 func (*ProbeTask) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{27}
+	return file_drsync_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ProbeTask) GetTaskId() uint64 {
@@ -2765,7 +2839,7 @@ type WorkItem struct {
 
 func (x *WorkItem) Reset() {
 	*x = WorkItem{}
-	mi := &file_drsync_proto_msgTypes[28]
+	mi := &file_drsync_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2777,7 +2851,7 @@ func (x *WorkItem) String() string {
 func (*WorkItem) ProtoMessage() {}
 
 func (x *WorkItem) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[28]
+	mi := &file_drsync_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2790,7 +2864,7 @@ func (x *WorkItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkItem.ProtoReflect.Descriptor instead.
 func (*WorkItem) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{28}
+	return file_drsync_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *WorkItem) GetLeaseId() uint64 {
@@ -2934,7 +3008,7 @@ type WorkGrant struct {
 
 func (x *WorkGrant) Reset() {
 	*x = WorkGrant{}
-	mi := &file_drsync_proto_msgTypes[29]
+	mi := &file_drsync_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2946,7 +3020,7 @@ func (x *WorkGrant) String() string {
 func (*WorkGrant) ProtoMessage() {}
 
 func (x *WorkGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[29]
+	mi := &file_drsync_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2959,7 +3033,7 @@ func (x *WorkGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkGrant.ProtoReflect.Descriptor instead.
 func (*WorkGrant) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{29}
+	return file_drsync_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *WorkGrant) GetItems() []*WorkItem {
@@ -2988,7 +3062,7 @@ type ShardSplit struct {
 
 func (x *ShardSplit) Reset() {
 	*x = ShardSplit{}
-	mi := &file_drsync_proto_msgTypes[30]
+	mi := &file_drsync_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3000,7 +3074,7 @@ func (x *ShardSplit) String() string {
 func (*ShardSplit) ProtoMessage() {}
 
 func (x *ShardSplit) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[30]
+	mi := &file_drsync_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3013,7 +3087,7 @@ func (x *ShardSplit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardSplit.ProtoReflect.Descriptor instead.
 func (*ShardSplit) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{30}
+	return file_drsync_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ShardSplit) GetParentShardId() uint64 {
@@ -3055,7 +3129,7 @@ type ShardSplitAck struct {
 
 func (x *ShardSplitAck) Reset() {
 	*x = ShardSplitAck{}
-	mi := &file_drsync_proto_msgTypes[31]
+	mi := &file_drsync_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3067,7 +3141,7 @@ func (x *ShardSplitAck) String() string {
 func (*ShardSplitAck) ProtoMessage() {}
 
 func (x *ShardSplitAck) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[31]
+	mi := &file_drsync_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3080,7 +3154,7 @@ func (x *ShardSplitAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardSplitAck.ProtoReflect.Descriptor instead.
 func (*ShardSplitAck) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{31}
+	return file_drsync_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ShardSplitAck) GetParentShardId() uint64 {
@@ -3130,7 +3204,7 @@ type ShardCounters struct {
 
 func (x *ShardCounters) Reset() {
 	*x = ShardCounters{}
-	mi := &file_drsync_proto_msgTypes[32]
+	mi := &file_drsync_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3142,7 +3216,7 @@ func (x *ShardCounters) String() string {
 func (*ShardCounters) ProtoMessage() {}
 
 func (x *ShardCounters) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[32]
+	mi := &file_drsync_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3155,7 +3229,7 @@ func (x *ShardCounters) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardCounters.ProtoReflect.Descriptor instead.
 func (*ShardCounters) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{32}
+	return file_drsync_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ShardCounters) GetEntriesWalked() uint64 {
@@ -3283,7 +3357,7 @@ type ShardResult struct {
 
 func (x *ShardResult) Reset() {
 	*x = ShardResult{}
-	mi := &file_drsync_proto_msgTypes[33]
+	mi := &file_drsync_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3295,7 +3369,7 @@ func (x *ShardResult) String() string {
 func (*ShardResult) ProtoMessage() {}
 
 func (x *ShardResult) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[33]
+	mi := &file_drsync_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3308,7 +3382,7 @@ func (x *ShardResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardResult.ProtoReflect.Descriptor instead.
 func (*ShardResult) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{33}
+	return file_drsync_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *ShardResult) GetShardId() uint64 {
@@ -3365,7 +3439,7 @@ type TaskResult struct {
 
 func (x *TaskResult) Reset() {
 	*x = TaskResult{}
-	mi := &file_drsync_proto_msgTypes[34]
+	mi := &file_drsync_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3377,7 +3451,7 @@ func (x *TaskResult) String() string {
 func (*TaskResult) ProtoMessage() {}
 
 func (x *TaskResult) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[34]
+	mi := &file_drsync_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3390,7 +3464,7 @@ func (x *TaskResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskResult.ProtoReflect.Descriptor instead.
 func (*TaskResult) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{34}
+	return file_drsync_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *TaskResult) GetTaskId() uint64 {
@@ -3465,7 +3539,7 @@ type TaskResultBatch struct {
 
 func (x *TaskResultBatch) Reset() {
 	*x = TaskResultBatch{}
-	mi := &file_drsync_proto_msgTypes[35]
+	mi := &file_drsync_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3477,7 +3551,7 @@ func (x *TaskResultBatch) String() string {
 func (*TaskResultBatch) ProtoMessage() {}
 
 func (x *TaskResultBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[35]
+	mi := &file_drsync_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3490,7 +3564,7 @@ func (x *TaskResultBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskResultBatch.ProtoReflect.Descriptor instead.
 func (*TaskResultBatch) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{35}
+	return file_drsync_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *TaskResultBatch) GetResults() []*TaskResult {
@@ -3519,7 +3593,7 @@ type JournalRecord struct {
 
 func (x *JournalRecord) Reset() {
 	*x = JournalRecord{}
-	mi := &file_drsync_proto_msgTypes[36]
+	mi := &file_drsync_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3531,7 +3605,7 @@ func (x *JournalRecord) String() string {
 func (*JournalRecord) ProtoMessage() {}
 
 func (x *JournalRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[36]
+	mi := &file_drsync_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3544,7 +3618,7 @@ func (x *JournalRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JournalRecord.ProtoReflect.Descriptor instead.
 func (*JournalRecord) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{36}
+	return file_drsync_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *JournalRecord) GetType() JournalRecord_Type {
@@ -3625,7 +3699,7 @@ type JournalBatch struct {
 
 func (x *JournalBatch) Reset() {
 	*x = JournalBatch{}
-	mi := &file_drsync_proto_msgTypes[37]
+	mi := &file_drsync_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3637,7 +3711,7 @@ func (x *JournalBatch) String() string {
 func (*JournalBatch) ProtoMessage() {}
 
 func (x *JournalBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[37]
+	mi := &file_drsync_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3650,7 +3724,7 @@ func (x *JournalBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JournalBatch.ProtoReflect.Descriptor instead.
 func (*JournalBatch) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{37}
+	return file_drsync_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *JournalBatch) GetSeq() uint64 {
@@ -3697,7 +3771,7 @@ type JournalAck struct {
 
 func (x *JournalAck) Reset() {
 	*x = JournalAck{}
-	mi := &file_drsync_proto_msgTypes[38]
+	mi := &file_drsync_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3709,7 +3783,7 @@ func (x *JournalAck) String() string {
 func (*JournalAck) ProtoMessage() {}
 
 func (x *JournalAck) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[38]
+	mi := &file_drsync_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3722,7 +3796,7 @@ func (x *JournalAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use JournalAck.ProtoReflect.Descriptor instead.
 func (*JournalAck) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{38}
+	return file_drsync_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *JournalAck) GetAckedSeq() uint64 {
@@ -3744,7 +3818,7 @@ type LatencyHistogram struct {
 
 func (x *LatencyHistogram) Reset() {
 	*x = LatencyHistogram{}
-	mi := &file_drsync_proto_msgTypes[39]
+	mi := &file_drsync_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3756,7 +3830,7 @@ func (x *LatencyHistogram) String() string {
 func (*LatencyHistogram) ProtoMessage() {}
 
 func (x *LatencyHistogram) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[39]
+	mi := &file_drsync_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3769,7 +3843,7 @@ func (x *LatencyHistogram) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LatencyHistogram.ProtoReflect.Descriptor instead.
 func (*LatencyHistogram) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{39}
+	return file_drsync_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *LatencyHistogram) GetMount() string {
@@ -3813,7 +3887,7 @@ type StatsReport struct {
 
 func (x *StatsReport) Reset() {
 	*x = StatsReport{}
-	mi := &file_drsync_proto_msgTypes[40]
+	mi := &file_drsync_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3825,7 +3899,7 @@ func (x *StatsReport) String() string {
 func (*StatsReport) ProtoMessage() {}
 
 func (x *StatsReport) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[40]
+	mi := &file_drsync_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3838,7 +3912,7 @@ func (x *StatsReport) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsReport.ProtoReflect.Descriptor instead.
 func (*StatsReport) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{40}
+	return file_drsync_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *StatsReport) GetTsNs() int64 {
@@ -3929,7 +4003,7 @@ type WorkRequest_CachedOptions struct {
 
 func (x *WorkRequest_CachedOptions) Reset() {
 	*x = WorkRequest_CachedOptions{}
-	mi := &file_drsync_proto_msgTypes[41]
+	mi := &file_drsync_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3941,7 +4015,7 @@ func (x *WorkRequest_CachedOptions) String() string {
 func (*WorkRequest_CachedOptions) ProtoMessage() {}
 
 func (x *WorkRequest_CachedOptions) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[41]
+	mi := &file_drsync_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3980,7 +4054,7 @@ type ShardSplit_NewShard struct {
 
 func (x *ShardSplit_NewShard) Reset() {
 	*x = ShardSplit_NewShard{}
-	mi := &file_drsync_proto_msgTypes[42]
+	mi := &file_drsync_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3992,7 +4066,7 @@ func (x *ShardSplit_NewShard) String() string {
 func (*ShardSplit_NewShard) ProtoMessage() {}
 
 func (x *ShardSplit_NewShard) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[42]
+	mi := &file_drsync_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4005,7 +4079,7 @@ func (x *ShardSplit_NewShard) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardSplit_NewShard.ProtoReflect.Descriptor instead.
 func (*ShardSplit_NewShard) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{30, 0}
+	return file_drsync_proto_rawDescGZIP(), []int{31, 0}
 }
 
 func (x *ShardSplit_NewShard) GetRelPath() []byte {
@@ -4025,7 +4099,7 @@ type ShardSplit_NewEntryList struct {
 
 func (x *ShardSplit_NewEntryList) Reset() {
 	*x = ShardSplit_NewEntryList{}
-	mi := &file_drsync_proto_msgTypes[43]
+	mi := &file_drsync_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4037,7 +4111,7 @@ func (x *ShardSplit_NewEntryList) String() string {
 func (*ShardSplit_NewEntryList) ProtoMessage() {}
 
 func (x *ShardSplit_NewEntryList) ProtoReflect() protoreflect.Message {
-	mi := &file_drsync_proto_msgTypes[43]
+	mi := &file_drsync_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4050,7 +4124,7 @@ func (x *ShardSplit_NewEntryList) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardSplit_NewEntryList.ProtoReflect.Descriptor instead.
 func (*ShardSplit_NewEntryList) Descriptor() ([]byte, []int) {
-	return file_drsync_proto_rawDescGZIP(), []int{30, 1}
+	return file_drsync_proto_rawDescGZIP(), []int{31, 1}
 }
 
 func (x *ShardSplit_NewEntryList) GetDirRel() []byte {
@@ -4243,18 +4317,26 @@ const file_drsync_proto_rawDesc = "" +
 	"\foptions_hash\x18\x02 \x01(\x04R\voptionsHash\"8\n" +
 	"\aFileGen\x12\x12\n" +
 	"\x04size\x18\x01 \x01(\x04R\x04size\x12\x19\n" +
-	"\bmtime_ns\x18\x02 \x01(\x03R\amtimeNs\"m\n" +
+	"\bmtime_ns\x18\x02 \x01(\x03R\amtimeNs\"\x87\x01\n" +
+	"\rWalkOverrides\x12$\n" +
+	"\vwalk_budget\x18\x01 \x01(\x04H\x00R\n" +
+	"walkBudget\x88\x01\x01\x12,\n" +
+	"\x0fsplit_threshold\x18\x02 \x01(\x04H\x01R\x0esplitThreshold\x88\x01\x01B\x0e\n" +
+	"\f_walk_budgetB\x12\n" +
+	"\x10_split_threshold\"\xa5\x01\n" +
 	"\x05Shard\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\x04R\ashardId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\x04R\x05jobId\x12\x17\n" +
 	"\apass_no\x18\x03 \x01(\rR\x06passNo\x12\x19\n" +
-	"\brel_path\x18\x04 \x01(\tR\arelPath\"\x8a\x01\n" +
+	"\brel_path\x18\x04 \x01(\tR\arelPath\x126\n" +
+	"\toverrides\x18\x05 \x01(\v2\x18.drsync.v1.WalkOverridesR\toverrides\"\xc2\x01\n" +
 	"\x0eEntryListShard\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\x04R\ashardId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\x04R\x05jobId\x12\x17\n" +
 	"\apass_no\x18\x03 \x01(\rR\x06passNo\x12\x17\n" +
 	"\adir_rel\x18\x04 \x01(\tR\x06dirRel\x12\x14\n" +
-	"\x05names\x18\x05 \x03(\fR\x05names\"\x9f\x02\n" +
+	"\x05names\x18\x05 \x03(\fR\x05names\x126\n" +
+	"\toverrides\x18\x06 \x01(\v2\x18.drsync.v1.WalkOverridesR\toverrides\"\x9f\x02\n" +
 	"\tChunkTask\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\x04R\x06taskId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\x04R\x05jobId\x12\x17\n" +
@@ -4472,7 +4554,7 @@ func file_drsync_proto_rawDescGZIP() []byte {
 }
 
 var file_drsync_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_drsync_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
+var file_drsync_proto_msgTypes = make([]protoimpl.MessageInfo, 45)
 var file_drsync_proto_goTypes = []any{
 	(FrameType)(0),                    // 0: drsync.v1.FrameType
 	(EntryType)(0),                    // 1: drsync.v1.EntryType
@@ -4502,31 +4584,32 @@ var file_drsync_proto_goTypes = []any{
 	(*JobOptions)(nil),                // 25: drsync.v1.JobOptions
 	(*WorkRequest)(nil),               // 26: drsync.v1.WorkRequest
 	(*FileGen)(nil),                   // 27: drsync.v1.FileGen
-	(*Shard)(nil),                     // 28: drsync.v1.Shard
-	(*EntryListShard)(nil),            // 29: drsync.v1.EntryListShard
-	(*ChunkTask)(nil),                 // 30: drsync.v1.ChunkTask
-	(*DirMeta)(nil),                   // 31: drsync.v1.DirMeta
-	(*DirFixBatch)(nil),               // 32: drsync.v1.DirFixBatch
-	(*VerifyEntry)(nil),               // 33: drsync.v1.VerifyEntry
-	(*VerifyBatch)(nil),               // 34: drsync.v1.VerifyBatch
-	(*DeleteBatch)(nil),               // 35: drsync.v1.DeleteBatch
-	(*ProbeTask)(nil),                 // 36: drsync.v1.ProbeTask
-	(*WorkItem)(nil),                  // 37: drsync.v1.WorkItem
-	(*WorkGrant)(nil),                 // 38: drsync.v1.WorkGrant
-	(*ShardSplit)(nil),                // 39: drsync.v1.ShardSplit
-	(*ShardSplitAck)(nil),             // 40: drsync.v1.ShardSplitAck
-	(*ShardCounters)(nil),             // 41: drsync.v1.ShardCounters
-	(*ShardResult)(nil),               // 42: drsync.v1.ShardResult
-	(*TaskResult)(nil),                // 43: drsync.v1.TaskResult
-	(*TaskResultBatch)(nil),           // 44: drsync.v1.TaskResultBatch
-	(*JournalRecord)(nil),             // 45: drsync.v1.JournalRecord
-	(*JournalBatch)(nil),              // 46: drsync.v1.JournalBatch
-	(*JournalAck)(nil),                // 47: drsync.v1.JournalAck
-	(*LatencyHistogram)(nil),          // 48: drsync.v1.LatencyHistogram
-	(*StatsReport)(nil),               // 49: drsync.v1.StatsReport
-	(*WorkRequest_CachedOptions)(nil), // 50: drsync.v1.WorkRequest.CachedOptions
-	(*ShardSplit_NewShard)(nil),       // 51: drsync.v1.ShardSplit.NewShard
-	(*ShardSplit_NewEntryList)(nil),   // 52: drsync.v1.ShardSplit.NewEntryList
+	(*WalkOverrides)(nil),             // 28: drsync.v1.WalkOverrides
+	(*Shard)(nil),                     // 29: drsync.v1.Shard
+	(*EntryListShard)(nil),            // 30: drsync.v1.EntryListShard
+	(*ChunkTask)(nil),                 // 31: drsync.v1.ChunkTask
+	(*DirMeta)(nil),                   // 32: drsync.v1.DirMeta
+	(*DirFixBatch)(nil),               // 33: drsync.v1.DirFixBatch
+	(*VerifyEntry)(nil),               // 34: drsync.v1.VerifyEntry
+	(*VerifyBatch)(nil),               // 35: drsync.v1.VerifyBatch
+	(*DeleteBatch)(nil),               // 36: drsync.v1.DeleteBatch
+	(*ProbeTask)(nil),                 // 37: drsync.v1.ProbeTask
+	(*WorkItem)(nil),                  // 38: drsync.v1.WorkItem
+	(*WorkGrant)(nil),                 // 39: drsync.v1.WorkGrant
+	(*ShardSplit)(nil),                // 40: drsync.v1.ShardSplit
+	(*ShardSplitAck)(nil),             // 41: drsync.v1.ShardSplitAck
+	(*ShardCounters)(nil),             // 42: drsync.v1.ShardCounters
+	(*ShardResult)(nil),               // 43: drsync.v1.ShardResult
+	(*TaskResult)(nil),                // 44: drsync.v1.TaskResult
+	(*TaskResultBatch)(nil),           // 45: drsync.v1.TaskResultBatch
+	(*JournalRecord)(nil),             // 46: drsync.v1.JournalRecord
+	(*JournalBatch)(nil),              // 47: drsync.v1.JournalBatch
+	(*JournalAck)(nil),                // 48: drsync.v1.JournalAck
+	(*LatencyHistogram)(nil),          // 49: drsync.v1.LatencyHistogram
+	(*StatsReport)(nil),               // 50: drsync.v1.StatsReport
+	(*WorkRequest_CachedOptions)(nil), // 51: drsync.v1.WorkRequest.CachedOptions
+	(*ShardSplit_NewShard)(nil),       // 52: drsync.v1.ShardSplit.NewShard
+	(*ShardSplit_NewEntryList)(nil),   // 53: drsync.v1.ShardSplit.NewEntryList
 }
 var file_drsync_proto_depIdxs = []int32{
 	1,  // 0: drsync.v1.StatInfo.type:type_name -> drsync.v1.EntryType
@@ -4543,36 +4626,38 @@ var file_drsync_proto_depIdxs = []int32{
 	21, // 11: drsync.v1.JobOptions.verify:type_name -> drsync.v1.VerifyOptions
 	23, // 12: drsync.v1.JobOptions.limits:type_name -> drsync.v1.LimitOptions
 	24, // 13: drsync.v1.JobOptions.tuning:type_name -> drsync.v1.TuningOptions
-	50, // 14: drsync.v1.WorkRequest.cached:type_name -> drsync.v1.WorkRequest.CachedOptions
-	27, // 15: drsync.v1.ChunkTask.gen:type_name -> drsync.v1.FileGen
-	31, // 16: drsync.v1.DirFixBatch.dirs:type_name -> drsync.v1.DirMeta
-	33, // 17: drsync.v1.VerifyBatch.entries:type_name -> drsync.v1.VerifyEntry
-	28, // 18: drsync.v1.WorkItem.shard:type_name -> drsync.v1.Shard
-	29, // 19: drsync.v1.WorkItem.entry_list:type_name -> drsync.v1.EntryListShard
-	30, // 20: drsync.v1.WorkItem.chunk:type_name -> drsync.v1.ChunkTask
-	32, // 21: drsync.v1.WorkItem.dirfix:type_name -> drsync.v1.DirFixBatch
-	34, // 22: drsync.v1.WorkItem.verify:type_name -> drsync.v1.VerifyBatch
-	35, // 23: drsync.v1.WorkItem.delete:type_name -> drsync.v1.DeleteBatch
-	36, // 24: drsync.v1.WorkItem.probe:type_name -> drsync.v1.ProbeTask
-	37, // 25: drsync.v1.WorkGrant.items:type_name -> drsync.v1.WorkItem
-	25, // 26: drsync.v1.WorkGrant.options:type_name -> drsync.v1.JobOptions
-	51, // 27: drsync.v1.ShardSplit.subdirs:type_name -> drsync.v1.ShardSplit.NewShard
-	52, // 28: drsync.v1.ShardSplit.entry_lists:type_name -> drsync.v1.ShardSplit.NewEntryList
-	2,  // 29: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
-	41, // 30: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
-	2,  // 31: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
-	10, // 32: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
-	10, // 33: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
-	43, // 34: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
-	8,  // 35: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
-	9,  // 36: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
-	9,  // 37: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
-	48, // 38: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
-	39, // [39:39] is the sub-list for method output_type
-	39, // [39:39] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	39, // [39:39] is the sub-list for extension extendee
-	0,  // [0:39] is the sub-list for field type_name
+	51, // 14: drsync.v1.WorkRequest.cached:type_name -> drsync.v1.WorkRequest.CachedOptions
+	28, // 15: drsync.v1.Shard.overrides:type_name -> drsync.v1.WalkOverrides
+	28, // 16: drsync.v1.EntryListShard.overrides:type_name -> drsync.v1.WalkOverrides
+	27, // 17: drsync.v1.ChunkTask.gen:type_name -> drsync.v1.FileGen
+	32, // 18: drsync.v1.DirFixBatch.dirs:type_name -> drsync.v1.DirMeta
+	34, // 19: drsync.v1.VerifyBatch.entries:type_name -> drsync.v1.VerifyEntry
+	29, // 20: drsync.v1.WorkItem.shard:type_name -> drsync.v1.Shard
+	30, // 21: drsync.v1.WorkItem.entry_list:type_name -> drsync.v1.EntryListShard
+	31, // 22: drsync.v1.WorkItem.chunk:type_name -> drsync.v1.ChunkTask
+	33, // 23: drsync.v1.WorkItem.dirfix:type_name -> drsync.v1.DirFixBatch
+	35, // 24: drsync.v1.WorkItem.verify:type_name -> drsync.v1.VerifyBatch
+	36, // 25: drsync.v1.WorkItem.delete:type_name -> drsync.v1.DeleteBatch
+	37, // 26: drsync.v1.WorkItem.probe:type_name -> drsync.v1.ProbeTask
+	38, // 27: drsync.v1.WorkGrant.items:type_name -> drsync.v1.WorkItem
+	25, // 28: drsync.v1.WorkGrant.options:type_name -> drsync.v1.JobOptions
+	52, // 29: drsync.v1.ShardSplit.subdirs:type_name -> drsync.v1.ShardSplit.NewShard
+	53, // 30: drsync.v1.ShardSplit.entry_lists:type_name -> drsync.v1.ShardSplit.NewEntryList
+	2,  // 31: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
+	42, // 32: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
+	2,  // 33: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
+	10, // 34: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
+	10, // 35: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
+	44, // 36: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
+	8,  // 37: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
+	9,  // 38: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
+	9,  // 39: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
+	49, // 40: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
+	41, // [41:41] is the sub-list for method output_type
+	41, // [41:41] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_drsync_proto_init() }
@@ -4580,7 +4665,8 @@ func file_drsync_proto_init() {
 	if File_drsync_proto != nil {
 		return
 	}
-	file_drsync_proto_msgTypes[28].OneofWrappers = []any{
+	file_drsync_proto_msgTypes[19].OneofWrappers = []any{}
+	file_drsync_proto_msgTypes[29].OneofWrappers = []any{
 		(*WorkItem_Shard)(nil),
 		(*WorkItem_EntryList)(nil),
 		(*WorkItem_Chunk)(nil),
@@ -4595,7 +4681,7 @@ func file_drsync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_drsync_proto_rawDesc), len(file_drsync_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   44,
+			NumMessages:   45,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

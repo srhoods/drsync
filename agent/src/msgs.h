@@ -137,6 +137,17 @@ enum {
     WI_ENTRYLIST = 3, /* EntryListShard: a name slice of a pathological dir */
 };
 
+/* Per-shard walk overrides (proto WalkOverrides). The coordinator sends these
+ * to fan a job out across the fleet; absent = use the job's own tuning. The
+ * have_ flags matter: walk_budget = 0 ("descend nothing, push every subdir
+ * back") is a real instruction, not a missing field. */
+struct walk_overrides {
+    bool     have_budget;
+    uint64_t budget;
+    bool     have_split_threshold;
+    uint64_t split_threshold;
+};
+
 struct shard_item {
     uint64_t lease_id;
     uint32_t lease_ttl_s;
@@ -148,6 +159,7 @@ struct shard_item {
     char   **paths;     /* WI_DELETE/WI_VERIFY: malloc'd array of rel paths */
     unsigned char *vchecksum; /* WI_VERIFY: per-path checksum flag */
     size_t   n_paths;
+    struct walk_overrides ov; /* WI_SHARD/WI_ENTRYLIST */
 };
 void shard_item_free(struct shard_item *it);
 

@@ -105,6 +105,11 @@ type JobSpec struct {
 			DirSplitThreshold uint64 `yaml:"dir_split_threshold"`
 			StatxBatch        uint32 `yaml:"statx_batch"`
 			MtimeSlopNS       int64  `yaml:"mtime_slop_ns"`
+			// Fan-out control. Coordinator-side only: these never reach an agent
+			// (D9 — the agent acts on the resolved per-shard overrides it is
+			// granted, not on policy). See SpreadPolicy.
+			SpreadMode           string `yaml:"spread_mode"`
+			SpreadTargetPerAgent uint64 `yaml:"spread_target_per_agent"`
 		} `yaml:"tuning"`
 		Notifications NotificationSpec `yaml:"notifications,omitempty"`
 	} `yaml:"spec"`
@@ -208,6 +213,40 @@ func (s *JobSpec) ApplyDefaults() {
 	if sp.Tuning.MtimeSlopNS == 0 {
 		sp.Tuning.MtimeSlopNS = 1_000_000
 	}
+	if sp.Tuning.SpreadMode == "" {
+		sp.Tuning.SpreadMode = SpreadAuto
+	}
+	if sp.Tuning.SpreadTargetPerAgent == 0 {
+		sp.Tuning.SpreadTargetPerAgent = 32
+	}
+}
+
+// Spread modes for tuning.spread_mode.
+const (
+	// SpreadAuto fans out only while the fleet is starved of walk shards.
+	SpreadAuto = "auto"
+	// SpreadOff never overrides the job's shard_budget: a shard descends until
+	// its budget runs out, as it did before fan-out existed.
+	SpreadOff = "off"
+	// SpreadAlways fans out on every grant, whatever the queue depth. Costs a
+	// coordinator round trip per directory — for diagnosis, not production.
+	SpreadAlways = "always"
+)
+
+// SpreadPolicy is the coordinator-side fan-out policy resolved from the spec.
+// It is deliberately absent from JobOptions: agents receive the *result* of the
+// policy as per-shard WalkOverrides, never the policy itself.
+type SpreadPolicy struct {
+	Mode           string
+	TargetPerAgent uint64
+}
+
+// SpreadPolicy resolves the job's fan-out policy. Call on a defaulted spec.
+func (s *JobSpec) SpreadPolicy() SpreadPolicy {
+	return SpreadPolicy{
+		Mode:           s.Spec.Tuning.SpreadMode,
+		TargetPerAgent: s.Spec.Tuning.SpreadTargetPerAgent,
+	}
 }
 
 func (s *JobSpec) Validate() error {
@@ -253,6 +292,11 @@ func (s *JobSpec) Validate() error {
 	}
 	if r := s.Spec.Verify.Checksum.SampleRate; r < 0 || r > 1 {
 		return fmt.Errorf("verify.checksum.sample_rate must be in [0,1]")
+	}
+	switch s.Spec.Tuning.SpreadMode {
+	case SpreadAuto, SpreadOff, SpreadAlways:
+	default:
+		return fmt.Errorf("tuning.spread_mode must be auto|off|always")
 	}
 	n := s.Spec.Notifications
 	if n.Enabled() && len(n.Recipients) == 0 {
