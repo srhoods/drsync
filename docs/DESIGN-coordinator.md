@@ -227,6 +227,16 @@ Append-only, per (job, pass), the system of record for per-file outcomes:
   `drsync report`, the WebUI error browser, and the final migration audit report.
 - Retention: journals are the audit trail — kept until job deletion; segments are
   immutable and rsync-able for archival.
+- **Durability / ack gating:** an incoming `JournalBatch` is written, but the
+  `JournalAck` is withheld until a periodic flusher fsyncs the open segments
+  (`RunJournalFlusher`, 250 ms). Only then is each agent acked up to its durable
+  high-water sequence. This matters because the agent releases its send buffer
+  and unblocks the shard's `ShardResult` on the ack (`agent/src/jrn.c`
+  `jrn_wait_acked`): acking before fsync would let a shard complete — and its
+  records be discarded by the agent — while the journal write is still only in
+  the page cache, so a coordinator crash would lose them. If an fsync fails,
+  every ack for that cycle is withheld (counted by
+  `drsync_journal_fsync_errors_total`) and retried on the next successful flush.
 
 ## 6. REST API & WebSocket (day-1 surface, also the WebUI contract)
 

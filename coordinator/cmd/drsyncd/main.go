@@ -33,6 +33,12 @@ import (
 // When it is absent, email notifications are simply disabled.
 const defaultSMTPConfig = "/etc/drsync/smtp.yaml"
 
+// journalFlushInterval bounds how often persisted journal batches are fsynced
+// and acked. Small enough that the ack latency it adds to shard completion is
+// negligible against the agent's 120s ack timeout, large enough that the fsync
+// rate on the journal segments stays cheap.
+const journalFlushInterval = 250 * time.Millisecond
+
 // coordinatorVersion is surfaced in the console header and /api/v1/info.
 const coordinatorVersion = "0.1.0-slice5"
 
@@ -135,20 +141,10 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpCon
 	go sched.RunSweeper(ctx, leaseTTL/3)
 	go pc.Run(ctx, 2*time.Second)
 	go poller.Run(ctx, time.Second)
-	go func() { // journal fsync heartbeat (gates should move ack here in phase 1)
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if err := jw.Flush(); err != nil {
-					slog.Error("journal flush failed", "err", err)
-				}
-			}
-		}
-	}()
+	// Journal durability: fsync persisted batches, then ack each agent up to its
+	// durable high-water. Gating the ack on fsync is what makes JournalAck mean
+	// "durable" — see agentsrv.RunJournalFlusher.
+	go asrv.RunJournalFlusher(ctx, journalFlushInterval)
 
 	agentLn, err := net.Listen("tcp", agentAddr)
 	if err != nil {

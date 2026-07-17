@@ -1,6 +1,7 @@
 package agentsrv
 
 import (
+	"context"
 	"net"
 	"path/filepath"
 	"testing"
@@ -90,6 +91,11 @@ func TestAgentSession(t *testing.T) {
 	}
 	defer ln.Close()
 	go srv.Serve(ln)
+	// The journal ack is fsync-gated: the flusher persists batches and then
+	// acks. Run it fast so the ack round-trip below stays deterministic.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.RunJournalFlusher(ctx, 10*time.Millisecond)
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
@@ -205,6 +211,44 @@ func newTestServer(t *testing.T) *Server {
 	}
 	return New(Config{HeartbeatInterval: 5 * time.Second, LeaseTTL: 30 * time.Second},
 		st, sched, jw, met)
+}
+
+// TestJournalAckWithheldUntilFlush is the durability regression: a JournalAck
+// must not be sent until the batch is fsynced, because the agent releases its
+// send buffer and unblocks the shard's result on the ack (agent/src/jrn.c). An
+// ack before fsync would lose journal records on a coordinator crash.
+func TestJournalAckWithheldUntilFlush(t *testing.T) {
+	srv := newTestServer(t)
+	coordSide, agentSide := net.Pipe()
+	defer agentSide.Close()
+	go srv.handle(coordSide)
+
+	a := &fakeAgent{t: t, conn: agentSide}
+	a.send(drsyncpb.FrameType_FRAME_HELLO, &drsyncpb.Hello{
+		AgentId: "jd", Hostname: "h", ProtoMajor: 1, AgentVersion: "0.0.1"})
+	a.recv(drsyncpb.FrameType_FRAME_HELLO_ACK, &drsyncpb.HelloAck{})
+
+	// Persist a batch, then round-trip a heartbeat: the read loop processes
+	// frames in order, so once its ack returns the batch has been Append'd.
+	a.send(drsyncpb.FrameType_FRAME_JOURNAL_BATCH, &drsyncpb.JournalBatch{
+		Seq: 7, JobId: 1, PassNo: 1, RecordCount: 3, RecordsZstd: []byte("x")})
+	a.send(drsyncpb.FrameType_FRAME_HEARTBEAT, &drsyncpb.Heartbeat{Seq: 1})
+	a.recv(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, &drsyncpb.HeartbeatAck{})
+
+	// No flusher has run: the ack must not have been sent.
+	agentSide.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if ft, _, err := wire.ReadFrame(agentSide); err == nil {
+		t.Fatalf("received %v before fsync; ack must be withheld until flush", ft)
+	}
+	agentSide.SetReadDeadline(time.Time{})
+
+	// After a flush (fsync) the ack is released, at the durable high-water.
+	srv.flushAndAck()
+	jack := &drsyncpb.JournalAck{}
+	a.recv(drsyncpb.FrameType_FRAME_JOURNAL_ACK, jack)
+	if jack.AckedSeq != 7 {
+		t.Fatalf("acked seq = %d, want 7", jack.AckedSeq)
+	}
 }
 
 // TestReadLoopNotBlockedByWrites is the end-of-scan deadlock regression. Over an
