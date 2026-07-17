@@ -428,6 +428,35 @@ static bool dec_tuning_opts(const uint8_t *p, size_t n, struct job_options *o)
     return !c.err;
 }
 
+static bool dec_filter_rule(const uint8_t *p, size_t n, struct filter_rule *fr)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    fr->exclude = false;
+    fr->pattern[0] = '\0';
+    const uint8_t *sp;
+    size_t sn;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1: fr->exclude = pb_get_varint(&c) != 0; break;
+        case 2:
+            /* Guard against silent truncation: the coordinator bounds the
+             * pattern below FILTER_PATTERN_MAX, so an over-length pattern is a
+             * corrupt frame or a gross version skew — reject rather than match
+             * a truncated glob (which would copy data the operator excluded). */
+            if (!pb_get_len(&c, &sp, &sn) || sn >= sizeof fr->pattern)
+                return false;
+            memcpy(fr->pattern, sp, sn);
+            fr->pattern[sn] = '\0';
+            break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err && fr->pattern[0];
+}
+
 static bool dec_job_options(const uint8_t *p, size_t n, struct job_options *o)
 {
     memset(o, 0, sizeof(*o));
@@ -443,6 +472,15 @@ static bool dec_job_options(const uint8_t *p, size_t n, struct job_options *o)
         case 2: pb_get_strn(&c, o->job_name, sizeof o->job_name); break;
         case 3: pb_get_strn(&c, o->src_root, sizeof o->src_root); break;
         case 4: pb_get_strn(&c, o->dst_root, sizeof o->dst_root); break;
+        case 5:
+            /* An over-limit rule count means agent/coordinator version skew:
+             * fail loudly rather than silently drop a filter and copy excluded
+             * data. The coordinator caps the count at FILTER_MAX_RULES. */
+            if (!pb_get_len(&c, &sp, &sn) || o->n_filters >= FILTER_MAX_RULES ||
+                !dec_filter_rule(sp, sn, &o->filters[o->n_filters]))
+                return false;
+            o->n_filters++;
+            break;
         case 6:
             if (!pb_get_len(&c, &sp, &sn) || !dec_copy_opts(sp, sn, o))
                 return false;
@@ -461,7 +499,7 @@ static bool dec_job_options(const uint8_t *p, size_t n, struct job_options *o)
             break;
         case 11: o->dry_run = pb_get_varint(&c) != 0; break;
         case 12: o->options_hash = pb_get_varint(&c); break;
-        default: pb_skip(&c, wt); /* filters (5): TODO(slice2) */
+        default: pb_skip(&c, wt);
         }
     }
     return !c.err && o->job_id && o->src_root[0] && o->dst_root[0];

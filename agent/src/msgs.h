@@ -101,11 +101,25 @@ struct hb_ack {
     bool     drain;
 };
 
+/* One resolved include/exclude rule (proto FilterRule). Stored inline so
+ * job_options stays plain-old-data (copied by value into the options table).
+ * The coordinator bounds the pattern to 255 bytes and the rule count to
+ * FILTER_MAX_RULES at submit time, so the buffer below never truncates. */
+#define FILTER_MAX_RULES   64
+#define FILTER_PATTERN_MAX 256
+struct filter_rule {
+    bool exclude; /* false = include */
+    char pattern[FILTER_PATTERN_MAX];
+};
+
 struct job_options {
     uint64_t job_id;
     char     job_name[128];
     char     src_root[PATH_MAX];
     char     dst_root[PATH_MAX];
+    /* filters (evaluated in order, first match wins; default = include) */
+    struct filter_rule filters[FILTER_MAX_RULES];
+    uint32_t n_filters;
     /* copy */
     uint64_t chunk_threshold;
     uint64_t chunk_size;
