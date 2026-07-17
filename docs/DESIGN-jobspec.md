@@ -52,7 +52,7 @@ spec:
 
   copy:
     chunk_threshold: 1GiB            # files >= this are split into chunk tasks
-    chunk_size: 8GiB                 # size of each chunk task
+    chunk_size: 1GiB                 # size of each chunk task (file > this fans out)
     buffer_size: 1MiB                # io_uring buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA; auto-fallback to zero-detect
     server_side_copy: auto           # try copy_file_range (NFSv4.2), fallback read/write

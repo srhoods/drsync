@@ -382,8 +382,18 @@ message ShardSplit {
     bytes dir_rel        = 1;
     repeated bytes names = 2;
   }
+  // A regular file large enough to copy across the fleet rather than on the
+  // one agent that walked it. The coordinator computes the chunk ranges (from
+  // copy.chunk_size), assigns the shared temp name, and fans the ranges out as
+  // ChunkTasks; the discovering agent only names the file. See ChunkTask.
+  message BigFile {
+    bytes  rel_path = 1;
+    uint64 size     = 2;
+    int64  mtime_ns = 3;  // with size, the gen a chunk aborts on if it drifts
+  }
   repeated NewShard subdirs         = 3;
   repeated NewEntryList entry_lists = 4;
+  repeated BigFile big_files        = 5;
 }
 
 message ShardSplitAck {

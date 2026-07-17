@@ -65,6 +65,8 @@ void process_item(struct shard_item *it)
         process_verify(it);
     else if (it->kind == WI_ENTRYLIST)
         process_entrylist(it);
+    else if (it->kind == WI_CHUNK)
+        process_chunk(it);
     else
         process_shard(it);
     shard_item_free(it);

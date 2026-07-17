@@ -83,9 +83,10 @@ decision D9).
 > auto-reconnect-resume (`test/tls_e2e.sh`); entry-list shards for pathological
 > directories (walker `split_entrylist`/`process_entrylist`, WI_ENTRYLIST) and
 > parallel chunked copy for huge files (`copy_ranges_parallel`, honours
-> `server_side_copy`), both verified by `test/scale_e2e.sh`.
-> Not yet: io_uring data path, coordinator-orchestrated cross-fleet ChunkTask
-> fan-out (`chunk_sets` + finalize), dirfix/probe task types, coordinator-side
+> `server_side_copy`), both verified by `test/scale_e2e.sh`; coordinator-
+> orchestrated cross-fleet ChunkTask fan-out for big files (`chunk.c`,
+> WI_CHUNK, `chunk_groups` + finalize), verified by `test/chunk_e2e.sh`.
+> Not yet: io_uring data path, dirfix/probe task types, coordinator-side
 > DIRFIX task generation (split-dir metadata currently converges over passes).
 > Verified end-to-end by `test/e2e.sh` (sync + fidelity + verify + delete).
 

@@ -131,6 +131,21 @@ CREATE TABLE IF NOT EXISTS journal_cursors (
   acked_seq INTEGER NOT NULL,
   PRIMARY KEY (pass_id, agent_id)
 );
+-- One row per large file being copied across the fleet as chunk shards. The
+-- coordinator seeds n_chunks data-chunk shards, counts their completions in
+-- n_done, and seeds the finalize shard (fsync+meta+rename) when they all land.
+-- Keyed by (pass_id, rel_path): a pass has at most one copy of any file.
+CREATE TABLE IF NOT EXISTS chunk_groups (
+  pass_id   INTEGER NOT NULL,
+  rel_path  TEXT NOT NULL,
+  temp_name TEXT NOT NULL,
+  size      INTEGER NOT NULL,
+  mtime_ns  INTEGER NOT NULL,
+  n_chunks  INTEGER NOT NULL,
+  n_done    INTEGER NOT NULL DEFAULT 0,
+  state     TEXT NOT NULL DEFAULT 'copying',  -- copying | done | aborted
+  PRIMARY KEY (pass_id, rel_path)
+) WITHOUT ROWID;
 `
 
 func Open(path string) (*Store, error) {
@@ -319,10 +334,11 @@ func (s *Store) DeleteJob(name string) (int64, error) {
 		   (SELECT id FROM shards WHERE pass_id IN (` + passSel + `))`,
 		`DELETE FROM shards WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM shard_counts WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM chunk_groups WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM passes WHERE job_id = ?`,
 		`DELETE FROM jobs WHERE id = ?`,
 	}
-	args := []any{id, id, id, id, id, id}
+	args := []any{id, id, id, id, id, id, id}
 	for i, q := range stmts {
 		if _, err := tx.Exec(q, args[i]); err != nil {
 			return 0, err
@@ -523,9 +539,22 @@ func insertShardsTx(tx *sql.Tx, passID, parentID int64, shards []NewShard) ([]in
 	return ids, nil
 }
 
+// NewChunkGroup seeds a chunk_groups row alongside a big file's data-chunk
+// shards. Created in the same transaction as those shards so the split stays
+// atomic and idempotent (protocol doc §4.3).
+type NewChunkGroup struct {
+	RelPath  string
+	TempName string
+	Size     uint64
+	MtimeNs  int64
+	NChunks  int
+}
+
 // RecordSplit persists a ShardSplit idempotently: retransmits of the same
-// (parent, seq) return the originally assigned ids (protocol doc §4.3).
-func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard) ([]int64, error) {
+// (parent, seq) return the originally assigned ids (protocol doc §4.3). groups
+// (for big files whose data-chunk shards are among shards) are created in the
+// same transaction; pass nil when there are none.
+func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard, groups []NewChunkGroup) ([]int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -553,12 +582,135 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard) 
 	if err != nil {
 		return nil, err
 	}
+	for _, g := range groups {
+		// INSERT OR IGNORE: a big file already fanned out in an earlier split
+		// (e.g. the parent re-ran) keeps its original group and chunk shards.
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO chunk_groups
+			(pass_id, rel_path, temp_name, size, mtime_ns, n_chunks)
+			VALUES (?,?,?,?,?,?)`,
+			passID, g.RelPath, g.TempName, g.Size, g.MtimeNs, g.NChunks); err != nil {
+			return nil, err
+		}
+	}
 	blob, _ := json.Marshal(ids)
 	if _, err := tx.Exec(`INSERT INTO splits (parent_shard_id, seq, assigned_ids) VALUES (?,?,?)`,
 		parentShardID, seq, string(blob)); err != nil {
 		return nil, err
 	}
 	return ids, tx.Commit()
+}
+
+// ShardJobID resolves the job that owns a shard (via its pass).
+func (s *Store) ShardJobID(shardID int64) (int64, error) {
+	var jobID int64
+	err := s.rdb.QueryRow(`SELECT p.job_id FROM shards s
+		JOIN passes p ON p.id = s.pass_id WHERE s.id = ?`, shardID).Scan(&jobID)
+	return jobID, err
+}
+
+// ShardMeta returns a leased shard's pass, kind and inner payload — enough for
+// the result handler to route a completion without a second round trip. Read
+// before the shard transitions, so a chunk's ChunkTask payload is still there.
+func (s *Store) ShardMeta(shardID int64) (passID int64, kind model.ShardKind, payload []byte, err error) {
+	var k string
+	err = s.rdb.QueryRow(`SELECT pass_id, kind, payload FROM shards WHERE id = ?`,
+		shardID).Scan(&passID, &k, &payload)
+	return passID, model.ShardKind(k), payload, err
+}
+
+// CompleteDataChunk marks a data-chunk shard DONE and bumps its group's n_done.
+// When that was the last chunk it inserts finalizeShard (fsync+meta+rename) in
+// the SAME transaction — so a reader never observes every chunk done with no
+// finalize queued, which would let passctrl advance the phase past a file that
+// is not yet renamed into place. Returns whether the finalize shard was seeded.
+// An aborted group (source drifted under another chunk) seeds nothing.
+func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string, finalizeShard NewShard) (seeded bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	n, err := execCountTx(tx, `UPDATE shards SET state = ?, lease_id = NULL, updated_at = ?
+		WHERE id = ? AND state = ? AND lease_id = ?`,
+		string(model.ShardDone), nowMS(), shardID, string(model.ShardLeased), leaseID)
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, ErrLeaseMismatch // stale/duplicate result; drop it
+	}
+
+	var nChunks, nDone int
+	var state string
+	if err := tx.QueryRow(`UPDATE chunk_groups SET n_done = n_done + 1
+		WHERE pass_id = ? AND rel_path = ? RETURNING n_chunks, n_done, state`,
+		passID, relPath).Scan(&nChunks, &nDone, &state); err != nil {
+		return false, err
+	}
+	if state != "copying" || nDone < nChunks {
+		return false, tx.Commit() // more chunks outstanding, or already aborted
+	}
+	if _, err := insertShardsTx(tx, passID, 0, []NewShard{finalizeShard}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// CompleteFinalizeChunk marks the finalize shard DONE and closes its group.
+func (s *Store) CompleteFinalizeChunk(shardID, leaseID, passID int64, relPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	n, err := execCountTx(tx, `UPDATE shards SET state = ?, lease_id = NULL, updated_at = ?
+		WHERE id = ? AND state = ? AND lease_id = ?`,
+		string(model.ShardDone), nowMS(), shardID, string(model.ShardLeased), leaseID)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLeaseMismatch
+	}
+	if _, err := tx.Exec(`UPDATE chunk_groups SET state = 'done'
+		WHERE pass_id = ? AND rel_path = ?`, passID, relPath); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// AbortChunkGroup marks a group aborted after a chunk reported the source drift
+// (RESULT_SRC_CHANGED). No finalize is seeded; the half-written temp is left
+// for the next walk to reclaim as .drsync.tmp residue, and the file is
+// re-diffed next pass. The triggering chunk shard is marked DONE (not retried:
+// re-copying this pass would race the same moving source).
+func (s *Store) AbortChunkGroup(shardID, leaseID, passID int64, relPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	n, err := execCountTx(tx, `UPDATE shards SET state = ?, lease_id = NULL, updated_at = ?
+		WHERE id = ? AND state = ? AND lease_id = ?`,
+		string(model.ShardDone), nowMS(), shardID, string(model.ShardLeased), leaseID)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLeaseMismatch
+	}
+	if _, err := tx.Exec(`UPDATE chunk_groups SET state = 'aborted'
+		WHERE pass_id = ? AND rel_path = ?`, passID, relPath); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // LeaseShards grants up to max queued shards to an agent, highest priority
@@ -707,6 +859,14 @@ func (s *Store) ExpireLeases(now time.Time) (int64, int64, error) {
 
 func (s *Store) execCount(q string, args ...any) (int64, error) {
 	res, err := s.db.Exec(q, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func execCountTx(tx *sql.Tx, q string, args ...any) (int64, error) {
+	res, err := tx.Exec(q, args...)
 	if err != nil {
 		return 0, err
 	}

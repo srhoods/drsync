@@ -69,12 +69,13 @@ int open_beneath(int root_fd, const char *rel, uint64_t flags)
     return cur;
 }
 
-/* Open dst dir for rel, creating missing components (mode fixed when the dir
- * itself is walked). */
-static int open_dst_dir(const struct walk_ctx *ctx, const char *rel)
+/* Open dir rel beneath dst_fd, creating missing components (mode 0700, fixed
+ * when the dir itself is walked). Shared by the walker and the chunk executor,
+ * which lands a big file's temp in a directory another agent may have created. */
+int dst_dir_open(int dst_fd, const char *rel)
 {
-    int fd = open_beneath(ctx->oe->dst_fd, rel, O_RDONLY | O_DIRECTORY);
-    if (fd >= 0 || errno != ENOENT || ctx->oe->o.dry_run)
+    int fd = open_beneath(dst_fd, rel, O_RDONLY | O_DIRECTORY);
+    if (fd >= 0 || errno != ENOENT)
         return fd;
     char tmp[PATH_MAX];
     if (strlen(rel) >= sizeof tmp) {
@@ -82,7 +83,7 @@ static int open_dst_dir(const struct walk_ctx *ctx, const char *rel)
         return -1;
     }
     strcpy(tmp, rel);
-    int cur = dup(ctx->oe->dst_fd);
+    int cur = dup(dst_fd);
     char *save = NULL;
     for (char *comp = strtok_r(tmp, "/", &save); comp;
          comp = strtok_r(NULL, "/", &save)) {
@@ -100,6 +101,14 @@ static int open_dst_dir(const struct walk_ctx *ctx, const char *rel)
         cur = next;
     }
     return cur;
+}
+
+/* Open dst dir for rel; in a real run, create missing components. */
+static int open_dst_dir(const struct walk_ctx *ctx, const char *rel)
+{
+    if (ctx->oe->o.dry_run)
+        return open_beneath(ctx->oe->dst_fd, rel, O_RDONLY | O_DIRECTORY);
+    return dst_dir_open(ctx->oe->dst_fd, rel);
 }
 
 /* ---- directory entry collection ---- */
@@ -466,6 +475,62 @@ static void queue_split(struct walk_ctx *ctx, const char *rel)
         flush_splits(ctx);
 }
 
+/* ---- big-file queue (cross-host chunk fan-out) ---- */
+/* Big files per ShardSplit.big_files frame. Small: a batch of big files is
+ * already a lot of bytes to move, and the coordinator fans each out further. */
+#define BIGFILE_BATCH 256
+
+static void flush_bigfiles(struct walk_ctx *ctx)
+{
+    if (!ctx->n_bigfiles)
+        return;
+    pb_buf b;
+    pb_init(&b);
+    enc_bigfile_split(&b, ctx->it->shard_id, ctx->split_seq,
+                      ctx->bigfiles, ctx->n_bigfiles);
+    ship_split(ctx, &b);
+    for (size_t i = 0; i < ctx->n_bigfiles; i++)
+        free(ctx->bigfiles[i].rel);
+    ctx->n_bigfiles = 0;
+}
+
+/* Records a big regular file for the coordinator to chunk across the fleet,
+ * instead of copying it on this one agent (cp_submit). */
+static void queue_bigfile(struct walk_ctx *ctx, const char *dir_rel,
+                          const char *name, const struct estat *ss)
+{
+    if (ctx->n_bigfiles == ctx->cap_bigfiles) {
+        size_t cap = ctx->cap_bigfiles ? ctx->cap_bigfiles * 2 : 64;
+        struct bigfile *nv = realloc(ctx->bigfiles, cap * sizeof *nv);
+        if (!nv) {
+            CTR_ADD(ctx->c.errors, 1);
+            return;
+        }
+        ctx->bigfiles = nv;
+        ctx->cap_bigfiles = cap;
+    }
+    char *rel;
+    if (asprintf(&rel, "%s%s%s", dir_rel, dir_rel[0] ? "/" : "", name) < 0) {
+        CTR_ADD(ctx->c.errors, 1);
+        return;
+    }
+    ctx->bigfiles[ctx->n_bigfiles].rel = rel;
+    ctx->bigfiles[ctx->n_bigfiles].size = ss->size;
+    ctx->bigfiles[ctx->n_bigfiles].mtime_ns =
+        (int64_t)ss->mtim.tv_sec * 1000000000 + ss->mtim.tv_nsec;
+    ctx->n_bigfiles++;
+    if (ctx->n_bigfiles >= BIGFILE_BATCH)
+        flush_bigfiles(ctx);
+}
+
+/* A regular file big enough to copy across the fleet rather than on this agent:
+ * at/above chunk_threshold AND larger than one chunk, so it yields ≥2 ranges. */
+static bool should_chunk(const struct job_options *o, uint64_t size)
+{
+    return o->chunk_threshold && size >= o->chunk_threshold &&
+           o->chunk_size && size > o->chunk_size;
+}
+
 /* ---- the walk ---- */
 static void walk_dir(struct walk_ctx *ctx, const char *rel);
 
@@ -585,6 +650,13 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
         }
         if (ds && !type_match)
             remove_dst(ctx, dfd, name, S_ISDIR(ds->mode));
+        if (should_chunk(o, ss->size)) {
+            /* Hand a big file to the coordinator to copy across the fleet
+             * instead of on this agent alone (design §2.3). The dst dir exists
+             * (opened/created above); chunk tasks land the temp there. */
+            queue_bigfile(ctx, rel, name, ss);
+            break;
+        }
         cp_submit(ctx, dp, sfd, dfd, rel, name, ss); /* async: copy pool */
         break;
     }
@@ -800,6 +872,7 @@ void process_shard(const struct shard_item *it)
         ctx.budget = shard_budget(&ctx);
         walk_dir(&ctx, it->rel_path);
         flush_splits(&ctx);
+        flush_bigfiles(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
         jrn_flush(&ctx);
         if (!jrn_wait_acked(&ctx)) { /* same ordering invariant for journals */
@@ -821,6 +894,7 @@ void process_shard(const struct shard_item *it)
     out_push(FR_SHARD_RESULT, &b);
     lease_remove(it->lease_id);
     free(ctx.split);
+    free(ctx.bigfiles);
     jrn_destroy(&ctx);
 }
 
@@ -919,6 +993,7 @@ void process_entrylist(const struct shard_item *it)
         ctx.budget = shard_budget(&ctx);
         entrylist_walk(&ctx, it->rel_path ? it->rel_path : "", it->paths, it->n_paths);
         flush_splits(&ctx);
+        flush_bigfiles(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
         jrn_flush(&ctx);
         if (!jrn_wait_acked(&ctx)) {
@@ -940,5 +1015,6 @@ void process_entrylist(const struct shard_item *it)
     out_push(FR_SHARD_RESULT, &b);
     lease_remove(it->lease_id);
     free(ctx.split);
+    free(ctx.bigfiles);
     jrn_destroy(&ctx);
 }

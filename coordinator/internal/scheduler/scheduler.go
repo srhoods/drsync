@@ -284,6 +284,16 @@ func (s *Scheduler) jobPolicy(jobID int64) (*jobPolicy, error) {
 	return p, nil
 }
 
+// JobOptions returns a job's resolved agent options (cached). The split
+// handler uses copy.chunk_size / temp_prefix to lay out a big file's chunks.
+func (s *Scheduler) JobOptions(jobID int64) (*drsyncpb.JobOptions, error) {
+	pol, err := s.jobPolicy(jobID)
+	if err != nil {
+		return nil, err
+	}
+	return pol.opts, nil
+}
+
 // InvalidateOptions drops a job's cached spec (job update flow).
 func (s *Scheduler) InvalidateOptions(jobID int64) {
 	s.mu.Lock()

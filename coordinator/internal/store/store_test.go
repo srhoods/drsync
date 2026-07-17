@@ -126,7 +126,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	assertCountsConsistent(t, s, "after lease (1 LEASED)")
 	if _, err := s.RecordSplit(shardID, 1, []NewShard{
 		{Kind: model.KindDir, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	assertCountsConsistent(t, s, "after split")
@@ -358,11 +358,11 @@ func TestSplitIdempotency(t *testing.T) {
 		{Kind: model.KindDir, RelPath: "a"},
 		{Kind: model.KindDir, RelPath: "b"},
 	}
-	ids1, err := s.RecordSplit(shardID, 7, subs)
+	ids1, err := s.RecordSplit(shardID, 7, subs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ids2, err := s.RecordSplit(shardID, 7, subs) // retransmit
+	ids2, err := s.RecordSplit(shardID, 7, subs, nil) // retransmit
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -107,8 +107,9 @@ shards  (id, pass_id, parent_shard_id, kind,        -- kind: dir | entrylist | c
          INDEX (pass_id, state)                     -- the scheduler's working set
 agents  (id, hostname, state, version, caps BLOB, last_heartbeat,
          cert_cn, registered_at)
-chunk_sets (file_key, pass_id, total_chunks, done_chunks, file_gen, state)
-            -- large-file assembly tracking; finalize task emitted at done==total
+chunk_groups (pass_id, rel_path, temp_name, size, mtime_ns,
+              n_chunks, n_done, state)               -- large-file cross-fleet assembly;
+              -- finalize task seeded (same tx as the last data chunk) at n_done==n_chunks
 journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control/dedup
 ```
 
@@ -183,6 +184,28 @@ scale and phases with a large task backlog (verify) are untouched. The cap is
 never below 1 and never applies to a single-agent fleet: work must not sit
 QUEUED because nobody is permitted to take it — the same "never strand"
 property the anti-affinity tier-2 fallback protects above.
+
+### 4.3 Cross-fleet chunk fan-out
+
+A file too large for one host is not copied by the agent that walks it. The
+agent proposes it (`ShardSplit.big_files`: rel_path + size + mtime); the
+coordinator lays it out from `copy.chunk_size` into N data-chunk shards plus a
+`chunk_groups` row, all in the split's transaction so the fan-out is idempotent
+on retransmit. Every chunk carries the file's (size, mtime) gen and the shared,
+coordinator-named temp; chunk 0 alone creates and preallocates it.
+
+Assembly is counted, not coordinated between agents: each data chunk's OK bumps
+`n_done`, and the completion that reaches `n_done == n_chunks` seeds the finalize
+shard **in the same transaction**. That atomicity is load-bearing — a reader
+must never see every chunk done with no finalize queued, or `advance` (§4, which
+gates on `queued+leased == 0`) would step the pass past a file not yet renamed
+into place. The finalize task re-checks the gen, fsyncs, applies metadata, and
+renames the temp to the final name — the commit point. A chunk that finds the
+source drifted returns `RESULT_SRC_CHANGED`; the group is marked aborted, no
+finalize is seeded, the half-written temp is reclaimed as `.drsync.tmp` residue
+on the next walk, and the file is re-diffed next pass. Only the finalize accounts
+the file (files_copied +1, bytes +size), so a pass that copied solely via chunks
+still shows a nonzero delta and does not falsely converge.
 
 ## 5. Journals
 

@@ -135,6 +135,7 @@ enum {
     WI_DELETE = 1,    /* DeleteBatch: remove destination orphans */
     WI_VERIFY = 2,    /* VerifyBatch: metadata + sampled checksum re-check */
     WI_ENTRYLIST = 3, /* EntryListShard: a name slice of a pathological dir */
+    WI_CHUNK = 4,     /* ChunkTask: one byte range of a big file, or its finalize */
 };
 
 /* Per-shard walk overrides (proto WalkOverrides). The coordinator sends these
@@ -146,6 +147,19 @@ struct walk_overrides {
     uint64_t budget;
     bool     have_split_threshold;
     uint64_t split_threshold;
+};
+
+/* WI_CHUNK: one byte range of a big file (proto ChunkTask), or (finalize) the
+ * terminal task that fsyncs, applies metadata and renames the assembled temp
+ * into place. rel_path holds the file; temp_name is the coordinator-assigned
+ * shared temp all of the file's chunks write. */
+struct chunk_info {
+    uint64_t offset, length;
+    uint64_t gen_size;      /* abort if the source no longer matches this... */
+    int64_t  gen_mtime_ns;  /* ...size/mtime pair (RESULT_SRC_CHANGED) */
+    bool     create_temp;   /* this chunk creates + preallocates the temp */
+    bool     finalize;      /* fsync + metadata + rename; no byte range */
+    char    *temp_name;     /* malloc'd; owner frees */
 };
 
 struct shard_item {
@@ -160,6 +174,7 @@ struct shard_item {
     unsigned char *vchecksum; /* WI_VERIFY: per-path checksum flag */
     size_t   n_paths;
     struct walk_overrides ov; /* WI_SHARD/WI_ENTRYLIST */
+    struct chunk_info chunk;  /* WI_CHUNK */
 };
 void shard_item_free(struct shard_item *it);
 
@@ -224,6 +239,15 @@ void enc_shard_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
  * (the source-side slice of a directory over dir_split_threshold). */
 void enc_entrylist_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                          const char *dir_rel, char *const *names, size_t n_names);
+/* ShardSplit carrying big files: rel_path + size + mtime_ns each. The
+ * coordinator lays them out into ChunkTasks (proto ShardSplit.BigFile). */
+struct bigfile {
+    char    *rel;
+    uint64_t size;
+    int64_t  mtime_ns;
+};
+void enc_bigfile_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                       const struct bigfile *files, size_t n_files);
 void enc_shard_result(pb_buf *b, uint64_t shard_id, uint64_t lease_id, int status,
                       const struct shard_counters *c, const char *error);
 void enc_stats(pb_buf *b, const struct stats_snapshot *s);

@@ -323,7 +323,18 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 		shards = append(shards, store.NewShard{
 			Kind: model.KindEntryList, RelPath: string(el.DirRel), Payload: payload})
 	}
-	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards)
+
+	var groups []store.NewChunkGroup
+	if len(sp.BigFiles) > 0 {
+		chunkShards, g, err := s.planBigFiles(int64(sp.ParentShardId), sp.BigFiles)
+		if err != nil {
+			return err
+		}
+		shards = append(shards, chunkShards...)
+		groups = g
+	}
+
+	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups)
 	if err != nil {
 		return err
 	}
@@ -334,18 +345,109 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 	return ac.send(drsyncpb.FrameType_FRAME_SHARD_SPLIT_ACK, ack)
 }
 
+// planBigFiles turns discovered big files into their data-chunk shards plus a
+// group per file. Ranges come from the job's copy.chunk_size; the coordinator
+// owns the temp name so every chunk (granted to different hosts) writes the
+// same destination temp, and chunk 0 alone creates+preallocates it.
+func (s *Server) planBigFiles(parentShardID int64, bigs []*drsyncpb.ShardSplit_BigFile) ([]store.NewShard, []store.NewChunkGroup, error) {
+	jobID, err := s.st.ShardJobID(parentShardID)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts, err := s.sched.JobOptions(jobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	chunkSize := opts.GetCopy().GetChunkSize()
+	if chunkSize == 0 {
+		return nil, nil, fmt.Errorf("job %d has chunk_size 0", jobID)
+	}
+	prefix := opts.GetCopy().GetTempPrefix()
+	if prefix == "" {
+		prefix = ".drsync.tmp."
+	}
+
+	var shards []store.NewShard
+	var groups []store.NewChunkGroup
+	for i, bf := range bigs {
+		rel := string(bf.RelPath)
+		nChunks := int((bf.Size + chunkSize - 1) / chunkSize)
+		if nChunks < 1 {
+			nChunks = 1
+		}
+		// Temp name is stable across chunk retries and unique per file within
+		// the pass: base it on the parent shard and the file's index. The
+		// temp_prefix keeps it reclaimable as crash residue on the next walk.
+		temp := fmt.Sprintf("%s%x.%x", prefix, parentShardID, i)
+		gen := &drsyncpb.FileGen{Size: bf.Size, MtimeNs: bf.MtimeNs}
+		for c := 0; c < nChunks; c++ {
+			off := uint64(c) * chunkSize
+			length := chunkSize
+			if off+length > bf.Size {
+				length = bf.Size - off
+			}
+			payload, err := proto.Marshal(&drsyncpb.ChunkTask{
+				RelPath: rel, Offset: off, Length: length, Gen: gen,
+				CreateTemp: c == 0, TempName: temp})
+			if err != nil {
+				return nil, nil, err
+			}
+			shards = append(shards, store.NewShard{
+				Kind: model.KindChunk, RelPath: rel, Payload: payload})
+		}
+		groups = append(groups, store.NewChunkGroup{
+			RelPath: rel, TempName: temp, Size: bf.Size, MtimeNs: bf.MtimeNs, NChunks: nChunks})
+	}
+	return shards, groups, nil
+}
+
+// finalizeShard builds the terminal chunk task for a group: no byte range, just
+// fsync + metadata + rename of the assembled temp into place. It carries the
+// same gen as the data chunks so the finalize aborts (rather than renaming a
+// stale temp) if the source drifted while the file was being assembled.
+func finalizeShard(rel, temp string, gen *drsyncpb.FileGen) store.NewShard {
+	payload, _ := proto.Marshal(&drsyncpb.ChunkTask{
+		RelPath: rel, TempName: temp, Finalize: true, Gen: gen})
+	return store.NewShard{Kind: model.KindChunk, RelPath: rel, Payload: payload}
+}
+
 func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 	shardID, leaseID := int64(r.ShardId), int64(r.LeaseId)
 	var err error
 	switch r.Status {
 	case drsyncpb.ResultStatus_RESULT_OK:
-		var blob []byte
-		blob, _ = proto.Marshal(r)
-		if err = s.st.CompleteShard(shardID, leaseID, blob); err == nil {
-			var passID int64
-			if passID, err = s.passOfShard(shardID); err == nil {
+		// One read tells us pass, kind and (for chunks) the ChunkTask, so the
+		// chunk group can be maintained in the same completion without a second
+		// round trip. It replaces the passOfShard lookup the OK path already did.
+		passID, kind, payload, e := s.st.ShardMeta(shardID)
+		if e != nil {
+			err = e
+			break
+		}
+		if kind == model.KindChunk {
+			err = s.completeChunk(passID, shardID, leaseID, payload, r)
+		} else {
+			blob, _ := proto.Marshal(r)
+			if err = s.st.CompleteShard(shardID, leaseID, blob); err == nil {
 				err = s.st.AccumulatePassCounters(passID, r.Counters)
 			}
+		}
+	case drsyncpb.ResultStatus_RESULT_SRC_CHANGED:
+		// A chunk saw the source drift under it: abort the whole file's group.
+		// The half-written temp is reclaimed as .drsync.tmp residue next walk,
+		// and the file is re-diffed next pass. Only chunks emit this status.
+		passID, kind, payload, e := s.st.ShardMeta(shardID)
+		if e != nil {
+			err = e
+			break
+		}
+		if kind == model.KindChunk {
+			var ct drsyncpb.ChunkTask
+			if err = proto.Unmarshal(payload, &ct); err == nil {
+				err = s.st.AbortChunkGroup(shardID, leaseID, passID, ct.RelPath)
+			}
+		} else {
+			err = s.st.RequeueShard(shardID, leaseID, r.Error)
 		}
 	case drsyncpb.ResultStatus_RESULT_TRANSIENT, drsyncpb.ResultStatus_RESULT_MOUNT_SICK:
 		err = s.st.RequeueShard(shardID, leaseID, r.Error)
@@ -360,6 +462,27 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 		return nil
 	}
 	return err
+}
+
+// completeChunk finishes a chunk shard and maintains its group. A data chunk's
+// completion may seed the finalize shard (done atomically in the store); the
+// finalize chunk's completion closes the group. Pass counters are accumulated
+// only after a successful, non-duplicate transition, so a re-delivered result
+// (ErrLeaseMismatch) neither double-counts nor re-seeds.
+func (s *Server) completeChunk(passID, shardID, leaseID int64, payload []byte, r *drsyncpb.ShardResult) error {
+	var ct drsyncpb.ChunkTask
+	if err := proto.Unmarshal(payload, &ct); err != nil {
+		return err
+	}
+	if ct.Finalize {
+		if err := s.st.CompleteFinalizeChunk(shardID, leaseID, passID, ct.RelPath); err != nil {
+			return err
+		}
+	} else if _, err := s.st.CompleteDataChunk(shardID, leaseID, passID, ct.RelPath,
+		finalizeShard(ct.RelPath, ct.TempName, ct.Gen)); err != nil {
+		return err
+	}
+	return s.st.AccumulatePassCounters(passID, r.Counters)
 }
 
 func (s *Server) onTaskResults(ac *agentConn, batch *drsyncpb.TaskResultBatch) error {
@@ -388,9 +511,4 @@ func (s *Server) onStats(ac *agentConn, st *drsyncpb.StatsReport) {
 	s.met.CopyFiles.WithLabelValues(ac.id).Set(float64(st.FilesCopied))
 	s.met.CopyBytes.WithLabelValues(ac.id).Set(float64(st.BytesCopied))
 	s.met.AgentRSS.WithLabelValues(ac.id).Set(float64(st.RssBytes))
-}
-
-func (s *Server) passOfShard(shardID int64) (int64, error) {
-	// Small helper via store; acceptable per-result cost at shard granularity.
-	return s.st.PassOfShard(shardID)
 }

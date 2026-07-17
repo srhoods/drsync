@@ -3056,6 +3056,7 @@ type ShardSplit struct {
 	Seq           uint64                     `protobuf:"varint,2,opt,name=seq,proto3" json:"seq,omitempty"` // per-parent sequence for retransmit dedup
 	Subdirs       []*ShardSplit_NewShard     `protobuf:"bytes,3,rep,name=subdirs,proto3" json:"subdirs,omitempty"`
 	EntryLists    []*ShardSplit_NewEntryList `protobuf:"bytes,4,rep,name=entry_lists,json=entryLists,proto3" json:"entry_lists,omitempty"`
+	BigFiles      []*ShardSplit_BigFile      `protobuf:"bytes,5,rep,name=big_files,json=bigFiles,proto3" json:"big_files,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3114,6 +3115,13 @@ func (x *ShardSplit) GetSubdirs() []*ShardSplit_NewShard {
 func (x *ShardSplit) GetEntryLists() []*ShardSplit_NewEntryList {
 	if x != nil {
 		return x.EntryLists
+	}
+	return nil
+}
+
+func (x *ShardSplit) GetBigFiles() []*ShardSplit_BigFile {
+	if x != nil {
+		return x.BigFiles
 	}
 	return nil
 }
@@ -4141,6 +4149,70 @@ func (x *ShardSplit_NewEntryList) GetNames() [][]byte {
 	return nil
 }
 
+// A regular file large enough to copy across the fleet rather than on the
+// one agent that walked it. The coordinator computes the chunk ranges (from
+// copy.chunk_size), assigns the shared temp name, and fans the ranges out as
+// ChunkTasks; the discovering agent only names the file. See ChunkTask.
+type ShardSplit_BigFile struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RelPath       []byte                 `protobuf:"bytes,1,opt,name=rel_path,json=relPath,proto3" json:"rel_path,omitempty"`
+	Size          uint64                 `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
+	MtimeNs       int64                  `protobuf:"varint,3,opt,name=mtime_ns,json=mtimeNs,proto3" json:"mtime_ns,omitempty"` // with size, the gen a chunk aborts on if it drifts
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShardSplit_BigFile) Reset() {
+	*x = ShardSplit_BigFile{}
+	mi := &file_drsync_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShardSplit_BigFile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShardSplit_BigFile) ProtoMessage() {}
+
+func (x *ShardSplit_BigFile) ProtoReflect() protoreflect.Message {
+	mi := &file_drsync_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShardSplit_BigFile.ProtoReflect.Descriptor instead.
+func (*ShardSplit_BigFile) Descriptor() ([]byte, []int) {
+	return file_drsync_proto_rawDescGZIP(), []int{31, 2}
+}
+
+func (x *ShardSplit_BigFile) GetRelPath() []byte {
+	if x != nil {
+		return x.RelPath
+	}
+	return nil
+}
+
+func (x *ShardSplit_BigFile) GetSize() uint64 {
+	if x != nil {
+		return x.Size
+	}
+	return 0
+}
+
+func (x *ShardSplit_BigFile) GetMtimeNs() int64 {
+	if x != nil {
+		return x.MtimeNs
+	}
+	return 0
+}
+
 var File_drsync_proto protoreflect.FileDescriptor
 
 const file_drsync_proto_rawDesc = "" +
@@ -4392,19 +4464,24 @@ const file_drsync_proto_rawDesc = "" +
 	"\x04item\"g\n" +
 	"\tWorkGrant\x12)\n" +
 	"\x05items\x18\x01 \x03(\v2\x13.drsync.v1.WorkItemR\x05items\x12/\n" +
-	"\aoptions\x18\x02 \x03(\v2\x15.drsync.v1.JobOptionsR\aoptions\"\xab\x02\n" +
+	"\aoptions\x18\x02 \x03(\v2\x15.drsync.v1.JobOptionsR\aoptions\"\xbc\x03\n" +
 	"\n" +
 	"ShardSplit\x12&\n" +
 	"\x0fparent_shard_id\x18\x01 \x01(\x04R\rparentShardId\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x128\n" +
 	"\asubdirs\x18\x03 \x03(\v2\x1e.drsync.v1.ShardSplit.NewShardR\asubdirs\x12C\n" +
 	"\ventry_lists\x18\x04 \x03(\v2\".drsync.v1.ShardSplit.NewEntryListR\n" +
-	"entryLists\x1a%\n" +
+	"entryLists\x12:\n" +
+	"\tbig_files\x18\x05 \x03(\v2\x1d.drsync.v1.ShardSplit.BigFileR\bbigFiles\x1a%\n" +
 	"\bNewShard\x12\x19\n" +
 	"\brel_path\x18\x01 \x01(\fR\arelPath\x1a=\n" +
 	"\fNewEntryList\x12\x17\n" +
 	"\adir_rel\x18\x01 \x01(\fR\x06dirRel\x12\x14\n" +
-	"\x05names\x18\x02 \x03(\fR\x05names\"w\n" +
+	"\x05names\x18\x02 \x03(\fR\x05names\x1aS\n" +
+	"\aBigFile\x12\x19\n" +
+	"\brel_path\x18\x01 \x01(\fR\arelPath\x12\x12\n" +
+	"\x04size\x18\x02 \x01(\x04R\x04size\x12\x19\n" +
+	"\bmtime_ns\x18\x03 \x01(\x03R\amtimeNs\"w\n" +
 	"\rShardSplitAck\x12&\n" +
 	"\x0fparent_shard_id\x18\x01 \x01(\x04R\rparentShardId\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12,\n" +
@@ -4554,7 +4631,7 @@ func file_drsync_proto_rawDescGZIP() []byte {
 }
 
 var file_drsync_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_drsync_proto_msgTypes = make([]protoimpl.MessageInfo, 45)
+var file_drsync_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_drsync_proto_goTypes = []any{
 	(FrameType)(0),                    // 0: drsync.v1.FrameType
 	(EntryType)(0),                    // 1: drsync.v1.EntryType
@@ -4610,6 +4687,7 @@ var file_drsync_proto_goTypes = []any{
 	(*WorkRequest_CachedOptions)(nil), // 51: drsync.v1.WorkRequest.CachedOptions
 	(*ShardSplit_NewShard)(nil),       // 52: drsync.v1.ShardSplit.NewShard
 	(*ShardSplit_NewEntryList)(nil),   // 53: drsync.v1.ShardSplit.NewEntryList
+	(*ShardSplit_BigFile)(nil),        // 54: drsync.v1.ShardSplit.BigFile
 }
 var file_drsync_proto_depIdxs = []int32{
 	1,  // 0: drsync.v1.StatInfo.type:type_name -> drsync.v1.EntryType
@@ -4643,21 +4721,22 @@ var file_drsync_proto_depIdxs = []int32{
 	25, // 28: drsync.v1.WorkGrant.options:type_name -> drsync.v1.JobOptions
 	52, // 29: drsync.v1.ShardSplit.subdirs:type_name -> drsync.v1.ShardSplit.NewShard
 	53, // 30: drsync.v1.ShardSplit.entry_lists:type_name -> drsync.v1.ShardSplit.NewEntryList
-	2,  // 31: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
-	42, // 32: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
-	2,  // 33: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
-	10, // 34: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
-	10, // 35: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
-	44, // 36: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
-	8,  // 37: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
-	9,  // 38: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
-	9,  // 39: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
-	49, // 40: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
-	41, // [41:41] is the sub-list for method output_type
-	41, // [41:41] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	54, // 31: drsync.v1.ShardSplit.big_files:type_name -> drsync.v1.ShardSplit.BigFile
+	2,  // 32: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
+	42, // 33: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
+	2,  // 34: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
+	10, // 35: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
+	10, // 36: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
+	44, // 37: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
+	8,  // 38: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
+	9,  // 39: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
+	9,  // 40: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
+	49, // 41: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
+	42, // [42:42] is the sub-list for method output_type
+	42, // [42:42] is the sub-list for method input_type
+	42, // [42:42] is the sub-list for extension type_name
+	42, // [42:42] is the sub-list for extension extendee
+	0,  // [0:42] is the sub-list for field type_name
 }
 
 func init() { file_drsync_proto_init() }
@@ -4681,7 +4760,7 @@ func file_drsync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_drsync_proto_rawDesc), len(file_drsync_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   45,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

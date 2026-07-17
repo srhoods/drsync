@@ -164,7 +164,10 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Copy.ChunkThreshold = 1 << 30 // 1 GiB
 	}
 	if sp.Copy.ChunkSize == 0 {
-		sp.Copy.ChunkSize = 8 << 30
+		// One chunk per GiB by default. With chunk_threshold at 1 GiB, a file
+		// only fans out once it exceeds a single chunk (> chunk_size), so an
+		// 8 GiB default would have kept every file up to 8 GiB on one agent.
+		sp.Copy.ChunkSize = 1 << 30
 	}
 	if sp.Copy.BufferSize == 0 {
 		sp.Copy.BufferSize = 1 << 20

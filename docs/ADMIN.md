@@ -103,7 +103,7 @@ spec:
 
   copy:
     chunk_threshold: 1GiB         # files ≥ this are copied in parallel ranges (huge files)
-    chunk_size: 8GiB              # chunk granularity hint
+    chunk_size: 1GiB              # range per chunk task; a file > this fans out across agents
     buffer_size: 1MiB
     preserve_sparse: true         # SEEK_HOLE/SEEK_DATA extent copy
     server_side_copy: auto        # auto | off | require  (copy_file_range / NFSv4.2 SSC / reflink)
@@ -289,11 +289,16 @@ extreme.
   ```
 
 - **Very large files.** A file at/above `copy.chunk_threshold` (default 1 GiB)
-  is copied in **parallel byte ranges** into one temp, then finalized —
-  so a single 500 GB file is not bottlenecked on one thread. On same-mount pairs
-  `server_side_copy: auto` offloads to the filesystem (NFSv4.2 SSC / reflink,
-  which moves no bytes through the agent); set it `off` to force the parallel
-  byte-copy path, or `require` to fail if server-side copy is unavailable.
+  and larger than one `copy.chunk_size` (default 1 GiB) is **copied across the
+  fleet**: the agent that walks it hands the file to the coordinator, which fans
+  its byte ranges out as chunk tasks to different hosts, all writing one shared
+  temp that a final task fsyncs, stamps with metadata, and renames into place —
+  so a single 500 GB file is not bottlenecked on one host. A qualifying file
+  smaller than two chunks (or when only one agent is connected) is still copied
+  locally in parallel ranges. On same-mount pairs `server_side_copy: auto`
+  offloads each range to the filesystem (NFSv4.2 SSC / reflink, which moves no
+  bytes through the agent); set it `off` to force the byte-copy path, or
+  `require` to fail if server-side copy is unavailable.
 
   ```bash
   # cross-mount migration of large media, force parallel chunked copy

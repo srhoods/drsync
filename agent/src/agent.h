@@ -157,6 +157,10 @@ struct walk_ctx {
     int64_t                  budget;
     char                   **split;
     size_t                   n_split, cap_split;
+    /* Big files found this shard, shipped as ShardSplit.big_files for the
+     * coordinator to fan out into chunk tasks across the fleet. */
+    struct bigfile          *bigfiles;
+    size_t                   n_bigfiles, cap_bigfiles;
     uint64_t                 split_seq;
     /* In-flight split acks: shipped, awaiting the coordinator's ack. Drained
      * (all awaited) before the shard result — the ordering invariant (§4.2) —
@@ -235,6 +239,16 @@ void cp_submit(struct walk_ctx *ctx, struct dpend *dp, int sfd, int dfd,
  * rel is the job-root-relative path of the file (journal identity). */
 void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
                     const char *rel, const struct estat *ss);
+/* Applies owner/mode/times to an open fd (chown before chmod, times last).
+ * xattrs/ACLs are the caller's job first (they need the src fd). */
+void apply_meta(struct walk_ctx *ctx, int fd, const struct estat *ss,
+                const char *path);
+
+/* ---- chunk executor (chunk.c) ----
+ * Processes one ChunkTask: a byte range of a big file copied into the shared
+ * temp, or the finalize task that fsyncs, applies metadata and renames it in.
+ * Cross-host: ranges of one file are granted to different agents. */
+void process_chunk(const struct shard_item *it);
 
 /* ---- walker (walker.c) ---- */
 /* Processes one shard end-to-end and enqueues its ShardResult. */
@@ -248,6 +262,9 @@ void process_entrylist(const struct shard_item *it);
 int open_beneath(int root_fd, const char *rel, uint64_t flags);
 /* opens rel's parent directory beneath root; *leaf points into rel (delete.c) */
 int open_parent_beneath(int root_fd, const char *rel, const char **leaf);
+/* opens dir rel beneath dst_fd, creating missing components (mode 0700, fixed
+ * when the dir itself is walked). Returns an fd or -1 (walker.c). */
+int dst_dir_open(int dst_fd, const char *rel);
 /* struct stat → estat (uring.c) */
 void estat_of(struct estat *e, const struct stat *st);
 

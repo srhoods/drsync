@@ -289,8 +289,8 @@ static int64_t ts_diff_ns(const struct timespec *a, const struct timespec *b)
     return d < 0 ? -d : d;
 }
 
-static void apply_meta(struct walk_ctx *ctx, int fd, const struct estat *ss,
-                       const char *path)
+void apply_meta(struct walk_ctx *ctx, int fd, const struct estat *ss,
+                const char *path)
 {
     const struct job_options *o = &ctx->oe->o;
     /* xattrs/ACLs are applied by the caller first (needs the src fd);

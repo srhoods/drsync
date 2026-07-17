@@ -86,6 +86,23 @@ void enc_entrylist_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
     pb_free(&el);
 }
 
+void enc_bigfile_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                       const struct bigfile *files, size_t n_files)
+{
+    pb_put_u64(b, 1, parent_shard_id);
+    pb_put_u64(b, 2, seq);
+    for (size_t i = 0; i < n_files; i++) {
+        /* one ShardSplit.BigFile (field 5): rel_path(1), size(2), mtime_ns(3) */
+        pb_buf bf;
+        pb_init(&bf);
+        pb_put_bytes(&bf, 1, files[i].rel, strlen(files[i].rel));
+        pb_put_u64(&bf, 2, files[i].size);
+        pb_put_i64(&bf, 3, files[i].mtime_ns);
+        pb_put_msg(b, 5, &bf);
+        pb_free(&bf);
+    }
+}
+
 static void enc_counters(pb_buf *b, uint32_t field, const struct shard_counters *c)
 {
     pb_buf sub;
@@ -457,9 +474,11 @@ void shard_item_free(struct shard_item *it)
         free(it->paths[i]);
     free(it->paths);
     free(it->vchecksum);
+    free(it->chunk.temp_name);
     it->rel_path = NULL;
     it->paths = NULL;
     it->vchecksum = NULL;
+    it->chunk.temp_name = NULL;
     it->n_paths = 0;
 }
 
@@ -630,6 +649,70 @@ static bool dec_entrylist(const uint8_t *p, size_t n, struct shard_item *it)
     return !c.err;
 }
 
+/* FileGen submessage (ChunkTask.gen): size (1), mtime_ns (2). */
+static bool dec_filegen(const uint8_t *p, size_t n, struct chunk_info *ch)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1: ch->gen_size = pb_get_varint(&c); break;
+        case 2: ch->gen_mtime_ns = (int64_t)pb_get_varint(&c); break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err;
+}
+
+static bool dec_chunk_task(const uint8_t *p, size_t n, struct shard_item *it)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    const uint8_t *sp;
+    size_t sn;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1: it->shard_id = pb_get_varint(&c); break;
+        case 2: it->job_id = pb_get_varint(&c); break;
+        case 3: it->pass_no = (uint32_t)pb_get_varint(&c); break;
+        case 4:
+            if (!pb_get_len(&c, &sp, &sn))
+                return false;
+            free(it->rel_path);
+            it->rel_path = malloc(sn + 1);
+            if (!it->rel_path)
+                return false;
+            memcpy(it->rel_path, sp, sn);
+            it->rel_path[sn] = '\0';
+            break;
+        case 5: it->chunk.offset = pb_get_varint(&c); break;
+        case 6: it->chunk.length = pb_get_varint(&c); break;
+        case 7:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_filegen(sp, sn, &it->chunk))
+                return false;
+            break;
+        case 8: it->chunk.create_temp = pb_get_varint(&c) != 0; break;
+        case 9:
+            if (!pb_get_len(&c, &sp, &sn))
+                return false;
+            free(it->chunk.temp_name);
+            it->chunk.temp_name = malloc(sn + 1);
+            if (!it->chunk.temp_name)
+                return false;
+            memcpy(it->chunk.temp_name, sp, sn);
+            it->chunk.temp_name[sn] = '\0';
+            break;
+        case 10: it->chunk.finalize = pb_get_varint(&c) != 0; break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err;
+}
+
 static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
 {
     struct shard_item it = {0};
@@ -668,8 +751,14 @@ static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
             it.kind = WI_ENTRYLIST;
             have_item = true;
             break;
-        case 5: case 6: case 9:
-            /* chunk/dirfix/probe: later slices.
+        case 5:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_chunk_task(sp, sn, &it))
+                goto fail;
+            it.kind = WI_CHUNK;
+            have_item = true;
+            break;
+        case 6: case 9:
+            /* dirfix/probe: later slices.
              * Skipped; the lease expires and the coordinator re-queues. */
             unsupported = true;
             pb_skip(&c, wt);
