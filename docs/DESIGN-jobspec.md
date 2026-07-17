@@ -109,18 +109,22 @@ Quantity suffixes: `KiB/MiB/GiB/TiB` (binary), plain integers are bytes/counts.
 
 ### 1.1 Validation
 
-`drsync job submit spec.yaml` validates before anything runs:
+`drsync job submit spec.yaml` validates the static spec before anything runs:
 
 - schema + unknown-field rejection (typo safety),
-- src/dst paths exist and are directories **on every registered agent** (coordinator
-  issues a probe task to each agent; catches missing/misordered mounts before pass 1),
-- src ≠ dst and neither is a prefix of the other,
+- src/dst paths are absolute, src ≠ dst and neither is a prefix of the other,
 - destination mount has plausible free space (statfs vs. src estimate once pass 1 has a
   running total; hard check is per-write ENOSPC handling),
 - filters compile,
 - `notifications`: if `on_pass_complete`/`on_job_complete` is set, `recipients` is non-empty
   and every address is well-formed (a permissive sanity check — the SMTP server validates
   authoritatively).
+
+Mount existence is **not** checked at submit — the coordinator holds no mounts. Instead
+each pass opens with a `PROBING` phase (DESIGN-coordinator.md §2.2): every schedulable
+agent runs a `ProbeTask` verifying its own src/dst roots are present directories, and the
+pass is held until all pass. A missing or misordered mount on any host thus parks a probe
+and blocks the pass before bulk work runs, rather than failing partway through.
 
 ### 1.2 Email notifications
 

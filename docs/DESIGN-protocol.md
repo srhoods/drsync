@@ -49,7 +49,7 @@ Direction key: `A→C` agent to coordinator, `C→A` coordinator to agent.
 | 3 | `Heartbeat` | A→C | liveness + implicit renewal of **all** leases held by this agent; includes coarse load (queue depths, in-flight bytes) |
 | 4 | `HeartbeatAck` | C→A | piggybacks control state: pause/resume/drain flags, config-changed epoch |
 | 5 | `WorkRequest` | A→C | credit-based pull: "I have capacity for N shards / M copy tasks"; sent whenever local queues drop below low-water marks |
-| 6 | `WorkGrant` | C→A | 0..N work items, each a `Shard`, `EntryListShard`, `ChunkTask`, `DirFixBatch`, `VerifyBatch`, or `DeleteBatch`; each carries a lease (id, TTL) |
+| 6 | `WorkGrant` | C→A | 0..N work items, each a `Shard`, `EntryListShard`, `ChunkTask`, `DirFixBatch`, `VerifyBatch`, `DeleteBatch`, or `ProbeTask` (a mount-probe pinned to this agent, gating pass start); each carries a lease (id, TTL) |
 | 7 | `ShardSplit` | A→C | new shards discovered mid-walk (subdirectories pushed back, or entry-list batches from a huge directory); coordinator persists + queues them, acks with assigned shard ids |
 | 8 | `ShardSplitAck` | C→A | ids assigned; until received, the agent must not report the parent shard complete (no lost subtrees) |
 | 9 | `ShardResult` | A→C | terminal state of a leased shard: counters (entries walked, tasks emitted/completed, bytes copied), orphan count, error summary, nlink>1 stats, wall/IO timings |

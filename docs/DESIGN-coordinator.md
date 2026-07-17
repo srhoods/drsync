@@ -62,12 +62,20 @@ CREATED ──validate──▶ READY ──start──▶ RUNNING ⇄ PAUSED
 ### 2.2 Pass
 
 ```
-PENDING ──▶ SCANNING ──all shards done──▶ DIRFIX ──▶ VERIFY ──▶ [DELETE] ──▶ COMPLETE
-              (walk+diff+copy               (dir     (sampled     (only if
-               interleaved per               metadata  checksums,   explicitly
-               shard)                        sweep)    metadata)    triggered)
+PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards done──▶ DIRFIX ──▶ VERIFY ──▶ [DELETE] ──▶ COMPLETE
+            (per-agent               (walk+diff+copy               (dir     (sampled     (only if
+             mount probe)             interleaved per               metadata  checksums,   explicitly
+                                      shard)                        sweep)    metadata)    triggered)
 ```
 
+- `PROBING` gates the pass: one `ProbeTask` shard is pinned (`target_agent`) to each
+  schedulable agent, and the root walk shard is withheld until every probe reports OK.
+  Each agent verifies **its own** source and destination roots are present directories,
+  so a missing or misordered mount on any host is caught before bulk work runs — not
+  just on whichever agent grabbed the root shard. A failed probe parks (like any shard),
+  and the parked-shard guard holds the pass until the operator fixes the mount and
+  retries. Probes pinned to an agent that departs after seeding are pruned so the phase
+  is not stalled. An empty fleet skips probing (nobody to probe or grant work to).
 - `SCANNING` is the long phase: walk, diff, and copy are interleaved *per shard*, so
   data starts moving seconds after pass start; there is no global "scan first" barrier.
 - `DIRFIX` applies directory metadata deepest-first from the journal's dir records

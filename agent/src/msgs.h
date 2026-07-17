@@ -136,6 +136,7 @@ enum {
     WI_VERIFY = 2,    /* VerifyBatch: metadata + sampled checksum re-check */
     WI_ENTRYLIST = 3, /* EntryListShard: a name slice of a pathological dir */
     WI_CHUNK = 4,     /* ChunkTask: one byte range of a big file, or its finalize */
+    WI_PROBE = 5,     /* ProbeTask: verify this agent's src/dst mounts before work */
 };
 
 /* Per-shard walk overrides (proto WalkOverrides). The coordinator sends these

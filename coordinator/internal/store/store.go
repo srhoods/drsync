@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS shards (
   lease_expiry    INTEGER,
   result          BLOB,
   error           TEXT,
+  target_agent    TEXT,               -- non-NULL = leasable only by this agent (probes)
   updated_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS shards_sched ON shards (state, priority DESC, id);
@@ -195,6 +196,7 @@ func Open(path string) (*Store, error) {
 // idempotent (guarded by the duplicate-column check in Open).
 var migrations = []string{
 	`ALTER TABLE agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`,
+	`ALTER TABLE shards ADD COLUMN target_agent TEXT`,
 }
 
 func (s *Store) Close() error {
@@ -483,6 +485,10 @@ type NewShard struct {
 	Kind    model.ShardKind
 	RelPath string
 	Payload []byte // marshaled inner work message for non-dir kinds
+	// TargetAgent pins the shard to one agent: only that agent can lease it.
+	// Empty = grantable to anyone (the default). Used for probe shards, where
+	// each agent must verify its own mounts.
+	TargetAgent string
 }
 
 type ShardRow struct {
@@ -525,11 +531,15 @@ func insertShardsTx(tx *sql.Tx, passID, parentID int64, shards []NewShard) ([]in
 	}
 	ids := make([]int64, 0, len(shards))
 	for _, ns := range shards {
+		var target any
+		if ns.TargetAgent != "" {
+			target = ns.TargetAgent
+		}
 		res, err := tx.Exec(`INSERT INTO shards
-			(pass_id, parent_shard_id, kind, rel_path, payload, priority, state, updated_at)
-			VALUES (?,?,?,?,?,?,?,?)`,
+			(pass_id, parent_shard_id, kind, rel_path, payload, priority, state, target_agent, updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?)`,
 			passID, parent, string(ns.Kind), ns.RelPath, ns.Payload,
-			ns.Kind.Priority(), string(model.ShardQueued), nowMS())
+			ns.Kind.Priority(), string(model.ShardQueued), target, nowMS())
 		if err != nil {
 			return nil, err
 		}
@@ -752,11 +762,14 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	}
 	defer tx.Rollback()
 
+	// A targeted shard (target_agent set) is leasable only by that agent; an
+	// untargeted one (NULL) by anyone. Probe shards use this so each agent
+	// verifies its own mounts.
 	const selCols = `SELECT s.id, s.pass_id, s.kind, s.rel_path, s.payload, s.attempt, p.job_id, p.pass_no
 		FROM shards s
 		JOIN passes p ON p.id = s.pass_id
 		JOIN jobs   j ON j.id = p.job_id
-		WHERE s.state = ? AND j.state = ? `
+		WHERE s.state = ? AND j.state = ? AND (s.target_agent IS NULL OR s.target_agent = ?) `
 
 	var out []*ShardRow
 	scan := func(query string, args ...any) error {
@@ -778,7 +791,7 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	// Tier 1: fresh work — shards this agent did NOT last hold.
 	if err := scan(selCols+`AND NOT (s.attempt > 0 AND s.lease_agent = ?)
 		ORDER BY s.priority DESC, s.id LIMIT ?`,
-		string(model.ShardQueued), string(model.JobRunning), agentID, max); err != nil {
+		string(model.ShardQueued), string(model.JobRunning), agentID, agentID, max); err != nil {
 		return nil, err
 	}
 	// Tier 2: only if fresh work didn't fill the grant, fall back to shards this
@@ -786,7 +799,7 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	if len(out) < max {
 		if err := scan(selCols+`AND s.attempt > 0 AND s.lease_agent = ?
 			ORDER BY s.priority DESC, s.id LIMIT ?`,
-			string(model.ShardQueued), string(model.JobRunning), agentID, max-len(out)); err != nil {
+			string(model.ShardQueued), string(model.JobRunning), agentID, agentID, max-len(out)); err != nil {
 			return nil, err
 		}
 	}
@@ -1165,6 +1178,48 @@ func (s *Store) CountSchedulableAgents() (int64, error) {
 		return 0, err
 	}
 	return max(n, 1), nil
+}
+
+// SchedulableAgents lists the agent ids that could be granted work right now:
+// connected and administratively enabled. Used to target one probe shard per
+// agent at pass start. Unlike CountSchedulableAgents this reports the true set,
+// so an empty fleet returns an empty slice (no probes to seed).
+func (s *Store) SchedulableAgents() ([]string, error) {
+	rows, err := s.rdb.Query(`SELECT id FROM agents
+		WHERE enabled = 1 AND state = ? ORDER BY id`, "connected")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// PruneStaleProbes deletes still-pending probe shards whose target agent is no
+// longer schedulable (disconnected or disabled). Without this a probe pinned to
+// an agent that dropped after seeding would sit queued forever and stall the
+// probing phase; dropping it lets the pass proceed on the agents that did
+// probe. Returns the number pruned.
+func (s *Store) PruneStaleProbes(passID int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`DELETE FROM shards
+		WHERE pass_id = ? AND kind = ? AND state IN (?, ?)
+		  AND target_agent IS NOT NULL
+		  AND target_agent NOT IN (SELECT id FROM agents WHERE enabled = 1 AND state = 'connected')`,
+		passID, string(model.KindProbe), string(model.ShardQueued), string(model.ShardLeased))
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // SchedulerCounts is a snapshot of the global queue driving the scheduler's
