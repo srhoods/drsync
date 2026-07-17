@@ -132,6 +132,58 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   scheduler enforces `src_load_ceiling` by shrinking grant credits when agents report
   p99 latency above the ceiling — global backpressure with no agent coordination.
 
+### 4.1 Fan-out: who decides how far a shard descends
+
+An agent walking a shard cannot know whether the fleet needs more shards — it
+sees one subtree, not the queue. Left to itself it descends until
+`tuning.shard_budget` (250k entries) runs out, so **a volume smaller than the
+budget never splits at all**: one shard, one agent, one walker thread, whatever
+the fleet size. That is a correctness-preserving but capacity-wasting outcome,
+and it is the common case when consolidating many modest volumes.
+
+The decision therefore belongs to the coordinator, which is the only party that
+knows both numbers:
+
+```
+target  = spread_target_per_agent × (connected AND enabled agents)
+pending = queued + leased dir/entrylist shards, across RUNNING jobs
+spread  = pending < target                       # tuning.spread_mode: auto
+```
+
+While `spread` holds, every granted walk shard carries `WalkOverrides`
+(protocol §4.3) with `walk_budget = 0`: descend nothing, push every
+subdirectory back as a new shard. The queue therefore grows exponentially from
+the root until it can cover the fleet, at which point the overrides stop, shards
+revert to `shard_budget`, and agents descend deeply in-process with no further
+round trips. Steady-state behaviour at PB scale is unchanged (D7) — the cost is
+bounded at roughly `target` extra round trips in a job's first moments.
+
+Two properties this must preserve:
+
+- **Overrides only ever fan out harder.** The spread `split_threshold` is
+  `min(spread default, the job's dir_split_threshold)`: an operator who lowered
+  the threshold to break up a pathological directory keeps it.
+- **Leased shards count as pending.** An agent busy on a shard is not starved;
+  counting only queued shards would spread forever.
+
+`spread_mode: off` pins the pre-fan-out behaviour, `always` spreads on every
+grant. Both are diagnostic.
+
+### 4.2 Fair-share grants
+
+Fan-out is not enough on its own. An agent requests
+`(workers + copy_threads) × 2` credits — 48 on a default host — and
+`LeaseShards` grants whatever it can, so the first agent to poll drains a
+shallow queue and the fleet still idles.
+
+While the queue is too shallow to fill every agent's request
+(`queued < agents × credits`), a grant is capped at `ceil(queued / agents)`.
+Once the queue is deep the full request is granted, so nothing extra is paid at
+scale and phases with a large task backlog (verify) are untouched. The cap is
+never below 1 and never applies to a single-agent fleet: work must not sit
+QUEUED because nobody is permitted to take it — the same "never strand"
+property the anti-affinity tier-2 fallback protects above.
+
 ## 5. Journals
 
 Append-only, per (job, pass), the system of record for per-file outcomes:

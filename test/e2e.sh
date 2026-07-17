@@ -22,6 +22,24 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# has PATTERN CMD... — CMD must succeed AND its stdout must match PATTERN.
+#
+# Not `CMD | grep -q PAT`: grep -q exits at its first match, CMD then dies of
+# SIGPIPE, and under `set -o pipefail` the pipeline reports 141 even though the
+# pattern matched. Whether that fires depends on how much CMD had left to write
+# when grep quit — i.e. on where the match happens to sit in the output — so it
+# shows up as an intermittent failure that moves whenever record ordering does.
+#
+# `out` is declared before the assignment on purpose: `local out=$(CMD)` would
+# mask CMD's exit status behind local's own, silently dropping the status check
+# that pipefail used to give us.
+has() {
+    local pat=$1 out
+    shift
+    out=$("$@") || return 1
+    grep -q -- "$pat" <<<"$out"
+}
+
 # --- build -------------------------------------------------------------------
 make -C "$ROOT/agent" -s
 ( cd "$ROOT" && go build -o bin/drsyncd ./coordinator/cmd/drsyncd \
@@ -92,7 +110,7 @@ AGENT_PID=$!
 sleep 1
 curl -sf -H "$AUTH" "$API/api/v1/agents" | grep -q '"connected":true' \
     || fail "agent did not register"
-"$DRSYNC" agent list | grep -q "agent-e2e.*true" \
+has "agent-e2e.*true" "$DRSYNC" agent list \
     || fail "CLI agent list does not show the connected agent"
 
 # --- submit + run job ----------------------------------------------------------
@@ -114,8 +132,8 @@ spec:
 EOF
 # submit + start via the CLI; --set exercises the YAML-path override pipeline
 # (shard_budget deliberately absent from the spec file above)
-"$DRSYNC" job submit "$WORK/job.yaml" --set spec.tuning.shard_budget=4 --start \
-    | grep -q "job e2e started" || fail "CLI job submit --start failed"
+has "job e2e started" "$DRSYNC" job submit "$WORK/job.yaml" \
+    --set spec.tuning.shard_budget=4 --start || fail "CLI job submit --start failed"
 curl -sf -H "$AUTH" "$API/api/v1/jobs/e2e" >/dev/null || fail "submitted job not visible"
 
 # follow live progress over the WebSocket event feed while the job runs
@@ -230,14 +248,14 @@ echo "$PD" | grep -q '"duration_ms"' || fail "pass detail missing duration: $PD"
 echo "$PD" | grep -q '"DONE"' || fail "pass detail missing shard counts: $PD"
 
 # 11. journal query: pass-1 orphans visible through the API, with type filter
-"$DRSYNC" journal cat e2e --pass 1 --type orphan | grep -q "keepme" \
+has "keepme" "$DRSYNC" journal cat e2e --pass 1 --type orphan \
     || fail "journal cat did not list the keepme orphan"
-"$DRSYNC" journal cat e2e --pass 1 --type copied --path projects/ --jsonl \
-    | grep -q '"rel_path":"projects/alpha/readme.txt"' \
+has '"rel_path":"projects/alpha/readme.txt"' \
+    "$DRSYNC" journal cat e2e --pass 1 --type copied --path projects/ --jsonl \
     || fail "journal cat path filter failed"
 
 # 12. error browser: clean job reports none
-"$DRSYNC" errors e2e --pass all | grep -q "no errors" || fail "CLI errors not clean"
+has "no errors" "$DRSYNC" errors e2e --pass all || fail "CLI errors not clean"
 
 # 13. report: converged, verify totals, orphans still outstanding (pre-delete)
 "$DRSYNC" report e2e --json > "$WORK/report1.json"
@@ -252,7 +270,7 @@ assert r["totals"]["verify_fail"] == 0 and r["totals"]["errors"] == 0
 assert r["parked_shard_count"] == 0
 assert r["passes"][0]["duration_ms"] > 0 and r["passes"][0]["delta_files"] > 40
 EOF
-"$DRSYNC" report e2e | grep -q "converged: true" || fail "human report wrong"
+has "converged: true" "$DRSYNC" report e2e || fail "human report wrong"
 
 # --- delete pass (journals + D5 double gate) ----------------------------------
 # journals were written on the coordinator
@@ -269,8 +287,9 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH" -X POST \
 [[ -f "$DST/keepme/orphan.txt" ]] || fail "refused delete pass still deleted something"
 
 # gate 2: fully acknowledged delete pass runs
-"$DRSYNC" pass trigger e2e --delete-pass --i-know-this-deletes \
-    | grep -q "DELETE pass triggered" || fail "confirmed delete pass rejected"
+has "DELETE pass triggered" \
+    "$DRSYNC" pass trigger e2e --delete-pass --i-know-this-deletes \
+    || fail "confirmed delete pass rejected"
 for _ in $(seq 1 60); do
     JOB=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/e2e")
     echo "$JOB" | grep -q '"state":"COMPLETED"' && break
@@ -291,9 +310,9 @@ DELP=$(echo "$JOB" | grep -o '"pass_no":[0-9]*' | tail -1 | cut -d: -f2)
 "$DRSYNC" report e2e --json > "$WORK/report2.json"
 grep -q '"delete_pass_ran": true' "$WORK/report2.json" || fail "report missed delete pass"
 grep -q '"orphans_remaining": 0' "$WORK/report2.json" || fail "orphans not zeroed in report"
-"$DRSYNC" journal cat e2e --pass "$DELP" --type deleted | grep -q "keepme" \
+has "keepme" "$DRSYNC" journal cat e2e --pass "$DELP" --type deleted \
     || fail "delete pass journal missing DELETED records"
-"$DRSYNC" queue | grep -q "queue empty" || fail "queue not drained: $("$DRSYNC" queue)"
+has "queue empty" "$DRSYNC" queue || fail "queue not drained: $("$DRSYNC" queue)"
 
 echo "PASS: e2e sync converged in $N_PASSES passes (pass1 copied $P1 files);" \
      "delete pass $DELP removed $DP orphaned objects; operator surface + fidelity checks OK"

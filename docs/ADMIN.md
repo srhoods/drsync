@@ -138,6 +138,8 @@ spec:
                                   #   (rounded up to a power of two, clamped 1–4096;
                                   #   keep ≤ nfs4 max_session_slots)
     mtime_slop_ns: 1000000        # mtimes within this are "equal" (1 ms)
+    spread_mode: auto             # auto | off | always — fleet-wide fan-out (see §4.6)
+    spread_target_per_agent: 32   # walk shards per agent to aim for before spreading stops
 ```
 
 You can keep the spec minimal and override individual fields at submit time with
@@ -299,7 +301,34 @@ extreme.
     --set spec.copy.chunk_threshold=512MiB --set spec.copy.server_side_copy=off
   ```
 
-### 4.6 Throttling agents
+### 4.6 Using the whole fleet on a small volume
+
+A volume does not have to be big to be slow: consolidating many modest volumes
+means running many jobs whose trees are nowhere near PB scale, and those must
+still use every agent you have.
+
+Fan-out is automatic and needs no tuning. The coordinator compares the walk
+shards the fleet is holding against what it could chew on
+(`spread_target_per_agent` × connected, enabled agents). While there are too
+few, it tells each granted shard to push its subdirectories straight back
+instead of descending them, so the tree fans out across the fleet within
+seconds. Once there is enough work to go round, shards revert to
+`tuning.shard_budget` and descend deeply in-process — a PB-scale job pays for
+fan-out only in its first moments.
+
+| `spread_mode` | Behaviour |
+|---|---|
+| `auto` (default) | Fan out while the fleet is starved. Leave it here. |
+| `off` | Never fan out early: a shard descends until `shard_budget` runs out. A volume smaller than `shard_budget` (250 000 entries) is then walked by **one thread on one agent** — the rest of the fleet idles. Diagnostic only. |
+| `always` | Fan out on every grant regardless of queue depth. Costs a coordinator round trip per directory; use it to reproduce distribution problems, not in production. |
+
+Check that a job is actually spread with `drsync job status <job>` (per-agent
+throughput) or the console's agent panel. If one agent is doing everything and
+the others are idle, confirm the idle agents are connected **and** enabled
+(`drsync agent list`) — a disabled agent is excluded from the fan-out target and
+receives no grants (§4.7).
+
+### 4.7 Throttling agents
 
 Cap per-agent throughput so a migration doesn't starve production I/O:
 
@@ -309,7 +338,7 @@ drsync job submit bulk.yaml --start \
   --set spec.limits.iops_per_agent=20000
 ```
 
-### 4.7 Draining an agent for maintenance
+### 4.8 Draining an agent for maintenance
 
 To take a node out of a running migration without disrupting jobs — e.g. before
 a reboot, kernel patch, or to shift its NIC/mount load elsewhere — disable it
@@ -415,6 +444,7 @@ anything you need first (`drsync report <name> --json`, `drsync journal cat
 | Errors with `class MOUNT_SICK` / `ESTALE` | An agent's mount is unhealthy; that shard is requeued to another agent. Check `RequiresMountsFor` and NFS health on the offending host. |
 | Job runs to `passes.max` without `COMPLETED` | The source is changing faster than it converges, or `converge_when` is too strict. A pass that changes nothing always converges; if the delta never reaches zero, quiesce the source for a final pass (§4.3) or relax `converge_when`. |
 | A single huge directory or file dominates runtime | Lower `tuning.dir_split_threshold` (fan the directory out) and/or `copy.chunk_threshold` (parallelize the file). See §4.5. |
+| One agent does all the work; the others sit idle | Check the idle agents are connected **and** enabled (`drsync agent list`) — a disabled or disconnected agent gets no grants and is excluded from the fan-out target. If they are healthy, confirm the job is not pinned with `tuning.spread_mode: off`. See §4.6. |
 | Copy fails with "server-side copy required but unavailable" | `server_side_copy: require` on a mount pair that can't do `copy_file_range`. Use `auto` (falls back to byte copy) or ensure both sides are the same NFSv4.2/reflink-capable filesystem. |
 | Fidelity exceptions in the report | An attribute couldn't be translated (e.g. an ACL with no destination equivalent). Under `acls.untranslatable: warn` these are counted and the entry still copies with mode bits; set `fail` to make them hard errors or `skip` to ignore. |
 

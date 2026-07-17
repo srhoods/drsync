@@ -2,8 +2,7 @@
  * Slice 2: stats are prefetched in batches (io_uring statx, fstatat fallback)
  * and data movement runs on the copy pool; the walker waits per directory so
  * directory metadata still lands after every rename into it (§3.5).
- * Still TODO: entry-list sharding for huge dirs, xattrs/ACLs/sparse (slice 3),
- * journal records, explicit stack for very deep trees. */
+ * Still TODO: explicit stack for very deep trees. */
 #include "agent.h"
 #include "wire.h"
 
@@ -127,7 +126,6 @@ static int read_entries(int fd, DIR **dp, struct dent **out, size_t *n_out)
     size_t n = 0, cap = 0;
     errno = 0;
     struct dirent *de;
-    /* TODO(slice3): dir_split_threshold entry-list sharding mid-readdir */
     while ((de = readdir(d))) {
         if (de->d_name[0] == '.' &&
             (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0')))
@@ -471,6 +469,27 @@ static void queue_split(struct walk_ctx *ctx, const char *rel)
 /* ---- the walk ---- */
 static void walk_dir(struct walk_ctx *ctx, const char *rel);
 
+/* This shard's entry budget: subdirectories are descended inline while it
+ * lasts and pushed back to the coordinator once it runs out. The coordinator's
+ * per-shard override wins when present — it knows the fleet size and queue
+ * depth, and sends budget 0 to fan a job out (proto WalkOverrides). Absent, the
+ * job's tuning applies. */
+static int64_t shard_budget(const struct walk_ctx *ctx)
+{
+    if (ctx->it->ov.have_budget)
+        return (int64_t)ctx->it->ov.budget;
+    return (int64_t)(ctx->oe->o.shard_budget ? ctx->oe->o.shard_budget : 250000);
+}
+
+/* Entry count above which a directory is fanned out as entry-list shards
+ * instead of being walked here. Coordinator override wins, as for the budget. */
+static uint64_t split_threshold(const struct walk_ctx *ctx)
+{
+    if (ctx->it->ov.have_split_threshold)
+        return ctx->it->ov.split_threshold;
+    return ctx->oe->o.dir_split_threshold;
+}
+
 static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel,
                          int sfd, int dfd, const struct dent *se,
                          const struct dent *de /* NULL if absent in dst */)
@@ -696,7 +715,7 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel)
         return;
     }
 
-    /* Pathological directory: source entry count over dir_split_threshold.
+    /* Pathological directory: source entry count over the split threshold.
      * Ship the names as entry-list shards for fleet-wide fan-out instead of
      * statting and copying millions of entries in this one shard (§2.3).
      *
@@ -709,9 +728,10 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel)
      * re-applies it, and by the converging pass nothing is copied so it sticks
      * (dir metadata converges over passes — the same property the non-split
      * path relies on for cross-shard subdirectories). */
-    if (o->dir_split_threshold && sn > o->dir_split_threshold && !o->dry_run) {
+    uint64_t split_at = split_threshold(ctx);
+    if (split_at && sn > split_at) {
         split_entrylist(ctx, rel, sv, sn, dv, dn, dfd);
-        if (dfd >= 0 && !ctx->fatal) {
+        if (dfd >= 0 && !o->dry_run && !ctx->fatal) {
             xattr_copy_fd(ctx, sfd, dfd, rel[0] ? rel : "<root>"); /* incl. ACLs */
             apply_meta_dirfd(ctx, dfd, &sst, rel[0] ? rel : "<root>");
         }
@@ -777,7 +797,7 @@ void process_shard(const struct shard_item *it)
                  (unsigned long long)it->job_id);
         status = RES_TRANSIENT;
     } else {
-        ctx.budget = (int64_t)(ctx.oe->o.shard_budget ? ctx.oe->o.shard_budget : 250000);
+        ctx.budget = shard_budget(&ctx);
         walk_dir(&ctx, it->rel_path);
         flush_splits(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
@@ -896,7 +916,7 @@ void process_entrylist(const struct shard_item *it)
                  (unsigned long long)it->job_id);
         status = RES_TRANSIENT;
     } else {
-        ctx.budget = (int64_t)(ctx.oe->o.shard_budget ? ctx.oe->o.shard_budget : 250000);
+        ctx.budget = shard_budget(&ctx);
         entrylist_walk(&ctx, it->rel_path ? it->rel_path : "", it->paths, it->n_paths);
         flush_splits(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */

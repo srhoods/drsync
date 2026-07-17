@@ -254,6 +254,30 @@ bool dec_hb_ack(const uint8_t *p, size_t n, struct hb_ack *out)
     return !c.err;
 }
 
+/* WalkOverrides: proto3 optional, so a field that is present at all is an
+ * explicit value — including zero. */
+static bool dec_walk_overrides(const uint8_t *p, size_t n, struct walk_overrides *ov)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1:
+            ov->budget = pb_get_varint(&c);
+            ov->have_budget = true;
+            break;
+        case 2:
+            ov->split_threshold = pb_get_varint(&c);
+            ov->have_split_threshold = true;
+            break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err;
+}
+
 static bool dec_shard(const uint8_t *p, size_t n, struct shard_item *it)
 {
     pb_cur c;
@@ -276,6 +300,13 @@ static bool dec_shard(const uint8_t *p, size_t n, struct shard_item *it)
                 return false;
             memcpy(it->rel_path, sp, sn);
             it->rel_path[sn] = '\0';
+            break;
+        }
+        case 5: {
+            const uint8_t *sp;
+            size_t sn;
+            if (!pb_get_len(&c, &sp, &sn) || !dec_walk_overrides(sp, sn, &it->ov))
+                return false;
             break;
         }
         default: pb_skip(&c, wt);
@@ -589,6 +620,10 @@ static bool dec_entrylist(const uint8_t *p, size_t n, struct shard_item *it)
             it->paths[it->n_paths++] = s;
             break;
         }
+        case 6:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_walk_overrides(sp, sn, &it->ov))
+                return false;
+            break;
         default: pb_skip(&c, wt);
         }
     }

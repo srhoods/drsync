@@ -94,6 +94,8 @@ spec:
     dir_split_threshold: 50000       # single-dir size that triggers entry-list sharding
     statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (pow2, 1–4096)
     mtime_slop_ns: 1000000           # 1ms slop for cross-FS timestamp granularity
+    spread_mode: auto                # auto | off | always — coordinator-side fan-out
+    spread_target_per_agent: 32      # walk shards per agent to aim for while spreading
 
   notifications:                     # optional email; needs an SMTP config on the coordinator
     recipients:                      # one or more addresses (required if any flag is set)
