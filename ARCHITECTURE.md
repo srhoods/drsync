@@ -1,7 +1,10 @@
 # drsync — Distributed rsync for Multi-Billion File Migrations
 
-**Status:** Initial architecture — key decisions ratified 2026-07-10 (see §10)
-**Date:** 2026-07-10
+**Status:** Phase 1 implemented; parts of phase 2/3 landed ahead of schedule —
+large-file chunking (including cross-fleet fan-out), verify/delete passes, and a
+read-only WebUI console all ship today. See §9 for the per-phase status. Key
+decisions ratified 2026-07-10 (see §10).
+**Date:** 2026-07-10 (status updated 2026-07-17)
 **Author:** drafted for review by Steven Rhoods
 
 ---
@@ -139,6 +142,13 @@ one walker; and we can't know the shape of the tree up front.
 This is a work-stealing pattern with the coordinator as the queue; agents *pull* work, so
 a slow NFS mount on one host never stalls the fleet.
 
+Because the descend-vs-push-back decision is the agent's, a volume smaller than one
+shard's budget would never split — one agent would walk it while the rest idle. The
+coordinator therefore overrides the budget while the fleet holds fewer walk shards than it
+can run: it tells each granted shard to push every subdirectory straight back until the
+queue can cover the fleet, then lets shards descend deeply again. Small volumes fan out
+without hand-tuning, and PB-scale behaviour is unchanged once the queue is deep.
+
 ### 3.3 Scan + diff are one operation (dual-tree walk)
 
 There is no separate "scan source, scan destination, then compare" phase — at this scale
@@ -197,11 +207,14 @@ lease shard ──> dual-tree walk ──> emit tasks ────────�
 - **Directory metadata is applied in a final fix-up sweep per shard** (children first),
   because writing into a directory disturbs its mtime, and restrictive dir modes (e.g.
   0500) must land *after* population.
-- **Large-file chunking:** files > `chunk_threshold` (default 1 GiB) become independent
-  chunk-copy tasks (offset/length), so a single 20 TB file is copied by many workers —
-  potentially on many hosts — into the same destination file (preallocated with
-  `fallocate`), then stitched with one finalize task. This is essential on Weka/GPFS where
-  single-stream throughput is a fraction of aggregate.
+- **Large-file chunking (implemented):** a file ≥ `chunk_threshold` (default 1 GiB) and
+  larger than one `chunk_size` becomes independent chunk-copy tasks (offset/length). The
+  coordinator lays out the ranges and grants them **across hosts**, all writing one
+  shared destination temp (preallocated with `fallocate`); a final task fsyncs, applies
+  metadata, and renames it into place once every range lands. So a single 20 TB file is
+  copied by the whole fleet — essential on Weka/GPFS where single-stream throughput is a
+  fraction of aggregate. A qualifying file smaller than two chunks (or when only one agent
+  is connected) is still copied locally in parallel ranges.
 
 ### 3.6 Convergence passes and cutover
 
@@ -333,11 +346,11 @@ drsync/
 └── test/           fidelity matrix tests, fault-injection harness, scale rigs
 ```
 
-| Phase | Deliverable |
-|---|---|
-| **1 — MVP** | Coordinator + agent, posix lister, dual-tree diff, copy + full metadata, passes, CLI, Prometheus metrics. Correctness proven by fidelity test matrix. |
-| **2 — Scale & resilience** | Large-file chunking, GPFS policy lister, verify pass, delete pass, coordinator HA, fault-injection test suite, 1B-file synthetic benchmark. |
-| **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. |
+| Phase | Deliverable | Status |
+|---|---|---|
+| **1 — MVP** | Coordinator + agent, posix lister, dual-tree diff, copy + full metadata, passes, CLI, Prometheus metrics. Correctness proven by fidelity test matrix. | **Shipped.** Plus mTLS, entry-list sharding for pathological directories, and coordinator-driven fleet spread so a volume below `shard_budget` still fans out across every agent (`test/fanout_e2e.sh`). |
+| **2 — Scale & resilience** | Large-file chunking, GPFS policy lister, verify pass, delete pass, coordinator HA, fault-injection test suite, 1B-file synthetic benchmark. | **Partial.** Shipped: large-file chunking — local parallel ranges **and** cross-fleet chunk fan-out with idempotent recovery (`test/chunk_e2e.sh`, `test/chunk_resilience_e2e.sh`); verify pass (sampled xxHash3); delete pass. Outstanding: GPFS policy lister, coordinator HA, fault-injection suite, 1B-file benchmark. |
+| **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. | **Partial.** Shipped: read-only WebUI monitoring console, per-pass reports. Outstanding: Weka snapshot lister, job control in the UI, cutover tooling. |
 
 ---
 
