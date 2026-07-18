@@ -54,6 +54,8 @@ func main() {
 		leaseTTL   = flag.Duration("lease-ttl", 30*time.Second, "shard lease TTL")
 		hbEvery    = flag.Duration("heartbeat-interval", 5*time.Second, "agent heartbeat interval")
 		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
+		minMinor   = flag.Uint("min-agent-minor", 0,
+			"refuse agents below this protocol minor (0 = accept all compatible agents)")
 		smtpConfig = flag.String("smtp-config", defaultSMTPConfig, "SMTP config for email notifications (absent default = disabled)")
 	)
 	flag.Parse()
@@ -65,15 +67,23 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 
+	if *minMinor > agentsrv.ProtoMinor {
+		fmt.Fprintf(os.Stderr,
+			"invalid -min-agent-minor: %d is above this coordinator's protocol minor (%d); no agent could connect\n",
+			*minMinor, agentsrv.ProtoMinor)
+		os.Exit(2)
+	}
+
 	if err := run(*agentAddr, *httpAddr, *dataDir, *apiToken,
-		*tlsCert, *tlsKey, *tlsCA, *smtpConfig, *leaseTTL, *hbEvery); err != nil {
+		*tlsCert, *tlsKey, *tlsCA, *smtpConfig, *leaseTTL, *hbEvery,
+		uint32(*minMinor)); err != nil {
 		slog.Error("drsyncd exiting", "err", err)
 		os.Exit(1)
 	}
 }
 
 func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpConfig string,
-	leaseTTL, hbEvery time.Duration) error {
+	leaseTTL, hbEvery time.Duration, minAgentMinor uint32) error {
 
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return err
@@ -122,10 +132,12 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpCon
 		LeaseTTL:          leaseTTL,
 		TLS:               tlsConf,
 		FleetEpoch:        fleetEpoch,
+		MinAgentMinor:     minAgentMinor,
 	}, st, sched, jw, met)
 
 	apiSrv := api.New(st, pc, met, bus, journalRoot, apiToken)
 	apiSrv.ConnectedAgents = asrv.ConnectedAgents
+	apiSrv.AgentInflight = asrv.Inflight
 	apiSrv.DropJournal = jw.DropJob
 	apiSrv.Info = api.CoordinatorInfo{
 		FleetEpoch: fmt.Sprintf("%016x", fleetEpoch),

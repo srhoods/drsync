@@ -14,10 +14,10 @@ func TestSeedPassProbesConnectedAgents(t *testing.T) {
 	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.st.UpsertAgent("a1", "h", "v1"); err != nil {
+	if err := c.st.UpsertAgent("a1", "h", "v1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.st.UpsertAgent("a2", "h", "v1"); err != nil {
+	if err := c.st.UpsertAgent("a2", "h", "v1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.StartJob("t1"); err != nil {
@@ -58,7 +58,7 @@ func TestProbeGateTransitionsToScanning(t *testing.T) {
 	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.st.UpsertAgent("a1", "h", "v1"); err != nil {
+	if err := c.st.UpsertAgent("a1", "h", "v1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.StartJob("t1"); err != nil {

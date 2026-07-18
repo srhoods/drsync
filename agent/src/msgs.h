@@ -260,9 +260,14 @@ struct stats_snapshot {
 void enc_hello(pb_buf *b, const char *agent_id, const char *hostname,
                const char *version, uint32_t cores, uint64_t mem_limit,
                bool io_uring);
+struct inflight_view; /* agent.h */
 void enc_heartbeat(pb_buf *b, uint64_t seq, const uint64_t *leases, size_t n_leases,
                    uint32_t shard_queue_depth, uint32_t copy_queue_depth,
-                   uint64_t rss_bytes);
+                   uint64_t rss_bytes, const struct inflight_view *inflight,
+                   size_t n_inflight);
+/* Wire name for a WI_* kind, matching the coordinator's model.ShardKind
+ * strings so both sides label a shard identically. */
+const char *wi_kind_name(int kind);
 void enc_work_request(pb_buf *b, uint32_t shard_credits,
                       const struct cached_opts *cached, size_t n_cached);
 void enc_shard_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,

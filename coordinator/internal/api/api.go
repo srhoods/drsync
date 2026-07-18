@@ -11,17 +11,20 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"drsync/coordinator/internal/agentsrv"
 	"drsync/coordinator/internal/events"
 	"drsync/coordinator/internal/metrics"
 	"drsync/coordinator/internal/model"
 	"drsync/coordinator/internal/passctrl"
 	"drsync/coordinator/internal/store"
+	drsyncpb "drsync/proto/gen/drsyncpb"
 	"drsync/webui"
 )
 
@@ -34,6 +37,10 @@ type Server struct {
 	token       string // empty = no auth (dev only)
 	// ConnectedAgents is injected by agentsrv for the fleet view.
 	ConnectedAgents func() []string
+	// AgentInflight returns an agent's last-reported in-flight work, when it was
+	// reported, whether the agent is new enough to report it at all, and whether
+	// it is connected. Injected by agentsrv.
+	AgentInflight func(id string) (items []*drsyncpb.InflightItem, at time.Time, reports, connected bool)
 	// DropJournal removes a purged job's on-disk journal segments; injected in
 	// main so the API can reclaim disk on `job purge`.
 	DropJournal func(jobID int64) error
@@ -86,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs/{name}/report", s.auth(s.getReport))
 	mux.HandleFunc("GET /api/v1/info", s.auth(s.getInfo))
 	mux.HandleFunc("GET /api/v1/agents", s.auth(s.listAgents))
+	mux.HandleFunc("GET /api/v1/agents/{id}/inflight", s.auth(s.getAgentInflight))
 	mux.HandleFunc("POST /api/v1/agents/{id}/enable", s.auth(s.setAgentEnabled(true)))
 	mux.HandleFunc("POST /api/v1/agents/{id}/disable", s.auth(s.setAgentEnabled(false)))
 	mux.HandleFunc("GET /api/v1/queue", s.auth(s.getQueue))
@@ -480,6 +488,8 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 		ID            string `json:"id"`
 		Hostname      string `json:"hostname"`
 		Version       string `json:"version"`
+		ProtoMinor    uint32 `json:"proto_minor"`
+		Stale         bool   `json:"stale"` // behind the coordinator's protocol minor
 		State         string `json:"state"`
 		Connected     bool   `json:"connected"`
 		Enabled       bool   `json:"enabled"`
@@ -488,9 +498,60 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	out := make([]agentView, 0, len(agents))
 	for _, a := range agents {
 		out = append(out, agentView{ID: a.ID, Hostname: a.Hostname, Version: a.Version,
+			ProtoMinor: a.ProtoMinor, Stale: a.ProtoMinor < agentsrv.ProtoMinor,
 			State: a.State, Connected: live[a.ID], Enabled: a.Enabled, LastHeartbeat: a.LastHeartbeat})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// getAgentInflight answers "what is this agent doing right now" from the last
+// heartbeat's snapshot.
+//
+// `supported: false` means the agent is too old to report in-flight detail —
+// deliberately distinct from an empty list, which means the agent really is
+// holding nothing. Conflating the two would make a stale agent look idle.
+func (s *Server) getAgentInflight(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.AgentInflight == nil {
+		httpErr(w, http.StatusServiceUnavailable, "agent server not attached")
+		return
+	}
+	items, at, reports, connected := s.AgentInflight(id)
+	if !connected {
+		httpErr(w, http.StatusNotFound, "agent not connected")
+		return
+	}
+	type itemView struct {
+		LeaseID     uint64 `json:"lease_id"`
+		ShardID     uint64 `json:"shard_id"`
+		JobID       uint64 `json:"job_id"`
+		Kind        string `json:"kind"`
+		RelPath     string `json:"rel_path"`
+		HeldMS      uint32 `json:"held_ms"`
+		RunningMS   uint32 `json:"running_ms"`
+		Running     bool   `json:"running"`
+		EntriesDone uint64 `json:"entries_done"`
+	}
+	out := make([]itemView, 0, len(items))
+	for _, it := range items {
+		out = append(out, itemView{
+			LeaseID: it.LeaseId, ShardID: it.ShardId, JobID: it.JobId,
+			Kind: it.Kind, RelPath: it.RelPath, HeldMS: it.HeldMs,
+			RunningMS: it.RunningMs, Running: it.Running, EntriesDone: it.EntriesDone,
+		})
+	}
+	// Longest-running first: the head of this list is what to investigate.
+	sort.Slice(out, func(i, j int) bool { return out[i].RunningMS > out[j].RunningMS })
+	var reportedAt int64
+	if !at.IsZero() {
+		reportedAt = at.UnixMilli()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agent":          id,
+		"supported":      reports,
+		"reported_at_ms": reportedAt,
+		"inflight":       out,
+	})
 }
 
 // setAgentEnabled toggles an agent's scheduling flag. Disabled agents stay
