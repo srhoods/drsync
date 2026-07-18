@@ -129,10 +129,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # attr supplies setfattr/getfattr, which chunk_e2e and scale_e2e use to
+      # seed and check xattrs. It is not present on the runners by default.
       - name: build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libzstd-dev libssl-dev
+          sudo apt-get install -y --no-install-recommends libzstd-dev libssl-dev attr
 
       - name: ${{ matrix.script }}
         run: bash test/${{ matrix.script }}.sh
