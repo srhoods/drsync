@@ -69,6 +69,8 @@ void process_item(struct shard_item *it)
         process_chunk(it);
     else if (it->kind == WI_PROBE)
         process_probe(it);
+    else if (it->kind == WI_DIRFIX)
+        process_dirfix(it);
     else
         process_shard(it);
     shard_item_free(it);

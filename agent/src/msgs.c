@@ -512,12 +512,17 @@ void shard_item_free(struct shard_item *it)
         free(it->paths[i]);
     free(it->paths);
     free(it->vchecksum);
+    for (size_t i = 0; i < it->n_dirs; i++)
+        free(it->dirs[i].rel_path);
+    free(it->dirs);
     free(it->chunk.temp_name);
     it->rel_path = NULL;
     it->paths = NULL;
     it->vchecksum = NULL;
+    it->dirs = NULL;
     it->chunk.temp_name = NULL;
     it->n_paths = 0;
+    it->n_dirs = 0;
 }
 
 /* ProbeTask { task_id = 1, job_id = 2 }. task_id is the probe shard's id; the
@@ -624,6 +629,86 @@ static bool dec_verify_entry(const uint8_t *p, size_t n, struct shard_item *it,
 fail:
     free(path);
     return false;
+}
+
+/* DirMeta { rel_path=1, uid=2, gid=3, mode=4, atime_ns=5, mtime_ns=6 } → one
+ * struct dirmeta appended to it->dirs. */
+static bool dec_dir_meta(const uint8_t *p, size_t n, struct shard_item *it,
+                         size_t *cap)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    struct dirmeta dm = {0};
+    const uint8_t *sp;
+    size_t sn;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1:
+            if (!pb_get_len(&c, &sp, &sn))
+                goto fail;
+            free(dm.rel_path);
+            dm.rel_path = malloc(sn + 1);
+            if (!dm.rel_path)
+                goto fail;
+            memcpy(dm.rel_path, sp, sn);
+            dm.rel_path[sn] = '\0';
+            break;
+        case 2: dm.uid = (uint32_t)pb_get_varint(&c); break;
+        case 3: dm.gid = (uint32_t)pb_get_varint(&c); break;
+        case 4: dm.mode = (uint32_t)pb_get_varint(&c); break;
+        case 5: dm.atime_ns = (int64_t)pb_get_varint(&c); break;
+        case 6: dm.mtime_ns = (int64_t)pb_get_varint(&c); break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    if (c.err)
+        goto fail;
+    if (!dm.rel_path) {
+        /* Empty rel_path (the root directory) is omitted on the wire by proto3;
+         * treat an absent field as "". */
+        dm.rel_path = calloc(1, 1);
+        if (!dm.rel_path)
+            goto fail;
+    }
+    if (it->n_dirs == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        struct dirmeta *nd = realloc(it->dirs, *cap * sizeof *nd);
+        if (!nd)
+            goto fail; /* originals stay owned by it (freed by caller) */
+        it->dirs = nd;
+    }
+    it->dirs[it->n_dirs++] = dm;
+    return true;
+fail:
+    free(dm.rel_path);
+    return false;
+}
+
+/* DirFixBatch { task_id=1, job_id=2, pass_no=3, dirs=4 (repeated DirMeta) }. */
+static bool dec_dirfix_batch(const uint8_t *p, size_t n, struct shard_item *it)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    size_t cap = 0;
+    const uint8_t *sp;
+    size_t sn;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1: it->shard_id = pb_get_varint(&c); break;
+        case 2: it->job_id = pb_get_varint(&c); break;
+        case 3: it->pass_no = (uint32_t)pb_get_varint(&c); break;
+        case 4:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_dir_meta(sp, sn, it, &cap))
+                return false;
+            break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err;
 }
 
 static bool dec_verify_batch(const uint8_t *p, size_t n, struct shard_item *it)
@@ -813,17 +898,17 @@ static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
             it.kind = WI_CHUNK;
             have_item = true;
             break;
+        case 6:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_dirfix_batch(sp, sn, &it))
+                goto fail;
+            it.kind = WI_DIRFIX;
+            have_item = true;
+            break;
         case 9:
             if (!pb_get_len(&c, &sp, &sn) || !dec_probe_task(sp, sn, &it))
                 goto fail;
             it.kind = WI_PROBE;
             have_item = true;
-            break;
-        case 6:
-            /* dirfix: later slice.
-             * Skipped; the lease expires and the coordinator re-queues. */
-            unsupported = true;
-            pb_skip(&c, wt);
             break;
         default: pb_skip(&c, wt);
         }

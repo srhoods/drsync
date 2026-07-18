@@ -813,15 +813,14 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel)
      * Ship the names as entry-list shards for fleet-wide fan-out instead of
      * statting and copying millions of entries in this one shard (§2.3).
      *
-     * The directory's OWN metadata must still be applied here — the fanned-out
-     * entrylist shards process the dir's ENTRIES, never the dir itself, and
-     * DIRFIX is currently a no-op, so without this the split dir's owner/mode/
-     * times/xattrs/ACLs never land. Those entrylist shards rename entries into
-     * this dir asynchronously, which bumps its mtime after we set it; on a
-     * non-final pass the mtime is therefore left dirty and the next pass
-     * re-applies it, and by the converging pass nothing is copied so it sticks
-     * (dir metadata converges over passes — the same property the non-split
-     * path relies on for cross-shard subdirectories). */
+     * The directory's OWN metadata is applied here — the fanned-out entrylist
+     * shards process the dir's ENTRIES, never the dir itself — but those shards
+     * rename entries into this dir asynchronously, which bumps its mtime after
+     * we set it. The DIRFIX phase (coordinator seeds a DirFixBatch from this
+     * dir's DIR_META record; agent dirfix.c re-applies it) fixes that once the
+     * pass has drained, so the mtime lands correctly within the same pass. The
+     * xattrs/ACLs applied here do not drift from renames, so DIRFIX need only
+     * re-apply owner/mode/times. */
     uint64_t split_at = split_threshold(ctx);
     if (split_at && sn > split_at) {
         split_entrylist(ctx, rel, sv, sn, dv, dn, dfd);

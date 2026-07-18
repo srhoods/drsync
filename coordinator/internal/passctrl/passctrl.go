@@ -4,6 +4,7 @@
 package passctrl
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"hash/fnv"
@@ -26,6 +27,9 @@ const deleteBatchSize = 1000
 
 // verifyBatchSize bounds entries per verify task.
 const verifyBatchSize = 500
+
+// dirfixBatchSize bounds directories per DirFixBatch task.
+const dirfixBatchSize = 1000
 
 type Controller struct {
 	st          *store.Store
@@ -179,9 +183,15 @@ func (c *Controller) advance(job *store.Job) error {
 			"job", job.Name, "pass", pass.PassNo)
 		return c.st.SetPassState(pass.ID, model.PassScanning)
 	case model.PassScanning:
-		// TODO(phase1): generate DirFixBatch tasks from the pass journal's
-		// DIR_META records (deepest-first) and insert as KindDirfix shards.
-		slog.Info("pass phase: SCANNING → DIRFIX", "job", job.Name, "pass", pass.PassNo)
+		// Seed DIRFIX shards from the pass journal's DIR_META records, THEN flip
+		// the phase — inserting first keeps the queue non-empty so a tick can't
+		// see DIRFIX drained and skip straight to VERIFY before the fixes run.
+		n, err := c.seedDirfix(job, pass)
+		if err != nil {
+			return err
+		}
+		slog.Info("pass phase: SCANNING → DIRFIX", "job", job.Name,
+			"pass", pass.PassNo, "dirs", n)
 		return c.st.SetPassState(pass.ID, model.PassDirfix)
 	case model.PassDirfix:
 		n, err := c.seedVerify(job, pass)
@@ -258,6 +268,68 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) (jobDone, 
 		return false, false, nil // operator triggers via POST /passes
 	}
 	return false, false, c.seedPass(job.ID, done.PassNo+1)
+}
+
+// seedDirfix builds DirFixBatch shards from this pass's DIR_META journal
+// records so directory metadata — knocked off its source value by cross-shard
+// renames into a directory during the walk — is re-applied once the pass has
+// drained. Like seedVerify it STREAMS the journal into fixed-size batches, so
+// memory is O(dirfixBatchSize), never O(directories-walked). Each batch is
+// sorted deepest-first (the order the proto documents); a global sort is
+// neither feasible at bounded memory nor meaningful, since batches execute
+// concurrently on different agents and applying one directory's metadata never
+// affects another's.
+func (c *Controller) seedDirfix(job *store.Job, pass *store.Pass) (int, error) {
+	total := 0
+	batch := make([]*drsyncpb.DirMeta, 0, dirfixBatchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		sort.SliceStable(batch, func(i, j int) bool {
+			return bytes.Count(batch[i].RelPath, []byte("/")) >
+				bytes.Count(batch[j].RelPath, []byte("/"))
+		})
+		payload, err := proto.Marshal(&drsyncpb.DirFixBatch{Dirs: batch})
+		if err != nil {
+			return err
+		}
+		if _, err := c.st.InsertShards(pass.ID, 0,
+			[]store.NewShard{{Kind: model.KindDirfix, Payload: payload}}); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	err := journal.ReadRecords(c.journalRoot, job.ID, pass.PassNo,
+		func(r *drsyncpb.JournalRecord) error {
+			if r.Type != drsyncpb.JournalRecord_JR_DIR_META || r.Src == nil {
+				return nil
+			}
+			// r.RelPath is a fresh slice per record (proto.Unmarshal copies bytes
+			// fields), so it is safe to retain past this callback.
+			batch = append(batch, &drsyncpb.DirMeta{
+				RelPath: r.RelPath,
+				Uid:     r.Src.Uid,
+				Gid:     r.Src.Gid,
+				Mode:    r.Src.Mode,
+				AtimeNs: r.Src.AtimeNs,
+				MtimeNs: r.Src.MtimeNs,
+			})
+			total++
+			if len(batch) >= dirfixBatchSize {
+				return flush()
+			}
+			return nil
+		})
+	if err != nil {
+		return 0, fmt.Errorf("read journal for dirfix: %w", err)
+	}
+	if err := flush(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // seedVerify builds VerifyBatch shards from this pass's own journal (D4):

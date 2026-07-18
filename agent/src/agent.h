@@ -255,6 +255,12 @@ void process_chunk(const struct shard_item *it);
  * ShardResult; gates pass start (docs/DESIGN-protocol.md §3.1 ProbeTask). */
 void process_probe(const struct shard_item *it);
 
+/* ---- dirfix executor (dirfix.c) ----
+ * Re-applies directory metadata from a DirFixBatch after a pass has drained, so
+ * a directory whose mtime was bumped by cross-shard renames lands on its source
+ * value (docs/DESIGN-coordinator.md §2.2 DIRFIX). */
+void process_dirfix(const struct shard_item *it);
+
 /* ---- walker (walker.c) ---- */
 /* Processes one shard end-to-end and enqueues its ShardResult. */
 void process_shard(const struct shard_item *it);
