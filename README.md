@@ -47,7 +47,15 @@ systemd, verification).
 
 ```bash
 go test ./...            # coordinator unit tests
+make -C agent test       # agent unit tests (glob matcher, fidelity, ucopy, temp naming)
+make webui-test          # console behaviour in jsdom (needs Node >= 20)
+make test-all            # go + console
 bash test/e2e.sh         # full lifecycle: sync, converge, verify, gated delete, CLI, events
 bash test/tls_e2e.sh     # mTLS + auth enforcement + reconnect-resume
 bash test/scale_e2e.sh   # entry-list (pathological dir) + chunked copy (huge file)
 ```
+
+CI (`.github/workflows/ci.yml`) runs gofmt, vet, build and the Go tests; the
+console tests; the agent build and its unit tests; and `test/e2e.sh`. The
+remaining e2e scripts are not wired in yet — they are the obvious next
+addition.

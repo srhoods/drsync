@@ -3,7 +3,11 @@
 GOBIN := $(shell go env GOPATH)/bin
 export PATH := $(GOBIN):$(PATH)
 
-.PHONY: all proto build test test-all webui-test vet clean tools
+# `agent` must be here: it names a target whose recipe builds the C agent, but
+# it is also the name of a directory. Without .PHONY, make sees that directory,
+# considers the target up to date, and silently skips the build — so on a fresh
+# clone `make build` produced no agent binary and e2e failed at agent launch.
+.PHONY: all proto build agent test test-all webui-test e2e vet clean tools
 
 all: proto build test
 
