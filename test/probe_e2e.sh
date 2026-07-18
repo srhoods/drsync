@@ -82,8 +82,12 @@ if [[ -d "$BADDST" ]] && find "$BADDST" -type f | grep -q .; then
     fail "bad-mount job copied files despite the missing source: $(find "$BADDST" -type f)"
 fi
 # The parked shard's error names the mount problem.
-"$DRSYNC" queue 2>/dev/null | grep -qi "root\|mount\|source" \
-    || fail "parked probe error does not mention the mount problem: $("$DRSYNC" queue)"
+# Capture first, then grep — piping straight into `grep -q` lets grep close the
+# pipe on its first match, so `drsync queue` takes SIGPIPE and `set -o pipefail`
+# reports the pipeline as failed even though the pattern matched.
+QUEUE_OUT=$("$DRSYNC" queue 2>/dev/null || true)
+grep -qi "root\|mount\|source" <<<"$QUEUE_OUT" \
+    || fail "parked probe error does not mention the mount problem: $QUEUE_OUT"
 echo "negative case OK: bad mount blocked at probe (pass held in PROBING, nothing copied)"
 
 # --- positive: healthy job passes the probe and converges ---------------------
