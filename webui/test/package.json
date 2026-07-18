@@ -1,0 +1,16 @@
+{
+  "name": "drsync-console-tests",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Behavioural tests for the drsync operations console (webui/console.html)",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -103,6 +103,12 @@ one whose session has dropped reads as *no longer connected*. The snapshot
 rides the heartbeat, so the panel states its age rather than implying it is
 live.
 
+## Tests
+
+`make webui-test` runs the console in jsdom against mocked coordinator
+responses and asserts on the rendered DOM — see `test/README.md`. `make test`
+stays Go-only; `make test-all` runs both.
+
 ## Notes
 
 All values rendered from coordinator data are HTML-escaped. This is not
