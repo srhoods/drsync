@@ -168,7 +168,12 @@ walk_shard(shard):
       case !s && d:            journal(ORPHAN, d)
       if s.is_dir:
         journal(DIR_META, s)                     # input for the DIRFIX phase
-        if budget > 0: push(work, s.rel); budget -= subtree_estimate
+        # Descent is recursive in the implementation, but bounded: past
+        # MAX_WALK_DEPTH (256) a subdir is shard_split rather than descended,
+        # so a pathologically deep chain is sharded across the fleet and
+        # re-walked at depth 0 instead of overflowing the walker stack.
+        if budget > 0 and depth < MAX_WALK_DEPTH:
+                       recurse(s.rel); budget -= subtree_estimate
         else:          shard_split(s.rel)        # push back to coordinator
     if entries(src_fd) > opts.dir_split_threshold mid-readdir:
         entry_list_split(...)                    # §2.3
