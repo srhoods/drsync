@@ -280,6 +280,18 @@ void process_shard(const struct shard_item *it);
 /* Processes one entry-list shard (a name slice of a pathological directory). */
 void process_entrylist(const struct shard_item *it);
 
+/* ---- destination temp names (tempname.c) ----
+ * "<prefix><job>-<pass>.<shard>.<seq>", hex. The (job, pass) tag marks a temp as
+ * this pass's live work: the orphan sweep reclaims prefix-matching destination
+ * entries as crash residue, and without the tag it cannot tell residue from a
+ * chunk temp whose group is still being assembled by other hosts. */
+void temp_name_fmt(char *out, size_t cap, const char *prefix, uint64_t job_id,
+                   uint32_t pass_no, uint64_t shard_id, unsigned seq);
+/* tail is a temp name with its prefix already stripped. False for anything that
+ * does not carry exactly this (job, pass) — including untagged legacy names,
+ * which stay reclaimable. */
+bool temp_tag_matches(const char *tail, uint64_t job_id, uint32_t pass_no);
+
 /* ---- shared fs helpers ---- */
 /* openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS) with component-walk fallback
  * (walker.c) — the traversal guarantee for everything under a job root */

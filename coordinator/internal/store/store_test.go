@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -831,5 +832,50 @@ func TestSchedulableAgents(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, []string{"a"}) {
 		t.Fatalf("schedulable = %v, want [a]", got)
+	}
+}
+
+// TestCreateJobDestinationConflictIsAtomic: the overlap check runs under the
+// same lock as the insert, so concurrent submits of overlapping destinations
+// cannot both land. Checking in the caller (as the API originally did) left a
+// window where each request read the table before either row was visible, and
+// both were created — exactly the two-jobs-one-tree state the check exists to
+// prevent.
+func TestCreateJobDestinationConflictIsAtomic(t *testing.T) {
+	s := openTest(t)
+	spec := func(name, dst string) []byte {
+		return []byte("apiVersion: drsync/v1\nkind: Job\nmetadata: { name: " + name +
+			" }\nspec:\n  source: { path: /src }\n  destination: { path: " + dst + " }\n")
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release them together to maximise overlap
+			name := fmt.Sprintf("j%d", i)
+			_, errs[i] = s.CreateJob(name, spec(name, "/dst/home"), false)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	created := 0
+	for i, err := range errs {
+		var dc *DestinationConflictError
+		switch {
+		case err == nil:
+			created++
+		case errors.As(err, &dc):
+		default:
+			t.Fatalf("job %d: unexpected error %v", i, err)
+		}
+	}
+	if created != 1 {
+		t.Fatalf("%d concurrent submits of the same destination created %d jobs, want 1", n, created)
 	}
 }

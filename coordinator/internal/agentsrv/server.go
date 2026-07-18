@@ -360,7 +360,7 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 // owns the temp name so every chunk (granted to different hosts) writes the
 // same destination temp, and chunk 0 alone creates+preallocates it.
 func (s *Server) planBigFiles(parentShardID int64, bigs []*drsyncpb.ShardSplit_BigFile) ([]store.NewShard, []store.NewChunkGroup, error) {
-	jobID, err := s.st.ShardJobID(parentShardID)
+	jobID, passNo, err := s.st.ShardJobPass(parentShardID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -387,8 +387,17 @@ func (s *Server) planBigFiles(parentShardID int64, bigs []*drsyncpb.ShardSplit_B
 		}
 		// Temp name is stable across chunk retries and unique per file within
 		// the pass: base it on the parent shard and the file's index. The
-		// temp_prefix keeps it reclaimable as crash residue on the next walk.
-		temp := fmt.Sprintf("%s%x.%x", prefix, parentShardID, i)
+		// leading "<job>-<pass>." tag is what keeps the temp SAFE while its
+		// chunks run: an agent walking this directory reclaims prefix-matching
+		// destination orphans, and without the tag it cannot tell a live chunk
+		// temp from crash residue — a parent walk shard that is requeued (lease
+		// lapse, journal-ack timeout) re-walks the directory while the chunk
+		// group it already fanned out is still writing, unlinks the temp, and
+		// the finalize fails with "open temp for finalize" (or, if the unlink
+		// lands mid-group, later chunks O_CREAT it back and finalize renames a
+		// hole-ridden file into place). Agents skip temps carrying their own
+		// (job, pass); everything else is residue and is reclaimed.
+		temp := fmt.Sprintf("%s%x-%x.%x.%x", prefix, jobID, passNo, parentShardID, i)
 		gen := &drsyncpb.FileGen{Size: bf.Size, MtimeNs: bf.MtimeNs}
 		for c := 0; c < nChunks; c++ {
 			off := uint64(c) * chunkSize
@@ -484,7 +493,15 @@ func (s *Server) completeChunk(passID, shardID, leaseID int64, payload []byte, r
 	if err := proto.Unmarshal(payload, &ct); err != nil {
 		return err
 	}
-	if ct.Finalize {
+	if ct.Reclaim {
+		// Post-drain temp cleanup, not part of the group's assembly: it must not
+		// touch n_done (which would re-seed a finalize for a group that has
+		// none) or the group's state. Complete it like any ordinary shard.
+		blob, _ := proto.Marshal(r)
+		if err := s.st.CompleteShard(shardID, leaseID, blob); err != nil {
+			return err
+		}
+	} else if ct.Finalize {
 		if err := s.st.CompleteFinalizeChunk(shardID, leaseID, passID, ct.RelPath); err != nil {
 			return err
 		}

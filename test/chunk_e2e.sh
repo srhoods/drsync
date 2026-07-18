@@ -11,8 +11,14 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/test/lib.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/drsync-chunk.XXXXXX")
-CP=${CP:-17600}; HP=${HP:-17601}
+# Ports come from the kernel (test/lib.sh), not a hardcoded pair: fixed ports
+# collide with anything already listening — including another checkout's
+# coordinator — and several of these scripts used to share the same pair, so
+# they could not run side by side. Override with CP/HP to pin them.
+read -r _CP _HP < <(pick_ports)
+CP=${CP:-$_CP}; HP=${HP:-$_HP}
 API="http://127.0.0.1:${HP}"; AUTH="Authorization: Bearer chunktok"
 AGENTS=(chunk-a chunk-b chunk-c)
 PASS=0
@@ -50,8 +56,7 @@ H_MODE=$(stat -c '%a' "$SRC/huge.bin"); H_MTIME=$(stat -c '%Y' "$SRC/huge.bin")
     -listen-http 127.0.0.1:$HP -api-token chunktok -log-level warn \
     >"$WORK/coord.log" 2>&1 &
 CPID=$!
-for _ in $(seq 1 40); do curl -sf "$API/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
-curl -sf "$API/healthz" >/dev/null || fail "coordinator did not come up"
+wait_coordinator "$API" "$AUTH" || exit 1
 APIDS=""
 for a in "${AGENTS[@]}"; do
     "$ROOT/agent/bin/drsync-agent" -c 127.0.0.1:$CP -i "$a" -w 2 -C 4 \
@@ -59,7 +64,11 @@ for a in "${AGENTS[@]}"; do
     APIDS="$APIDS $!"
 done
 for _ in $(seq 1 40); do
-    n=$(curl -sf -H "$AUTH" "$API/api/v1/agents" | grep -o '"connected":true' | wc -l)
+    # grep -o|wc counts OCCURRENCES (the payload is a single JSON line, so
+    # grep -c would cap at 1). The `|| true` keeps a no-match grep — normal
+    # while agents are still connecting — from aborting the script via
+    # pipefail+set -e instead of retrying; same trap e2e.sh documents on has().
+    n=$(curl -sf -H "$AUTH" "$API/api/v1/agents" | { grep -o '"connected":true' || true; } | wc -l)
     [[ "$n" -eq 3 ]] && break; sleep 0.25
 done
 [[ "${n:-0}" -eq 3 ]] || fail "expected 3 connected agents, got ${n:-0}"

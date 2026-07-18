@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,6 +26,30 @@ import (
 const MaxShardAttempts = 5
 
 var ErrLeaseMismatch = errors.New("lease mismatch or shard not leased")
+
+// DestinationConflictError reports a job whose destination tree overlaps the
+// one being submitted or started. Callers surface Other so the operator knows
+// which job to finish or cancel.
+type DestinationConflictError struct {
+	Other    string // the job already holding the tree
+	OtherDst string
+	Dst      string
+}
+
+func (e *DestinationConflictError) Error() string {
+	return fmt.Sprintf("destination %q overlaps job %q (%s)", e.Dst, e.Other, e.OtherDst)
+}
+
+// JobStatesHoldingDestination are the states in which a job may still write to
+// its destination. CREATED/READY have not started but are about to, and a
+// PAUSED job's in-flight leases can still be draining; the terminal states
+// write nothing, so their tree is free to be re-synced by another job.
+var JobStatesHoldingDestination = []model.JobState{
+	model.JobCreated, model.JobReady, model.JobRunning, model.JobPaused,
+}
+
+// JobStatesRunning are the states in which a job is actually executing work.
+var JobStatesRunning = []model.JobState{model.JobRunning, model.JobPaused}
 
 type Store struct {
 	db  *sql.DB    // single writer connection; all mutations serialize on mu
@@ -228,9 +253,69 @@ type Job struct {
 	UpdatedAt int64
 }
 
+// DestinationConflict returns a *DestinationConflictError if any job in one of
+// states (other than excludeName) has a destination tree overlapping dst.
+//
+// Two jobs writing into one tree damage each other: an agent's orphan sweep
+// reclaims .drsync.tmp entries it finds in the destination and recognises only
+// its own job+pass as live work, so one job's chunk temp — present for the whole
+// multi-host assembly of a big file — reads as stray residue to the other's walk
+// of that directory and is unlinked underneath it.
+func (s *Store) DestinationConflict(excludeName, dst string, states ...model.JobState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.destinationConflictLocked(excludeName, dst, states)
+}
+
+func (s *Store) destinationConflictLocked(excludeName, dst string, states []model.JobState) error {
+	want := make(map[model.JobState]bool, len(states))
+	for _, st := range states {
+		want[st] = true
+	}
+	rows, err := s.rdb.Query(`SELECT name, state, spec_yaml FROM jobs`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, state string
+		var specYAML []byte
+		if err := rows.Scan(&name, &state, &specYAML); err != nil {
+			return err
+		}
+		if name == excludeName || !want[model.JobState(state)] {
+			continue
+		}
+		other, err := model.ParseSpec(specYAML)
+		if err != nil {
+			// A stored spec that no longer parses (downgrade, hand-edited row)
+			// must not wedge every future submit; it also cannot be compared.
+			slog.Warn("skipping unparsable stored spec in destination check",
+				"job", name, "err", err)
+			continue
+		}
+		if model.PathsOverlap(dst, other.Spec.Destination.Path) {
+			return &DestinationConflictError{
+				Other: name, OtherDst: other.Spec.Destination.Path, Dst: dst}
+		}
+	}
+	return rows.Err()
+}
+
+// CreateJob inserts a READY job. The destination-overlap check runs under the
+// same lock as the insert: checking in the caller would let two concurrent
+// submits of overlapping destinations both pass before either row lands.
 func (s *Store) CreateJob(name string, specYAML []byte, dryRun bool) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	spec, err := model.ParseSpec(specYAML)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.destinationConflictLocked(name, spec.Spec.Destination.Path,
+		JobStatesHoldingDestination); err != nil {
+		return nil, err
+	}
 	now := nowMS()
 	res, err := s.db.Exec(
 		`INSERT INTO jobs (name, spec_yaml, state, dry_run, created_at, updated_at) VALUES (?,?,?,?,?,?)`,
@@ -610,12 +695,46 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard, 
 	return ids, tx.Commit()
 }
 
-// ShardJobID resolves the job that owns a shard (via its pass).
-func (s *Store) ShardJobID(shardID int64) (int64, error) {
-	var jobID int64
-	err := s.rdb.QueryRow(`SELECT p.job_id FROM shards s
-		JOIN passes p ON p.id = s.pass_id WHERE s.id = ?`, shardID).Scan(&jobID)
-	return jobID, err
+// ShardJobPass resolves the job and pass number that own a shard. Both are
+// needed to name a chunk temp: the (job, pass) pair is what an agent's orphan
+// sweep compares against to tell a live temp from crash residue.
+func (s *Store) ShardJobPass(shardID int64) (jobID, passNo int64, err error) {
+	err = s.rdb.QueryRow(`SELECT p.job_id, p.pass_no FROM shards s
+		JOIN passes p ON p.id = s.pass_id WHERE s.id = ?`, shardID).Scan(&jobID, &passNo)
+	return jobID, passNo, err
+}
+
+// ChunkTemp is one chunk group's destination temp: the file's path and the
+// coordinator-assigned temp name that lives in the file's parent directory.
+type ChunkTemp struct {
+	RelPath  string
+	TempName string
+}
+
+// UnfinalizedChunkTemps lists the temps of a pass's chunk groups that never
+// reached 'done' — aborted mid-assembly on source drift, in practice. Their
+// temps are pure residue, but the agent orphan sweep will not reclaim a temp
+// tagged with the pass it is running (that rule is what stops a re-walk from
+// deleting a group's temp while its chunks are still writing), so a job whose
+// last pass this is would leave them behind forever. Call only once a pass's
+// scan phase has drained: with no chunk shard queued or leased, no name here
+// can still be in use.
+func (s *Store) UnfinalizedChunkTemps(passID int64) ([]ChunkTemp, error) {
+	rows, err := s.rdb.Query(`SELECT rel_path, temp_name FROM chunk_groups
+		WHERE pass_id = ? AND state != 'done'`, passID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChunkTemp
+	for rows.Next() {
+		var t ChunkTemp
+		if err := rows.Scan(&t.RelPath, &t.TempName); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
 }
 
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for

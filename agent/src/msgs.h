@@ -175,6 +175,11 @@ struct chunk_info {
     int64_t  gen_mtime_ns;  /* ...size/mtime pair (RESULT_SRC_CHANGED) */
     bool     create_temp;   /* this chunk creates + preallocates the temp */
     bool     finalize;      /* fsync + metadata + rename; no byte range */
+    bool     reclaim;       /* unlink the temp; no byte range, no source read.
+                             * Post-drain cleanup for a group that never
+                             * finalized — the walk sweep spares temps tagged
+                             * with the running pass, so nothing else collects
+                             * these before the job ends. */
     char    *temp_name;     /* malloc'd; owner frees */
 };
 

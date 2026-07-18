@@ -46,6 +46,15 @@ func writeJournal(t *testing.T, jw *journal.Writer, jobID int64, passNo int,
 	}
 }
 
+const jobSpecYAML = `
+apiVersion: drsync/v1
+kind: Job
+metadata: { name: j }
+spec:
+  source: { path: /src }
+  destination: { path: /dst }
+`
+
 func rec(typ drsyncpb.JournalRecord_Type, rel, detail string, errno int32) *drsyncpb.JournalRecord {
 	return &drsyncpb.JournalRecord{Type: typ, RelPath: []byte(rel), Detail: detail, Errno: errno}
 }
@@ -61,7 +70,7 @@ func setup(t *testing.T) (*Server, int64) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	job, err := st.CreateJob("j", []byte("spec"), false)
+	job, err := st.CreateJob("j", []byte(jobSpecYAML), false)
 	if err != nil {
 		t.Fatal(err)
 	}

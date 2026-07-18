@@ -4,9 +4,15 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/test/lib.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/drsync-e2e.XXXXXX")
-COORD_PORT=${COORD_PORT:-17540}
-HTTP_PORT=${HTTP_PORT:-17541}
+# Ports come from the kernel (test/lib.sh), not a hardcoded pair: fixed ports
+# collide with anything already listening — including another checkout's
+# coordinator — and several of these scripts used to share the same pair, so
+# they could not run side by side. Override to pin them.
+read -r _CP _HP < <(pick_ports)
+COORD_PORT=${COORD_PORT:-$_CP}
+HTTP_PORT=${HTTP_PORT:-$_HP}
 API="http://127.0.0.1:${HTTP_PORT}"
 AUTH="Authorization: Bearer e2etoken"
 PASS=0
@@ -99,10 +105,7 @@ echo "residue" > "$DST/projects/.drsync.tmp.deadbeef.1"            # must be rec
     -listen-agent "127.0.0.1:${COORD_PORT}" -listen-http "127.0.0.1:${HTTP_PORT}" \
     -api-token e2etoken -log-level warn >"$WORK/coord.log" 2>&1 &
 COORD_PID=$!
-for _ in $(seq 1 40); do
-    curl -sf "$API/healthz" >/dev/null 2>&1 && break; sleep 0.25
-done
-curl -sf "$API/healthz" >/dev/null || fail "coordinator did not come up"
+wait_coordinator "$API" "$AUTH" || exit 1
 
 "$ROOT/agent/bin/drsync-agent" -c "127.0.0.1:${COORD_PORT}" -i agent-e2e -w 4 \
     >"$WORK/agent.log" 2>&1 &
@@ -222,7 +225,9 @@ VF=$(echo "$JOB" | grep -o '"verify_fail":[0-9]*' | tr -dc '0-9\n' | sort -u | t
 [[ "${V1:-0}" -ge "$P1" ]] || fail "pass1 verified only ${V1:-0} of $P1 copied entries"
 echo "$JOB" | grep -q '"verify_fail":[1-9]' && fail "verify failures reported: $JOB"
 
-N_PASSES=$(echo "$JOB" | grep -o '"pass_no":' | wc -l)
+# counts occurrences, not lines; `|| true` stops a no-match grep from
+# aborting the script under pipefail + set -e.
+N_PASSES=$(echo "$JOB" | { grep -o '"pass_no":' || true; } | wc -l)
 echo "sync converged in $N_PASSES passes (pass1 copied $P1 files), fidelity checks OK"
 
 # --- operator surface: CLI + events + query endpoints --------------------------

@@ -257,6 +257,16 @@ func (s *JobSpec) SpreadPolicy() SpreadPolicy {
 	}
 }
 
+// PathsOverlap reports whether two absolute paths are equal or one contains the
+// other. Comparison is on whole path components — appending "/" to both is what
+// keeps /dst/a and /dst/ab from reading as nested — so it is a containment test,
+// not a string-prefix test.
+func PathsOverlap(a, b string) bool {
+	ca := strings.TrimRight(a, "/") + "/"
+	cb := strings.TrimRight(b, "/") + "/"
+	return ca == cb || strings.HasPrefix(ca, cb) || strings.HasPrefix(cb, ca)
+}
+
 func (s *JobSpec) Validate() error {
 	if s.APIVersion != "drsync/v1" {
 		return fmt.Errorf("apiVersion must be drsync/v1, got %q", s.APIVersion)
@@ -274,8 +284,7 @@ func (s *JobSpec) Validate() error {
 	if !strings.HasPrefix(src, "/") || !strings.HasPrefix(dst, "/") {
 		return fmt.Errorf("source and destination paths must be absolute")
 	}
-	cs, cd := strings.TrimRight(src, "/")+"/", strings.TrimRight(dst, "/")+"/"
-	if cs == cd || strings.HasPrefix(cs, cd) || strings.HasPrefix(cd, cs) {
+	if PathsOverlap(src, dst) {
 		return fmt.Errorf("source and destination must be disjoint")
 	}
 	// Bounds mirror the agent's fixed-size filter table (FILTER_MAX_RULES /

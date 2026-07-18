@@ -54,14 +54,57 @@ func (c *Controller) StartJob(name string) error {
 	switch job.State {
 	case model.JobReady:
 	case model.JobPaused:
+		if err := c.destinationFree(job); err != nil {
+			return err
+		}
 		return c.st.SetJobState(job.ID, model.JobRunning)
 	default:
 		return fmt.Errorf("job %q is %s; expected READY", name, job.State)
+	}
+	if err := c.destinationFree(job); err != nil {
+		return err
 	}
 	if err := c.st.SetJobState(job.ID, model.JobRunning); err != nil {
 		return err
 	}
 	return c.seedPass(job.ID, 1)
+}
+
+// ResumeJob returns a PAUSED job to RUNNING. It exists so resume goes through
+// the same destination check as start: while the job was paused another job may
+// have taken over its tree, and resuming into that is the corruption this gate
+// prevents.
+func (c *Controller) ResumeJob(name string) error {
+	job, err := c.st.GetJob(name)
+	if err != nil {
+		return fmt.Errorf("job %q: %w", name, err)
+	}
+	if job.State != model.JobPaused {
+		return fmt.Errorf("job %q is %s; expected PAUSED", name, job.State)
+	}
+	if err := c.destinationFree(job); err != nil {
+		return err
+	}
+	return c.st.SetJobState(job.ID, model.JobRunning)
+}
+
+// destinationFree refuses to start a job whose destination tree is being
+// written by another running job. Submit already rejects overlapping
+// destinations, so this is a backstop rather than the primary gate — but it is
+// the one that holds when submit could not: jobs created before that check
+// existed, and two overlapping submits racing (each passes its check before the
+// other's row is visible, though CreateJob now closes that window by checking
+// under the insert's lock).
+//
+// Only RUNNING/PAUSED count here. A READY job has not started, so blocking on
+// one would deadlock two jobs that each refuse to go first.
+func (c *Controller) destinationFree(job *store.Job) error {
+	spec, err := model.ParseSpec(job.SpecYAML)
+	if err != nil {
+		return fmt.Errorf("job %q: %w", job.Name, err)
+	}
+	return c.st.DestinationConflict(job.Name, spec.Spec.Destination.Path,
+		store.JobStatesRunning...)
 }
 
 func (c *Controller) seedPass(jobID int64, passNo int) error {
@@ -183,6 +226,17 @@ func (c *Controller) advance(job *store.Job) error {
 			"job", job.Name, "pass", pass.PassNo)
 		return c.st.SetPassState(pass.ID, model.PassScanning)
 	case model.PassScanning:
+		// Reclaim the temps of chunk groups that never finalized. Safe exactly
+		// here and nowhere earlier: the drain check above proves no chunk shard
+		// of this pass is queued or leased, so no name being unlinked can still
+		// be in use. The agent sweep cannot do this itself — it skips temps
+		// tagged with the pass it is running, which is what stops a re-walk
+		// from deleting a group's temp mid-assembly — so without this a job
+		// ending on this pass would leave them in the destination for good.
+		r, err := c.seedTempReclaim(pass)
+		if err != nil {
+			return err
+		}
 		// Seed DIRFIX shards from the pass journal's DIR_META records, THEN flip
 		// the phase — inserting first keeps the queue non-empty so a tick can't
 		// see DIRFIX drained and skip straight to VERIFY before the fixes run.
@@ -191,7 +245,7 @@ func (c *Controller) advance(job *store.Job) error {
 			return err
 		}
 		slog.Info("pass phase: SCANNING → DIRFIX", "job", job.Name,
-			"pass", pass.PassNo, "dirs", n)
+			"pass", pass.PassNo, "dirs", n, "temps_reclaimed", r)
 		return c.st.SetPassState(pass.ID, model.PassDirfix)
 	case model.PassDirfix:
 		n, err := c.seedVerify(job, pass)
@@ -279,6 +333,46 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) (jobDone, 
 // neither feasible at bounded memory nor meaningful, since batches execute
 // concurrently on different agents and applying one directory's metadata never
 // affects another's.
+// seedTempReclaim queues one reclaim chunk task per chunk group of the pass
+// that never finalized, unlinking the temp it left in the destination. Returns
+// how many were queued.
+//
+// These are the groups aborted on source drift (DESIGN-coordinator.md §4): no
+// finalize is seeded, so the partially assembled temp is left behind. It used
+// to be swept by the next walk that reached the directory, but the agent sweep
+// now deliberately spares any temp carrying the pass it is running — the rule
+// that stops a re-walk from deleting a group's temp while its chunks are still
+// writing — so the residue survives its own pass by design, and a job that ends
+// on this pass would never collect it.
+//
+// The caller must have established that the pass's scan phase has drained
+// (advance's queued+leased check). That is what makes unlinking these names
+// safe rather than a heuristic: nothing is left running that could still be
+// writing to one.
+func (c *Controller) seedTempReclaim(pass *store.Pass) (int, error) {
+	temps, err := c.st.UnfinalizedChunkTemps(pass.ID)
+	if err != nil {
+		return 0, err
+	}
+	shards := make([]store.NewShard, 0, len(temps))
+	for _, t := range temps {
+		payload, err := proto.Marshal(&drsyncpb.ChunkTask{
+			RelPath: t.RelPath, TempName: t.TempName, Reclaim: true})
+		if err != nil {
+			return 0, err
+		}
+		shards = append(shards, store.NewShard{
+			Kind: model.KindChunk, RelPath: t.RelPath, Payload: payload})
+	}
+	if len(shards) == 0 {
+		return 0, nil
+	}
+	if _, err := c.st.InsertShards(pass.ID, 0, shards); err != nil {
+		return 0, err
+	}
+	return len(shards), nil
+}
+
 func (c *Controller) seedDirfix(job *store.Job, pass *store.Pass) (int, error) {
 	total := 0
 	batch := make([]*drsyncpb.DirMeta, 0, dirfixBatchSize)

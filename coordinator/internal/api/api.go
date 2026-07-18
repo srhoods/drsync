@@ -221,12 +221,29 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	dryRun := r.URL.Query().Get("dry_run") == "true"
 	job, err := s.st.CreateJob(spec.Metadata.Name, body, dryRun)
+	var dc *store.DestinationConflictError
+	if errors.As(err, &dc) {
+		httpErr(w, http.StatusConflict, "%s", destConflictMsg(dc))
+		return
+	}
 	if err != nil {
 		httpErr(w, http.StatusConflict, "create job: %v", err)
 		return
 	}
 	slog.Info("job submitted", "job", job.Name, "dry_run", dryRun)
 	writeJSON(w, http.StatusCreated, jobView{Name: job.Name, State: job.State, DryRun: job.DryRun})
+}
+
+// destConflictMsg explains an overlapping destination in operator terms: what
+// breaks, and the two ways out.
+func destConflictMsg(dc *store.DestinationConflictError) string {
+	return fmt.Sprintf(
+		"destination %q overlaps the destination of job %q (%s), which is still live. "+
+			"Two jobs writing into one tree corrupt each other's in-progress files: each "+
+			"reclaims the other's .drsync.tmp temps as stray residue, so a large file being "+
+			"assembled by one job can be truncated or lost by the other. Finish or cancel %q, "+
+			"or use a destination outside that tree.",
+		dc.Dst, dc.Other, dc.OtherDst, dc.Other)
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +382,7 @@ func (s *Server) jobAction(action string) http.HandlerFunc {
 		case "pause":
 			err = s.setState(name, model.JobRunning, model.JobPaused)
 		case "resume":
-			err = s.setState(name, model.JobPaused, model.JobRunning)
+			err = s.pc.ResumeJob(name) // same destination gate as start
 		case "cancel":
 			var job *store.Job
 			if job, err = s.st.GetJob(name); err == nil {
@@ -374,6 +391,11 @@ func (s *Server) jobAction(action string) http.HandlerFunc {
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			httpErr(w, http.StatusNotFound, "no such job")
+			return
+		}
+		var dc *store.DestinationConflictError
+		if errors.As(err, &dc) {
+			httpErr(w, http.StatusConflict, "cannot %s: %s", action, destConflictMsg(dc))
 			return
 		}
 		if err != nil {

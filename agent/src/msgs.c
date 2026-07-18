@@ -848,6 +848,7 @@ static bool dec_chunk_task(const uint8_t *p, size_t n, struct shard_item *it)
             it->chunk.temp_name[sn] = '\0';
             break;
         case 10: it->chunk.finalize = pb_get_varint(&c) != 0; break;
+        case 11: it->chunk.reclaim = pb_get_varint(&c) != 0; break;
         default: pb_skip(&c, wt);
         }
     }

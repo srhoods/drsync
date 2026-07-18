@@ -9,8 +9,14 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/test/lib.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/drsync-scale.XXXXXX")
-CP=${CP:-17580}; HP=${HP:-17581}
+# Ports come from the kernel (test/lib.sh), not a hardcoded pair: fixed ports
+# collide with anything already listening — including another checkout's
+# coordinator — and several of these scripts used to share the same pair, so
+# they could not run side by side. Override with CP/HP to pin them.
+read -r _CP _HP < <(pick_ports)
+CP=${CP:-$_CP}; HP=${HP:-$_HP}
 API="http://127.0.0.1:${HP}"; AUTH="Authorization: Bearer scaletok"
 PASS=0
 cleanup() {
@@ -53,8 +59,7 @@ BD_MODE=$(stat -c '%a' "$SRC/bigdir"); BD_MTIME=$(stat -c '%Y' "$SRC/bigdir")
     -listen-http 127.0.0.1:$HP -api-token scaletok -log-level warn \
     >"$WORK/coord.log" 2>&1 &
 CPID=$!
-for _ in $(seq 1 40); do curl -sf "$API/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
-curl -sf "$API/healthz" >/dev/null || fail "coordinator did not come up"
+wait_coordinator "$API" "$AUTH" || exit 1
 "$ROOT/agent/bin/drsync-agent" -c 127.0.0.1:$CP -i scale-agent -w 4 -C 8 \
     >"$WORK/agent.log" 2>&1 &
 APID=$!

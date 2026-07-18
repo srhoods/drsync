@@ -492,11 +492,13 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
         walk_err(ctx, "open src", name);
         return;
     }
+    /* The (job, pass) tag in the name keeps a concurrent walk's orphan sweep
+     * from reclaiming this temp as crash residue while we are writing it. */
     char tmp[NAME_MAX + 1];
     unsigned seq = __atomic_fetch_add(&ctx->tmp_seq, 1, __ATOMIC_RELAXED);
-    snprintf(tmp, sizeof tmp, "%s%llx.%x",
-             o->temp_prefix[0] ? o->temp_prefix : ".drsync.tmp.",
-             (unsigned long long)ctx->it->shard_id, seq);
+    temp_name_fmt(tmp, sizeof tmp,
+                  o->temp_prefix[0] ? o->temp_prefix : ".drsync.tmp.",
+                  ctx->it->job_id, ctx->it->pass_no, ctx->it->shard_id, seq);
     int out = openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (out < 0) {
         walk_err(ctx, "create temp", name);

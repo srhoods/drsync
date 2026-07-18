@@ -255,7 +255,8 @@ Per copy task (one file, or one chunk of a large file):
 
 ```
 1. open src O_RDONLY|O_NOFOLLOW; statx snapshot → gen = (size, mtime)
-2. open dst temp: parent_fd + ".drsync.tmp.<taskid>"  O_CREAT|O_EXCL|O_WRONLY
+2. open dst temp: parent_fd + ".drsync.tmp.<job>-<pass>.<shard>.<seq>"
+                                                      O_CREAT|O_EXCL|O_WRONLY
    (chunks: shared temp file created by first chunk via coordinator-sequenced
     creator task; others open existing temp, pwrite their range)
 3. fallocate(dst, 0, 0, size)                     # contiguity + early ENOSPC
@@ -275,7 +276,22 @@ Per copy task (one file, or one chunk of a large file):
 
 - **Crash residue:** orphaned `.drsync.tmp.*` files are recognized by name pattern and
   reclaimed/deleted by the next walk of that directory (they never match source names,
-  so they appear as orphans with special handling: always deleted, even in report mode).
+  so they appear as orphans with special handling: always deleted, even in report mode)
+  — *except* temps tagged with the sweeping shard's own `<job>-<pass>`, which are live
+  work elsewhere in the fleet, not residue. The tag exists because a chunked file's
+  temp sits in the destination for the whole multi-host copy, and its directory can be
+  re-walked meanwhile (parent walk shard requeued after a lease lapse or journal-ack
+  timeout, with the chunk group deliberately kept rather than re-fanned). Reclaiming it
+  then failed the finalize with `open temp for finalize`, or — mid-group — let the
+  remaining chunks recreate the temp and finalize rename a hole-ridden file into place.
+  Untagged temps from a pre-tag build remain reclaimable; a tagged temp orphaned by a
+  crash is reclaimed by the next pass, whose pass number no longer matches. A chunk
+  group abandoned mid-assembly (source drift) does not wait that long: the coordinator
+  seeds a **reclaim** chunk task (`ChunkTask.reclaim` — unlink `temp_name`, no source
+  read, no metadata) once the pass's scan phase has drained and nothing can still be
+  writing to the name. The tag is parsed strictly — lowercase hex digits only, no sign,
+  whitespace or `0x` — since a false "live" reading would protect a file from reclaim
+  forever.
 - **Atomicity contract:** readers of the destination never observe a half-copied file
   under its final name — rename is the commit point. (Chunked files: finalize task does
   steps 6–9 once all chunks report done; `chunk_sets` tracking in the coordinator.)

@@ -2311,17 +2311,23 @@ func (x *EntryListShard) GetOverrides() *WalkOverrides {
 }
 
 type ChunkTask struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TaskId        uint64                 `protobuf:"varint,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	JobId         uint64                 `protobuf:"varint,2,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	PassNo        uint32                 `protobuf:"varint,3,opt,name=pass_no,json=passNo,proto3" json:"pass_no,omitempty"`
-	RelPath       string                 `protobuf:"bytes,4,opt,name=rel_path,json=relPath,proto3" json:"rel_path,omitempty"`
-	Offset        uint64                 `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
-	Length        uint64                 `protobuf:"varint,6,opt,name=length,proto3" json:"length,omitempty"`
-	Gen           *FileGen               `protobuf:"bytes,7,opt,name=gen,proto3" json:"gen,omitempty"`                                  // abort + SRC_CHANGED if source no longer matches
-	CreateTemp    bool                   `protobuf:"varint,8,opt,name=create_temp,json=createTemp,proto3" json:"create_temp,omitempty"` // this chunk creates the shared temp file
-	TempName      string                 `protobuf:"bytes,9,opt,name=temp_name,json=tempName,proto3" json:"temp_name,omitempty"`        // coordinator-assigned, stable across chunk retries
-	Finalize      bool                   `protobuf:"varint,10,opt,name=finalize,proto3" json:"finalize,omitempty"`                      // fsync + metadata + rename (granted when all chunks done)
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	TaskId     uint64                 `protobuf:"varint,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	JobId      uint64                 `protobuf:"varint,2,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	PassNo     uint32                 `protobuf:"varint,3,opt,name=pass_no,json=passNo,proto3" json:"pass_no,omitempty"`
+	RelPath    string                 `protobuf:"bytes,4,opt,name=rel_path,json=relPath,proto3" json:"rel_path,omitempty"`
+	Offset     uint64                 `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
+	Length     uint64                 `protobuf:"varint,6,opt,name=length,proto3" json:"length,omitempty"`
+	Gen        *FileGen               `protobuf:"bytes,7,opt,name=gen,proto3" json:"gen,omitempty"`                                  // abort + SRC_CHANGED if source no longer matches
+	CreateTemp bool                   `protobuf:"varint,8,opt,name=create_temp,json=createTemp,proto3" json:"create_temp,omitempty"` // this chunk creates the shared temp file
+	TempName   string                 `protobuf:"bytes,9,opt,name=temp_name,json=tempName,proto3" json:"temp_name,omitempty"`        // coordinator-assigned, stable across chunk retries
+	Finalize   bool                   `protobuf:"varint,10,opt,name=finalize,proto3" json:"finalize,omitempty"`                      // fsync + metadata + rename (granted when all chunks done)
+	// Unlink temp_name and nothing else. Seeded once the pass's scan phase has
+	// drained, for groups that never finalized (source drifted mid-assembly), so
+	// their temp does not outlive the job: the agent orphan sweep deliberately
+	// will not reclaim a temp tagged with the pass it is running, and a job that
+	// ends on this pass has no later pass to do it.
+	Reclaim       bool `protobuf:"varint,11,opt,name=reclaim,proto3" json:"reclaim,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2422,6 +2428,13 @@ func (x *ChunkTask) GetTempName() string {
 func (x *ChunkTask) GetFinalize() bool {
 	if x != nil {
 		return x.Finalize
+	}
+	return false
+}
+
+func (x *ChunkTask) GetReclaim() bool {
+	if x != nil {
+		return x.Reclaim
 	}
 	return false
 }
@@ -4408,7 +4421,7 @@ const file_drsync_proto_rawDesc = "" +
 	"\apass_no\x18\x03 \x01(\rR\x06passNo\x12\x17\n" +
 	"\adir_rel\x18\x04 \x01(\tR\x06dirRel\x12\x14\n" +
 	"\x05names\x18\x05 \x03(\fR\x05names\x126\n" +
-	"\toverrides\x18\x06 \x01(\v2\x18.drsync.v1.WalkOverridesR\toverrides\"\x9f\x02\n" +
+	"\toverrides\x18\x06 \x01(\v2\x18.drsync.v1.WalkOverridesR\toverrides\"\xb9\x02\n" +
 	"\tChunkTask\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\x04R\x06taskId\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\x04R\x05jobId\x12\x17\n" +
@@ -4421,7 +4434,8 @@ const file_drsync_proto_rawDesc = "" +
 	"createTemp\x12\x1b\n" +
 	"\ttemp_name\x18\t \x01(\tR\btempName\x12\x1a\n" +
 	"\bfinalize\x18\n" +
-	" \x01(\bR\bfinalize\"\x92\x01\n" +
+	" \x01(\bR\bfinalize\x12\x18\n" +
+	"\areclaim\x18\v \x01(\bR\areclaim\"\x92\x01\n" +
 	"\aDirMeta\x12\x19\n" +
 	"\brel_path\x18\x01 \x01(\fR\arelPath\x12\x10\n" +
 	"\x03uid\x18\x02 \x01(\rR\x03uid\x12\x10\n" +

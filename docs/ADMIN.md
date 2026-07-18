@@ -69,7 +69,26 @@ and delete phases. Browse it with `drsync journal` / `drsync errors`.
   counted as a *fidelity exception* (or fails the entry under policy), never
   silently dropped. `security.selinux` is deliberately excluded.
 - **`.drsync.tmp.*` temp files** are drsync's own; crash residue is reclaimed
-  automatically on the next walk.
+  automatically. The name carries the job and pass that created it
+  (`.drsync.tmp.<job>-<pass>.<shard>.<seq>`, hex), so a pass never deletes a
+  temp its own in-flight copies — including the long-lived temp of a big file
+  being assembled across several hosts — are still writing. Consequently a
+  temp is collected either by the next pass (whose pass number no longer
+  matches) or, for a big file whose assembly was abandoned when its source
+  drifted, by a reclaim task the coordinator seeds as soon as the pass's scan
+  phase has drained. The one case that can outlive a job is a temp left by an
+  agent that died mid-copy during the job's *final* pass: no later pass runs to
+  collect it. Removing `.drsync.tmp.*` by hand is safe **only** when no job
+  using that destination is running.
+- **One live job per destination tree.** Submitting a job whose destination
+  overlaps a live job's is rejected (409). The two would reclaim each other's
+  in-progress temps — each agent recognises only its own job as live work — so
+  a big file being assembled by one job can be truncated or lost by the other.
+  Finish or cancel the other job first, or pick a destination outside its tree.
+  `job start` and `job resume` re-check against RUNNING/PAUSED jobs and refuse
+  the same way, so a job created before this rule shipped is caught at start
+  rather than corrupting the tree. If an upgrade leaves you holding two such
+  jobs, cancel one — the message names it.
 
 ---
 
@@ -107,7 +126,7 @@ spec:
     buffer_size: 1MiB
     preserve_sparse: true         # SEEK_HOLE/SEEK_DATA extent copy
     server_side_copy: auto        # auto | off | require  (copy_file_range / NFSv4.2 SSC / reflink)
-    temp_naming: ".drsync.tmp."
+    temp_naming: ".drsync.tmp."   # prefix only; job/pass/shard suffix is appended
     fsync: per_file               # per_file | batched  (batched is ~5× faster, weaker crash durability)
 
   metadata:

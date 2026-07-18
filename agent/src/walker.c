@@ -757,9 +757,23 @@ static void handle_orphan(struct walk_ctx *ctx, const char *rel, int dfd,
 {
     const struct job_options *o = &ctx->oe->o;
     const char *prefix = o->temp_prefix[0] ? o->temp_prefix : ".drsync.tmp.";
-    if (strncmp(name, prefix, strlen(prefix)) == 0) {
-        /* crash residue from an interrupted copy: always reclaimed (design §3) */
-        if (!o->dry_run && unlinkat(dfd, name, 0) < 0 && errno != ENOENT)
+    size_t plen = strlen(prefix);
+    if (strncmp(name, prefix, plen) == 0) {
+        /* Residue from an interrupted copy: reclaimed (design §3) — but NOT a
+         * temp tagged with this pass, which is live work somewhere in the
+         * fleet. A chunked file's temp sits in its destination directory for
+         * the whole multi-host copy with no source counterpart, so it lands
+         * here looking exactly like residue; this directory can legitimately be
+         * re-walked meanwhile (the parent walk shard is requeued after a lease
+         * lapse or journal-ack timeout, and the coordinator keeps the chunk
+         * group it already fanned out rather than re-fanning it). Unlinking it
+         * then failed the finalize chunk with "open temp for finalize" — or, if
+         * the unlink landed mid-group, let the remaining chunks O_CREAT a fresh
+         * temp that finalize renamed into place with holes where the earlier
+         * chunks had written. Leaving a tagged temp alone at worst defers
+         * residue to a later pass; reclaiming a live one corrupts a file. */
+        if (!o->dry_run && !temp_tag_matches(name + plen, ctx->it->job_id, ctx->it->pass_no) &&
+            unlinkat(dfd, name, 0) < 0 && errno != ENOENT)
             walk_err(ctx, "reclaim temp", name);
         return;
     }

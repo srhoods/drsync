@@ -56,7 +56,8 @@ spec:
     buffer_size: 1MiB                # io_uring buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA; auto-fallback to zero-detect
     server_side_copy: auto           # try copy_file_range (NFSv4.2), fallback read/write
-    temp_naming: ".drsync.tmp.{id}"  # in-progress destination names
+    temp_naming: ".drsync.tmp."      # PREFIX for in-progress destination names;
+                                     # "<job>-<pass>.<shard>.<seq>" is appended
     fsync: per_file                  # per_file | batched(n)
 
   metadata:
@@ -135,6 +136,20 @@ at most 255 bytes (bounds match the agent's fixed filter table).
 
 - schema + unknown-field rejection (typo safety),
 - src/dst paths are absolute, src ≠ dst and neither is a prefix of the other,
+- the destination does not overlap the destination of any **live** job (one not
+  COMPLETED/CANCELLED/FAILED) — rejected with 409. Two jobs writing into one
+  tree damage each other: an agent's orphan sweep reclaims `.drsync.tmp` entries
+  it finds in the destination and can only recognise its own job+pass as live
+  work, so job A's chunk temp — present for the whole multi-host assembly of a
+  big file — reads as stray residue to job B's walk of that directory and is
+  unlinked underneath it. Containment is compared on whole path components, so
+  `/dst/a` and `/dst/ab` are siblings, not an overlap. A finished job holds
+  nothing, so re-syncing its destination with a new job is allowed. The check
+  runs inside the job insert, under the same lock, so two concurrent submits of
+  overlapping destinations cannot both succeed. **Start and resume re-check it**
+  against RUNNING/PAUSED jobs — a backstop for rows created before this
+  validation existed; a READY job does not block, or two jobs would each refuse
+  to go first,
 - destination mount has plausible free space (statfs vs. src estimate once pass 1 has a
   running total; hard check is per-write ENOSPC handling),
 - filters are well-formed (each rule is exactly one `include:`/`exclude:`, no
