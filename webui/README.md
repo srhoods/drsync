@@ -41,8 +41,10 @@ populate after the second poll.
   the **convergence curve** (Δfiles per pass → zero-delta fixpoint), the
   per-pass ledger incl. the TOTAL row, and the job's lifecycle controls; a live
   aggregate-throughput timeline; the **Fleet** table (per-agent scan/s, files/s,
-  throughput, RSS, heartbeat, drain state and drain/resume control); and an
-  Attention rail (queue composition, parked shards, event feed).
+  throughput, RSS, heartbeat, drain state and drain/resume control), where any
+  agent row expands to show **what it is holding right now** — each in-flight
+  shard's kind, path, running (or queued) time and entries done, longest-running
+  first; and an Attention rail (queue composition, parked shards, event feed).
 - **Queue & shards** — shard-queue depth by job · pass · kind · state (filterable
   by job and state), work-by-kind and state-mix breakdowns, retry-pressure
   counters, and the parked-shard table (attempts N/5, errno, last agent, age,
@@ -83,10 +85,23 @@ messages are written to be read by an operator.
 | Lease requeues, requeue rate | `GET /metrics` — `drsync_lease_expiries_total` / `drsync_work_grants_total` |
 | Queue depth & parked shards (incl. park time) | `GET /api/v1/queue` |
 | Fleet roster & enable/disable state | `GET /api/v1/agents` |
+| Per-agent in-flight work (expanded row only) | `GET /api/v1/agents/{id}/inflight` |
 | Errors view | `GET /api/v1/jobs/{name}/errors` |
 
 Throughput comes from `/metrics`, not from the WebSocket: the `stats` frames
 carry per-pass cumulative counters, not fleet-wide rates.
+
+In-flight detail is fetched only for the one expanded agent, and only while it
+stays expanded. The endpoint is per-agent, so polling the whole roster would
+cost one request per agent per tick — the same fan-out the jobs list was
+restructured to avoid.
+
+The in-flight panel keeps three situations distinct, because collapsing them
+would mislead: an agent whose build predates in-flight reporting says so
+(`supported: false`), an agent genuinely holding nothing reads as *idle*, and
+one whose session has dropped reads as *no longer connected*. The snapshot
+rides the heartbeat, so the panel states its age rather than implying it is
+live.
 
 ## Notes
 

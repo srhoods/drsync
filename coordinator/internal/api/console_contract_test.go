@@ -179,6 +179,110 @@ func TestReportParkedCarriesParkTime(t *testing.T) {
 	}
 }
 
+// The Fleet table's expandable row binds to these exact field names. A rename
+// would not fail any server-side test — the panel would just render blank — so
+// the shape is pinned here.
+func TestAgentInflightShape(t *testing.T) {
+	srv := consoleSrv(t)
+	srv.AgentInflight = func(id string) ([]*drsyncpb.InflightItem, time.Time, bool, bool) {
+		return []*drsyncpb.InflightItem{
+			{LeaseId: 9, ShardId: 501, JobId: 1, Kind: "chunk", RelPath: "big/file.bin",
+				HeldMs: 812000, RunningMs: 795000, Running: true, EntriesDone: 41200},
+			{LeaseId: 10, ShardId: 502, JobId: 1, Kind: "entrylist", RelPath: "some/dir",
+				HeldMs: 4200, RunningMs: 0, Running: false, EntriesDone: 0},
+		}, time.Now(), true, true
+	}
+
+	var got struct {
+		Agent        string `json:"agent"`
+		Supported    bool   `json:"supported"`
+		ReportedAtMs int64  `json:"reported_at_ms"`
+		Inflight     []struct {
+			Kind        string `json:"kind"`
+			RelPath     string `json:"rel_path"`
+			HeldMS      uint32 `json:"held_ms"`
+			RunningMS   uint32 `json:"running_ms"`
+			Running     bool   `json:"running"`
+			EntriesDone uint64 `json:"entries_done"`
+		} `json:"inflight"`
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/agents/a1/inflight", nil)
+	r.SetPathValue("id", "a1")
+	srv.getAgentInflight(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Supported || got.ReportedAtMs == 0 {
+		t.Errorf("supported=%v reported_at_ms=%d, want true and non-zero",
+			got.Supported, got.ReportedAtMs)
+	}
+	if len(got.Inflight) != 2 {
+		t.Fatalf("want 2 in-flight items, got %d", len(got.Inflight))
+	}
+	// Longest-running first: the console marks the head as the one to look at.
+	if !got.Inflight[0].Running || got.Inflight[0].RunningMS != 795000 {
+		t.Errorf("head item = %+v, want the running 795s one first", got.Inflight[0])
+	}
+	if got.Inflight[0].Kind != "chunk" || got.Inflight[0].RelPath != "big/file.bin" {
+		t.Errorf("identity fields wrong: %+v", got.Inflight[0])
+	}
+	if got.Inflight[0].EntriesDone != 41200 {
+		t.Errorf("entries_done = %d, want 41200 (stuck-vs-slow signal)", got.Inflight[0].EntriesDone)
+	}
+	// A queued item reports running=false with running_ms 0; the console falls
+	// back to held_ms for it, so both must survive.
+	q := got.Inflight[1]
+	if q.Running || q.RunningMS != 0 || q.HeldMS != 4200 {
+		t.Errorf("queued item = %+v, want running=false running_ms=0 held_ms=4200", q)
+	}
+}
+
+// An agent too old to report in-flight detail must be distinguishable from one
+// that is genuinely idle, or the console would show "idle" for a stale build.
+func TestAgentInflightUnsupportedIsNotIdle(t *testing.T) {
+	srv := consoleSrv(t)
+	srv.AgentInflight = func(id string) ([]*drsyncpb.InflightItem, time.Time, bool, bool) {
+		return nil, time.Time{}, false, true // connected, but does not report
+	}
+	var got struct {
+		Supported bool       `json:"supported"`
+		Inflight  []struct{} `json:"inflight"`
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/agents/old/inflight", nil)
+	r.SetPathValue("id", "old")
+	srv.getAgentInflight(w, r)
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Supported {
+		t.Error("supported=true for an agent that does not report in-flight detail")
+	}
+	if len(got.Inflight) != 0 {
+		t.Errorf("want an empty list alongside supported=false, got %d items", len(got.Inflight))
+	}
+}
+
+// A disconnected agent 404s; the console turns that into "no longer connected"
+// rather than an empty panel.
+func TestAgentInflightDisconnected404s(t *testing.T) {
+	srv := consoleSrv(t)
+	srv.AgentInflight = func(id string) ([]*drsyncpb.InflightItem, time.Time, bool, bool) {
+		return nil, time.Time{}, false, false
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/agents/gone/inflight", nil)
+	r.SetPathValue("id", "gone")
+	srv.getAgentInflight(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404 for a disconnected agent", w.Code)
+	}
+}
+
 // parkOneShard drives a shard through lease → park the way the scheduler does,
 // and returns its id plus a timestamp taken before the park.
 func parkOneShard(t *testing.T, srv *Server) (int64, int64) {
