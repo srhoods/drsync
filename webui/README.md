@@ -1,13 +1,11 @@
 # drsync WebUI
 
-A read-only operations console for monitoring a drsync cluster — jobs, pass
-convergence, aggregate throughput, agent performance, and the shard queue /
-parked-shard triage view.
+An operations console for monitoring and driving a drsync cluster — jobs, pass
+convergence, aggregate throughput, agent performance, the shard queue /
+parked-shard triage view, and the journal-backed error browser.
 
-This is the **phase-1 read-only console** (see `docs/DESIGN-coordinator.md` §6 —
-the REST + WebSocket surface is explicitly the WebUI contract). It is wired to a
-live coordinator: no build step, no framework — a single self-contained HTML
-file.
+It is wired to a live coordinator: no build step, no framework — a single
+self-contained HTML file.
 
 ## Running it
 
@@ -29,43 +27,75 @@ coordinator sends permissive CORS headers so this cross-origin case works too.
 The connection indicator (top bar) is green when polling and the event socket
 are healthy, amber while connecting, red when the coordinator is unreachable.
 
-Data refreshes every 2.5 s; live state changes (job/pass transitions, agent
+Data refreshes every 2.5 s. Live state changes (job/pass transitions, agent
 up/down, parked-shard alerts) arrive over the events WebSocket and trigger an
-immediate refresh. Per-agent rates are derived by differencing successive
-`/metrics` samples, so throughput/scan/copy figures populate after the second
-poll.
+immediate refresh, and the 1 Hz `stats` frames are folded into the selected
+job's detail so its counters advance between polls. Per-agent rates are derived
+by differencing successive `/metrics` samples, so throughput/scan/copy figures
+populate after the second poll.
 
 ## Views
 
 - **Overview** — cluster KPI strip; a jobs list with lifecycle state
   (SCANNING → DIRFIX → VERIFY → DELETE → COMPLETE); a selected-job detail with
-  the **convergence curve** (Δfiles per pass → zero-delta fixpoint) and the
-  per-pass ledger incl. the TOTAL row; a live aggregate-throughput timeline; the
-  **Fleet** table (per-agent scan/s, files/s, throughput, RSS, heartbeat, drain
-  state); and an Attention rail (queue composition, parked shards, event feed).
+  the **convergence curve** (Δfiles per pass → zero-delta fixpoint), the
+  per-pass ledger incl. the TOTAL row, and the job's lifecycle controls; a live
+  aggregate-throughput timeline; the **Fleet** table (per-agent scan/s, files/s,
+  throughput, RSS, heartbeat, drain state and drain/resume control); and an
+  Attention rail (queue composition, parked shards, event feed).
 - **Queue & shards** — shard-queue depth by job · pass · kind · state (filterable
-  by job and state), work-by-kind and state-mix breakdowns, and the parked-shard
-  table (attempts N/5, errno, last agent, age). Queue and parked rows click
-  through to the owning job's detail.
+  by job and state), work-by-kind and state-mix breakdowns, retry-pressure
+  counters, and the parked-shard table (attempts N/5, errno, last agent, age,
+  retry/drop). Queue and parked rows click through to the owning job's detail.
+- **Errors** — the journal-backed error browser: copy errors, fidelity
+  exceptions and verify failures for one job, filterable by pass, errno class
+  (chips built from the response's `by_class` histogram) and rel-path prefix,
+  paged.
+
+## Operator actions
+
+Every control maps to an existing coordinator endpoint, and the console only
+offers the transitions the job's current state permits.
+
+| Control | Endpoint |
+|---------|----------|
+| start / pause / resume / cancel | `POST /api/v1/jobs/{name}/{action}` |
+| trigger pass, trigger delete pass | `POST /api/v1/jobs/{name}/passes` |
+| drain / resume an agent | `POST /api/v1/agents/{id}/{disable,enable}` |
+| retry / drop a parked shard | `POST /api/v1/parked/{id}/{retry,drop}` |
+| retry / drop all parked of a job | `POST /api/v1/jobs/{name}/parked/{retry,drop}` |
+| download report | client-side, from `GET /api/v1/jobs/{name}/report` |
+
+Destructive actions open a confirm dialog. The two that lose data
+irrecoverably — the **delete pass** and **drop parked shards** — additionally
+require typing the job name, mirroring the API's own `confirm` gate. Failures
+are surfaced verbatim from the API's `{"error": …}` body, because those
+messages are written to be read by an operator.
 
 ## Data mapping
 
 | Panel | Source |
 |-------|--------|
-| KPI strip, throughput, live counters | `GET /api/v1/events` (WebSocket, 1 Hz stats frames) |
-| Agent performance (scan/copy rates, RSS, up) | `GET /metrics` — `drsync_scan_entries_total`, `drsync_copy_files_total`, `drsync_copy_bytes_total`, `drsync_agent_rss_bytes`, `drsync_agent_up` (rate() over the cumulative gauges) |
-| Jobs list & state | `GET /api/v1/jobs` |
-| Job detail, convergence, pass ledger | `GET /api/v1/jobs/{name}` and `GET /api/v1/jobs/{name}/report` |
-| Queue depth & parked shards | `GET /api/v1/queue` |
+| Jobs list, state, per-row pass rollup | `GET /api/v1/jobs` (one request for all rows) |
+| Job detail, convergence, pass ledger | `GET /api/v1/jobs/{name}/report` (selected job only) |
+| Live per-pass counters between polls | `GET /api/v1/events` (WebSocket, 1 Hz `stats` frames) |
+| Throughput / files·s⁻¹ / scan rate, agent RSS | `GET /metrics` — `rate()` over `drsync_scan_entries_total`, `drsync_copy_files_total`, `drsync_copy_bytes_total`, plus `drsync_agent_rss_bytes`, `drsync_agent_up` |
+| Lease requeues, requeue rate | `GET /metrics` — `drsync_lease_expiries_total` / `drsync_work_grants_total` |
+| Queue depth & parked shards (incl. park time) | `GET /api/v1/queue` |
 | Fleet roster & enable/disable state | `GET /api/v1/agents` |
+| Errors view | `GET /api/v1/jobs/{name}/errors` |
 
-## Roadmap
+Throughput comes from `/metrics`, not from the WebSocket: the `stats` frames
+carry per-pass cumulative counters, not fleet-wide rates.
 
-Phase 1 is read-only. Phase 2 adds operator actions already stubbed in the UI as
-disabled controls — job pause/resume/cancel (`POST /api/v1/jobs/{name}/…`),
-delete-pass trigger, agent enable/disable (`POST /api/v1/agents/{id}/…`), and
-parked-shard retry/drop. Auth moves from bearer token to OIDC when the WebUI
-lands (design doc §6).
+## Notes
+
+All values rendered from coordinator data are HTML-escaped. This is not
+optional hardening: `rel_path` comes from the tree being migrated, so a file
+named `<img onerror=…>` would otherwise execute script in an operator's browser
+just by appearing in a parked-shard row.
+
+Auth is a bearer token today; it moves to OIDC per DESIGN-coordinator §6.
 
 ## Design notes
 
@@ -74,4 +104,4 @@ and a reserved semantic trio — green nominal / amber informational / red criti
 — that matches the `drsync journal cat --summary` colour language so console and
 CLI read as one system. Monospace for every figure, ID, and label (tabular
 numerals). Theme-aware (light/dark, honouring OS preference and an explicit
-toggle) and reduced-motion-safe.
+toggle that persists) and reduced-motion-safe.

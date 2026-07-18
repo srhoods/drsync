@@ -1,7 +1,7 @@
 // Package events feeds the /api/v1/events WebSocket (DESIGN-coordinator §6):
 // job/pass state changes, agent connect/disconnect, parked-shard alerts, and
 // 1 Hz stats frames for running jobs. Consumers today: `drsync job status
-// --watch` and `drsync events`; the phase-3 WebUI subscribes to the same feed.
+// --watch` and `drsync events`; the WebUI console subscribes to the same feed.
 //
 // Events are derived by diffing store snapshots on a 1 s tick rather than by
 // instrumenting every state transition: one producer, inherently consistent

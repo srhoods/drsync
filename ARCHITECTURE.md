@@ -2,7 +2,7 @@
 
 **Status:** Phase 1 implemented; parts of phase 2/3 landed ahead of schedule —
 large-file chunking (including cross-fleet fan-out), verify/delete passes, and a
-read-only WebUI console all ship today. See §9 for the per-phase status. Key
+the WebUI console all ship today. See §9 for the per-phase status. Key
 decisions ratified 2026-07-10 (see §10).
 **Date:** 2026-07-10 (status updated 2026-07-17)
 **Author:** drafted for review by Steven Rhoods
@@ -103,7 +103,7 @@ flowchart TB
 | `drsync-agent` | **C** (C11, Linux-only) | All filesystem work: scan, diff, copy, metadata apply, verify. One process per host, internal thread pools + io_uring. |
 | `drsyncd` (coordinator) | **Go** (decision D1) | Job orchestration, shard queue, leases, agent registry, stats aggregation, REST/gRPC API, Prometheus metrics. No data-path I/O, so C buys nothing here; Go buys the HTTP/API/concurrency layer nearly for free and halves control-plane risk. |
 | `drsync` (CLI) | Go (thin client of the REST API) | Submit/inspect/pause/cancel jobs; `--dry-run`; tail progress in a terminal. |
-| WebUI | TypeScript, phase 3 | Read-mostly dashboard + job control, sits on the same REST/WS API as the CLI. |
+| WebUI | Single self-contained HTML file, no build step | Dashboard + job/agent/shard control, sits on the same REST/WS API as the CLI. |
 
 **Key principle:** the CLI and the WebUI are both just API clients. Nothing is designed
 "for the UI" later — the API and metrics exist from day one.
@@ -350,7 +350,7 @@ drsync/
 |---|---|---|
 | **1 — MVP** | Coordinator + agent, posix lister, dual-tree diff, copy + full metadata, passes, CLI, Prometheus metrics. Correctness proven by fidelity test matrix. | **Shipped.** Plus mTLS, entry-list sharding for pathological directories, and coordinator-driven fleet spread so a volume below `shard_budget` still fans out across every agent (`test/fanout_e2e.sh`). |
 | **2 — Scale & resilience** | Large-file chunking, GPFS policy lister, verify pass, delete pass, coordinator HA, fault-injection test suite, 1B-file synthetic benchmark. | **Partial.** Shipped: large-file chunking — local parallel ranges **and** cross-fleet chunk fan-out with idempotent recovery (`test/chunk_e2e.sh`, `test/chunk_resilience_e2e.sh`); verify pass (sampled xxHash3); delete pass. Outstanding: GPFS policy lister, coordinator HA, fault-injection suite, 1B-file benchmark. |
-| **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. | **Partial.** Shipped: read-only WebUI monitoring console, per-pass reports. Outstanding: Weka snapshot lister, job control in the UI, cutover tooling. |
+| **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. | **Partial.** Shipped: WebUI console (monitoring, job/agent/parked-shard control, error browser), per-pass reports. Outstanding: Weka snapshot lister, cutover tooling. |
 
 ---
 

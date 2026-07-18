@@ -195,8 +195,54 @@
   .detail .dhead .acts { margin-left: auto; display: flex; gap: 7px; }
   .abtn {
     font-family: var(--mono); font-size: 11px; padding: 4px 9px; border-radius: 6px;
-    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); cursor: not-allowed;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink-2); cursor: pointer;
   }
+  .abtn:hover:not(:disabled) { border-color: var(--line-2); color: var(--ink); background: var(--raise); }
+  .abtn:disabled { color: var(--muted); cursor: not-allowed; opacity: .55; }
+  /* Destructive actions (cancel, drop, delete pass) carry the critical colour
+     the CLI uses for the same operations. */
+  .abtn.danger { color: var(--crit); border-color: color-mix(in srgb, var(--crit) 32%, var(--line)); }
+  .abtn.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--crit) 12%, var(--panel-2)); border-color: var(--crit); }
+  .abtn.go { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 34%, var(--line)); }
+  .abtn.go:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); border-color: var(--accent); }
+  .abtn.busy { opacity: .6; cursor: progress; }
+
+  /* ---- toasts: outcome of every write action ---- */
+  .toasts { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
+  .toast {
+    font-family: var(--mono); font-size: 11.5px; padding: 10px 13px; border-radius: 9px;
+    background: var(--panel); border: 1px solid var(--line-2); color: var(--ink);
+    box-shadow: var(--shadow); display: flex; gap: 9px; align-items: flex-start;
+  }
+  .toast .tm { width: 5px; border-radius: 3px; align-self: stretch; background: var(--accent); flex: none; }
+  .toast.ok .tm { background: var(--good); } .toast.err .tm { background: var(--crit); }
+  .toast .tx { word-break: break-word; }
+  @keyframes toastin { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .toast { animation: toastin .16s ease-out; }
+  @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
+  /* ---- confirm dialog for destructive actions ---- */
+  .modal-bg { position: fixed; inset: 0; z-index: 90; background: rgba(6,10,18,.55); display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .modal-bg[hidden] { display: none; }
+  .modal { width: 460px; max-width: 100%; background: var(--panel); border: 1px solid var(--line-2); border-radius: 13px; box-shadow: var(--shadow); padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+  .modal h3 { font-size: 14px; }
+  .modal .mtext { font-size: 12.5px; color: var(--ink-2); line-height: 1.5; }
+  .modal .mtext b { color: var(--ink); font-family: var(--mono); }
+  .modal input { font-family: var(--mono); font-size: 12px; padding: 8px 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); }
+  .modal input:focus { outline: none; border-color: var(--accent); }
+  .modal .macts { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* ---- errors view ---- */
+  .ebrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .ebrow input.epath { font-family: var(--mono); font-size: 11.5px; padding: 5px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); min-width: 220px; }
+  .ebrow input.epath:focus { outline: none; border-color: var(--accent); }
+  table.et { width: 100%; border-collapse: collapse; font-family: var(--mono); font-variant-numeric: tabular-nums; min-width: 720px; }
+  table.et th { font-size: 9px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); font-weight: 500; text-align: left; padding: 8px 9px; border-bottom: 1px solid var(--line); }
+  table.et td { font-size: 11.5px; padding: 8px 9px; color: var(--ink-2); border-bottom: 1px solid var(--grid); vertical-align: top; }
+  table.et tr:hover td { background: var(--panel-2); }
+  .epath-cell { color: var(--ink); word-break: break-all; max-width: 420px; }
+  .edetail { color: var(--muted); font-size: 10.5px; }
+  .pager { display: flex; gap: 10px; align-items: center; justify-content: flex-end; padding: 10px 14px; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
   .dgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 16px; margin: 12px 0 4px; }
   .dstat .l { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
   .dstat .v { font-family: var(--mono); font-size: 16px; color: var(--ink); margin-top: 2px; }
@@ -210,7 +256,6 @@
   .cbar { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 0; height: 100%; justify-content: flex-end; min-width: 0; }
   .cbar .cval { font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin-bottom: 6px; }
   .cbar .bar { width: 100%; max-width: 54px; border-radius: 5px 5px 0 0; background: linear-gradient(180deg, var(--accent-2), var(--accent)); position: relative; transition: height .5s cubic-bezier(.2,.7,.2,1); }
-  .cbar.proj .bar { background: repeating-linear-gradient(135deg, color-mix(in srgb,var(--accent) 26%, transparent) 0 6px, transparent 6px 12px); border: 1px dashed color-mix(in srgb,var(--accent) 55%, transparent); }
   .cbar .clab { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-top: 7px; text-align: center; }
   .cbar .clab b { color: var(--ink-2); font-weight: 600; display: block; }
 
@@ -354,7 +399,8 @@
     </div>
     <nav class="nav" aria-label="Views">
       <button data-v="overview" class="on">▤ overview</button>
-      <button data-v="queue">▦ queue &amp; shards <span class="badge" id="nav-park">3</span></button>
+      <button data-v="queue">▦ queue &amp; shards <span class="badge" id="nav-park" style="display:none"></span></button>
+      <button data-v="errors">⚠ errors</button>
     </nav>
     <div class="coord">
       <span><span class="k">coordinator</span> <span id="hdr-coord">—</span></span>
@@ -368,7 +414,6 @@
       <span><span class="k">version</span> <span id="hdr-ver">—</span></span>
     </div>
     <span class="spacer"></span>
-    <span class="ro-chip" title="Phase 1 is read-only. Job &amp; agent controls arrive in Phase 2.">read-only</span>
     <span class="live"><span class="dot" id="conn-dot"></span> <span id="hz">connecting…</span></span>
     <span class="clock mono" id="clock">--:--:--</span>
     <button class="tbtn" id="settings" aria-label="Connection settings">⚙ connection</button>
@@ -438,8 +483,8 @@
         <div class="head"><h2>Aggregate throughput</h2><span class="eyebrow">bytes copied · fleet-wide · 90s</span></div>
         <div class="tl-wrap">
           <div class="tl-top">
-            <div class="tl-big"><span id="tl-now">4.7</span> <span class="u">GiB/s</span></div>
-            <div class="tl-leg"><span><i></i> bytes/s</span><span id="tl-peak">peak 6.1 GiB/s</span></div>
+            <div class="tl-big"><span id="tl-now">–</span> <span class="u"></span></div>
+            <div class="tl-leg"><span><i></i> bytes/s</span><span id="tl-peak">peak –</span></div>
           </div>
           <canvas id="tl" height="150" aria-label="Aggregate throughput timeline"></canvas>
         </div>
@@ -451,12 +496,12 @@
       <section class="panel">
         <div class="head"><h2>Fleet</h2><span class="eyebrow">agent performance</span>
           <span class="spacer" style="flex:1"></span>
-          <span class="eyebrow" id="fleet-hb">avg hb 1.1s</span>
+          <span class="eyebrow" id="fleet-hb"></span>
         </div>
         <div class="body fleet-wrap">
           <table class="ft" aria-label="Agent performance">
             <thead><tr>
-              <th>agent</th><th>scan /s</th><th>files /s</th><th>throughput</th><th>rss</th><th>hb</th>
+              <th>agent</th><th>scan /s</th><th>files /s</th><th>throughput</th><th>rss</th><th>hb</th><th></th>
             </tr></thead>
             <tbody id="fleet"></tbody>
           </table>
@@ -488,19 +533,19 @@
 
  <div id="view-queue" hidden>
   <section class="kpis" aria-label="Queue summary">
-    <div class="kpi"><span class="stripe"></span><div class="label">queued</div><div class="val" id="qk-q">252,904</div><div class="sub">awaiting a grant</div></div>
-    <div class="kpi"><span class="stripe"></span><div class="label">leased</div><div class="val" id="qk-l">2,046</div><div class="sub">in flight on agents</div></div>
-    <div class="kpi good"><span class="stripe"></span><div class="label">done · cycle</div><div class="val" id="qk-d">852,186</div><div class="sub">completed this pass</div></div>
-    <div class="kpi alert"><span class="stripe"></span><div class="label">parked</div><div class="val" id="qk-p">3</div><div class="sub">need operator action</div></div>
-    <div class="kpi"><span class="stripe"></span><div class="label">lease requeues</div><div class="val">41</div><div class="sub">expired &amp; retried</div></div>
-    <div class="kpi"><span class="stripe"></span><div class="label">avg attempts</div><div class="val">1.03</div><div class="sub">max 5 → park</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">queued</div><div class="val" id="qk-q">–</div><div class="sub">awaiting a grant</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">leased</div><div class="val" id="qk-l">–</div><div class="sub">in flight on agents</div></div>
+    <div class="kpi good"><span class="stripe"></span><div class="label">done · cycle</div><div class="val" id="qk-d">–</div><div class="sub">completed this pass</div></div>
+    <div class="kpi alert"><span class="stripe"></span><div class="label">parked</div><div class="val" id="qk-p">–</div><div class="sub">need operator action</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">lease requeues</div><div class="val" id="qk-req">–</div><div class="sub">expired &amp; retried</div></div>
+    <div class="kpi"><span class="stripe"></span><div class="label">requeue rate</div><div class="val" id="qk-rr">–</div><div class="sub" id="qk-rr-sub">of all work grants</div></div>
   </section>
 
   <div class="grid">
     <div class="col">
       <section class="panel">
         <div class="head"><h2>Shard queue</h2><span class="eyebrow">depth by job · pass · kind · state</span>
-          <span class="spacer" style="flex:1"></span><span class="eyebrow" id="q-updated">live · 1&#8202;Hz</span></div>
+          <span class="spacer" style="flex:1"></span><span class="eyebrow" id="q-updated">–</span></div>
         <div class="filters" id="qfilters"></div>
         <div class="body fleet-wrap">
           <table class="ft" style="min-width:540px" aria-label="Queue depth">
@@ -533,7 +578,7 @@
   <section class="panel" style="margin-top:16px">
     <div class="head"><h2>Parked shards</h2><span class="eyebrow">poison-guarded at 5 attempts</span>
       <span class="spacer" style="flex:1"></span>
-      <span class="ro-chip" title="Phase 2 — retry re-queues the shard; drop accepts the gap.">phase 2 · retry / drop</span></div>
+      <span id="park-bulk" class="park-acts"></span></div>
     <div class="body fleet-wrap">
       <table class="ft" style="min-width:760px" aria-label="Parked shards">
         <thead><tr><th class="l">shard</th><th class="l">job · pass</th><th class="l">kind</th><th class="l">path</th><th>attempts</th><th class="l">error</th><th class="l">last agent</th><th>age</th><th>actions</th></tr></thead>
@@ -543,10 +588,54 @@
   </section>
  </div><!-- /view-queue -->
 
+ <div id="view-errors" hidden>
+  <section class="panel" style="margin-top:20px">
+    <div class="head"><h2>Errors &amp; verify failures</h2><span class="eyebrow">journal-backed · per job</span>
+      <span class="spacer" style="flex:1"></span>
+      <span class="eyebrow" id="e-count">–</span></div>
+    <div class="filters">
+      <div class="fgroup"><span class="fl">job</span><div class="chips" id="e-jobs"></div></div>
+      <div class="fgroup"><span class="fl">pass</span><div class="chips" id="e-passes"></div></div>
+    </div>
+    <div class="filters">
+      <div class="fgroup"><span class="fl">class</span><div class="chips" id="e-classes"></div></div>
+      <div class="fgroup ebrow"><span class="fl">path</span>
+        <input class="epath" id="e-path" placeholder="rel-path prefix filter" autocomplete="off" spellcheck="false">
+        <button class="abtn" id="e-apply">apply</button>
+      </div>
+    </div>
+    <div class="body fleet-wrap">
+      <table class="et" aria-label="Errors and verify failures">
+        <thead><tr><th>pass</th><th>type</th><th>class</th><th>path</th><th>detail</th><th>when</th></tr></thead>
+        <tbody id="etb"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span id="e-range">–</span>
+      <button class="abtn" id="e-prev">‹ prev</button>
+      <button class="abtn" id="e-next">next ›</button>
+    </div>
+  </section>
+ </div><!-- /view-errors -->
+
   <div class="foot">
-    <span>drsync console · phase 1 (read-only)</span>
-    <span>data via <b>/api/v1/events</b> (WebSocket) + <b>/metrics</b></span>
+    <span>drsync console</span>
+    <span>data via <b>/api/v1/events</b> (WebSocket) + REST polling + <b>/metrics</b></span>
     <span style="margin-left:auto" id="foot-upd">updated just now</span>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<div class="modal-bg" id="modal" hidden role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+    <h3 id="modal-title">Confirm</h3>
+    <div class="mtext" id="modal-text"></div>
+    <input id="modal-input" hidden autocomplete="off" spellcheck="false">
+    <div class="macts">
+      <button class="abtn" id="modal-cancel">cancel</button>
+      <button class="abtn danger" id="modal-ok">confirm</button>
+    </div>
   </div>
 </div>
 
@@ -563,11 +652,22 @@
     token: localStorage.getItem("drsync.token") || "",
   };
 
-  // ---------- theme ----------
+  // ---------- escaping ----------
+  // Every dynamic value reaches the DOM through innerHTML, and much of it is
+  // attacker-influenced rather than operator-typed: rel_path comes from the
+  // tree being migrated, so a file named `<img onerror=…>` would otherwise run
+  // script in the console. Escape at every interpolation, without exception.
+  const ESC = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  const esc = v => String(v == null ? "" : v).replace(/[&<>"']/g, c => ESC[c]);
+
+  // ---------- theme (persisted) ----------
+  const applyTheme = t => { if (t) document.documentElement.setAttribute("data-theme", t); };
+  applyTheme(localStorage.getItem("drsync.theme"));
   $("#theme").addEventListener("click", () => {
     const cur = document.documentElement.getAttribute("data-theme")
       || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    document.documentElement.setAttribute("data-theme", cur === "dark" ? "light" : "dark");
+    const next = cur === "dark" ? "light" : "dark";
+    applyTheme(next); localStorage.setItem("drsync.theme", next);
     drawTL(); drawSparks(); if (curView === "queue") renderQueuePage();
   });
 
@@ -617,6 +717,82 @@
   const api = p => req(p, false);
   const apiText = p => req(p, true);
 
+  // POST for the operator actions. The API reports refusals as a JSON {error}
+  // with a 4xx (a job in the wrong state, a destination conflict, a parked
+  // shard that already moved on); surface that text verbatim rather than a
+  // generic failure, because it is written to be read by an operator.
+  async function post(path, body) {
+    const h = { "Content-Type": "application/json" };
+    if (cfg.token) h.Authorization = "Bearer " + cfg.token;
+    const res = await fetch(cfg.base + path, {
+      method: "POST", headers: h, cache: "no-store",
+      body: body === undefined ? null : JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+    return data;
+  }
+
+  // ---------- toasts ----------
+  const toasts = $("#toasts");
+  function toast(msg, kind) {
+    const el = document.createElement("div");
+    el.className = "toast" + (kind ? " " + kind : "");
+    el.innerHTML = `<span class="tm"></span><span class="tx">${esc(msg)}</span>`;
+    toasts.appendChild(el);
+    setTimeout(() => el.remove(), kind === "err" ? 8000 : 4000);
+  }
+
+  // ---------- confirm dialog ----------
+  // Destructive actions get a modal; the ones that lose data irrecoverably
+  // (delete pass, drop shard) additionally require typing the job name, which
+  // mirrors the API's own confirm gate for delete passes.
+  const modal = $("#modal"), modalInput = $("#modal-input");
+  let modalResolve = null;
+  function confirmAction({ title, text, okLabel, echo }) {
+    $("#modal-title").textContent = title;
+    $("#modal-text").innerHTML = text;
+    $("#modal-ok").textContent = okLabel || "confirm";
+    modalInput.hidden = !echo; modalInput.value = "";
+    modalInput.placeholder = echo ? `type "${echo}" to confirm` : "";
+    $("#modal-ok").disabled = !!echo;
+    modal.hidden = false;
+    (echo ? modalInput : $("#modal-ok")).focus();
+    return new Promise(res => { modalResolve = res; });
+  }
+  function closeModal(ok) {
+    modal.hidden = true;
+    const r = modalResolve; modalResolve = null;
+    if (r) r(ok);
+  }
+  modalInput.addEventListener("input", () => {
+    const want = (modalInput.placeholder.match(/^type "(.*)" to confirm$/) || [])[1];
+    $("#modal-ok").disabled = modalInput.value !== want;
+  });
+  modalInput.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !$("#modal-ok").disabled) closeModal(true);
+  });
+  $("#modal-ok").addEventListener("click", () => closeModal(true));
+  $("#modal-cancel").addEventListener("click", () => closeModal(false));
+  modal.addEventListener("click", e => { if (e.target === modal) closeModal(false); });
+  addEventListener("keydown", e => { if (e.key === "Escape" && !modal.hidden) closeModal(false); });
+
+  // Runs one write action: disables the button, reports the outcome, and
+  // refreshes so the UI reflects the new state without waiting for the poll.
+  async function act(btn, path, body, okMsg) {
+    if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+    try {
+      await post(path, body);
+      toast(okMsg, "ok");
+      await pollAll();
+    } catch (e) {
+      toast(String(e.message), "err");
+    } finally {
+      if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+    }
+  }
+
   // ---------- connection status ----------
   const connDot = $("#conn-dot"), hzEl = $("#hz"), footUpd = $("#foot-upd");
   function setConn(state, msg) {
@@ -632,8 +808,9 @@
   const kindLabel = k => k === "entrylist" ? "entry-list" : k;
 
   // ---------- live state ----------
-  const S = { jobs:[], jobDetails:{}, queue:{depth:[],parked:[]}, agents:[],
-              rates:{}, sum:{scan:0,files:0,bytes:0}, selected:null, report:null, info:null };
+  const S = { jobs:[], queue:{depth:[],parked:[]}, agents:[], rates:{}, glob:{},
+              sum:{scan:0,files:0,bytes:0}, selected:null, report:null, info:null };
+  const POLL_MS = 2500;
   const HN = 90;
   let bwHist = [], filesHist = [], scanHist = [];
   let curView = "overview";
@@ -641,9 +818,16 @@
   // ---------- /metrics parse + rate diff ----------
   let lastMetrics = null;
   const METRIC_RE = /^drsync_(scan_entries_total|copy_files_total|copy_bytes_total|agent_rss_bytes|agent_up)\{agent="([^"]+)"\}\s+([0-9.eE+-]+)/;
+  // Fleet-wide counters carry no labels. lease_expiries/work_grants are what
+  // the queue view's requeue tiles report: both are already maintained by the
+  // scheduler, so retry pressure costs no extra query — unlike averaging the
+  // attempt column, which would mean scanning every live shard each poll.
+  const GLOBAL_RE = /^drsync_(lease_expiries_total|work_grants_total|shards_parked_total)\s+([0-9.eE+-]+)/;
   function parseMetrics(text) {
-    const by = {};
+    const by = {}, glob = {};
     for (const line of text.split("\n")) {
+      const g = GLOBAL_RE.exec(line);
+      if (g) { glob[g[1]] = parseFloat(g[2]); continue; }
       const m = METRIC_RE.exec(line); if (!m) continue;
       const a = by[m[2]] || (by[m[2]] = {}), v = parseFloat(m[3]);
       if (m[1] === "scan_entries_total") a.scan = v;
@@ -652,7 +836,7 @@
       else if (m[1] === "agent_rss_bytes") a.rss = v;
       else if (m[1] === "agent_up") a.up = v;
     }
-    return by;
+    return { by, glob };
   }
   function computeRates(by) {
     const now = Date.now(), rates = {}, sum = { scan:0, files:0, bytes:0 };
@@ -678,6 +862,10 @@
   }
 
   // ---------- per-job active pass + progress (from /queue) ----------
+  // /queue only carries non-terminal passes, so a job that is not currently
+  // executing has no rows here. Callers fall back to the job's own pass state
+  // rather than reading the absence as 0% (which made paused and completed
+  // jobs look like they had made no progress at all).
   function jobActivePass(job) {
     const rows = S.queue.depth.filter(d => d.job === job);
     if (!rows.length) return null;
@@ -687,10 +875,15 @@
     const done = g.DONE || 0, tot = (g.QUEUED || 0) + (g.LEASED || 0) + done;
     return { pass, states: g, progress: tot ? done / tot * 100 : 0 };
   }
-  const jobLatestPass = name => {
-    const d = S.jobDetails[name];
-    return d && d.passes && d.passes.length ? d.passes[d.passes.length - 1] : null;
-  };
+  // Progress for a job row: live shard ratio when the pass is queued, else the
+  // last ratio we saw for it, else 100% for a job that finished.
+  const lastProgress = {};
+  function jobProgress(j) {
+    const ap = jobActivePass(j.name);
+    if (ap) { lastProgress[j.name] = ap.progress; return ap.progress; }
+    if (j.state === "COMPLETED") return 100;
+    return lastProgress[j.name] || 0;
+  }
 
   // ---------- poll ----------
   async function pollAll() {
@@ -700,17 +893,17 @@
       ]);
       S.jobs = jobs || []; S.queue = queue || {depth:[],parked:[]}; S.agents = agents || [];
       if (!S.info) S.info = await api("/api/v1/info").catch(() => null);
-      const dets = await Promise.all(S.jobs.map(j =>
-        api("/api/v1/jobs/" + encodeURIComponent(j.name)).catch(() => null)));
-      S.jobDetails = {}; S.jobs.forEach((j, i) => { if (dets[i]) S.jobDetails[j.name] = dets[i]; });
 
-      const { rates, sum } = computeRates(parseMetrics(mtext));
-      S.rates = rates; S.sum = sum; pushHist(sum);
+      const { by, glob } = parseMetrics(mtext);
+      const { rates, sum } = computeRates(by);
+      S.rates = rates; S.sum = sum; S.glob = glob; pushHist(sum);
 
       if (!S.selected || !S.jobs.find(j => j.name === S.selected)) {
         const run = S.jobs.find(j => j.state === "RUNNING");
         S.selected = run ? run.name : (S.jobs[0] ? S.jobs[0].name : null);
       }
+      // Only the selected job needs the full report; the jobs list carries its
+      // own pass rollup now, so this is one request rather than one per job.
       S.report = S.selected
         ? await api("/api/v1/jobs/" + encodeURIComponent(S.selected) + "/report").catch(() => null)
         : null;
@@ -727,7 +920,11 @@
   // ---------- render: everything ----------
   function renderAll() {
     renderHeader(); renderKPIs(); renderJobs(); renderDetail(); renderFleet(); renderRail();
-    drawTL(); drawSparks(); if (curView === "queue") renderQueuePage();
+    drawTL(); drawSparks();
+    // Rendered even while hidden: the queue view used to keep its seeded markup
+    // until it was first opened, so switching to it flashed stale numbers.
+    renderQueuePage();
+    if (curView === "errors") renderErrorsFilters();
   }
 
   // ---------- header (real coordinator identity) ----------
@@ -766,19 +963,20 @@
   function renderJobs() {
     if (!S.jobs.length) { joblist.innerHTML = `<div class="jmeta" style="padding:16px">no jobs registered</div>`; return; }
     joblist.innerHTML = S.jobs.map(j => {
-      const d = S.jobDetails[j.name], lp = jobLatestPass(j.name), ap = jobActivePass(j.name);
       const sev = j.state === "RUNNING" ? "run" : j.state === "COMPLETED" ? "done"
         : j.state === "PAUSED" ? "pause" : (j.state === "FAILED" || j.state === "CANCELLED") ? "attn" : "";
-      const prog = j.state === "COMPLETED" ? 100 : ap ? ap.progress : 0;
-      const passtxt = lp ? `pass ${lp.pass_no} · ${(lp.state || "").toLowerCase()}` : (j.state === "COMPLETED" ? "converged" : "—");
-      const totCopied = d && d.passes ? d.passes.reduce((s, p) => s + (+p.files_copied || 0), 0) : 0;
-      const meta = lp ? `${countFmt(lp.entries_walked)} walked · ${countFmt(totCopied)} copied`
+      const prog = jobProgress(j);
+      const passtxt = j.pass_count
+        ? `pass ${j.pass_no} · ${esc((j.pass_state || "").toLowerCase())}`
+        : (j.state === "COMPLETED" ? "converged" : "—");
+      const meta = j.pass_count
+        ? `${countFmt(j.entries_walked)} walked · ${countFmt(j.files_copied)} copied`
         : (j.dry_run ? "dry-run · not started" : "—");
-      const right = j.dry_run ? "dry-run" : (j.state === "RUNNING" ? "live" : j.state.toLowerCase());
-      return `<div class="jrow ${sev} ${j.name === S.selected ? "sel" : ""}" tabindex="0" role="button" data-job="${j.name}">
+      const right = j.dry_run ? "dry-run" : (j.state === "RUNNING" ? "live" : esc(j.state.toLowerCase()));
+      return `<div class="jrow ${sev} ${j.name === S.selected ? "sel" : ""}" tabindex="0" role="button" data-job="${esc(j.name)}">
         <div class="sev"></div>
-        <div><div class="jname">${j.name}</div><div class="jmeta">${meta}</div></div>
-        <div><span class="pill ${jobPill[j.state] || "mut"}">${j.state.toLowerCase()}</span></div>
+        <div><div class="jname" title="${esc(j.name)}">${esc(j.name)}</div><div class="jmeta">${meta}</div></div>
+        <div><span class="pill ${jobPill[j.state] || "mut"}">${esc(j.state.toLowerCase())}</span></div>
         <div><div class="jmeta" style="margin-bottom:5px">${passtxt}</div>
              <div class="prog ${j.state === "COMPLETED" ? "gdone" : ""}"><i style="width:${prog}%"></i></div></div>
         <div class="jr-right">${right}</div></div>`;
@@ -799,6 +997,67 @@
   const verifyCol = (ok, fail) => (+fail || 0) > 0
     ? `${countFmt(ok)} ok/${countFmt(fail)} FAIL` : `${countFmt(ok)} ok`;
 
+  // ---------- job actions ----------
+  // Which controls a job offers is a function of its lifecycle state, so the
+  // console never presents a transition the coordinator would refuse: READY
+  // starts, RUNNING pauses/cancels, PAUSED resumes, terminal states offer only
+  // the report download.
+  function jobActions(state) {
+    const b = [];
+    if (state === "READY" || state === "CREATED") b.push(`<button class="abtn go" data-ja="start">▶ start</button>`);
+    if (state === "RUNNING") b.push(`<button class="abtn" data-ja="pause">⏸ pause</button>`);
+    if (state === "PAUSED") b.push(`<button class="abtn go" data-ja="resume">▶ resume</button>`);
+    if (state === "RUNNING" || state === "PAUSED") {
+      b.push(`<button class="abtn" data-ja="pass">＋ pass</button>`);
+      b.push(`<button class="abtn danger" data-ja="delpass">⌫ delete pass</button>`);
+      b.push(`<button class="abtn danger" data-ja="cancel">✕ cancel</button>`);
+    }
+    b.push(`<button class="abtn" data-ja="report">⤓ report</button>`);
+    return b.join("");
+  }
+
+  // Downloads the report the API already assembles for the detail panel, so an
+  // operator can attach the cutover record to a migration ticket.
+  function downloadReport(name) {
+    const blob = new Blob([JSON.stringify(S.report, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name.replace(/[^\w.-]+/g, "_") + "-report.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+
+  $("#detail").addEventListener("click", async e => {
+    const btn = e.target.closest("button[data-ja]"); if (!btn) return;
+    const name = S.selected; if (!name) return;
+    const u = "/api/v1/jobs/" + encodeURIComponent(name);
+    switch (btn.dataset.ja) {
+      case "start":  return act(btn, u + "/start", undefined, `started ${name}`);
+      case "pause":  return act(btn, u + "/pause", undefined, `paused ${name}`);
+      case "resume": return act(btn, u + "/resume", undefined, `resumed ${name}`);
+      case "report": return downloadReport(name);
+      case "pass":   return act(btn, u + "/passes", { delete: false }, `triggered a pass on ${name}`);
+      case "cancel": {
+        const ok = await confirmAction({
+          title: "Cancel job",
+          text: `Cancel <b>${esc(name)}</b>? In-flight leases drain, no new work is granted, and the job cannot be resumed — only re-submitted.`,
+          okLabel: "cancel job",
+        });
+        return ok && act(btn, u + "/cancel", undefined, `cancelled ${name}`);
+      }
+      case "delpass": {
+        const ok = await confirmAction({
+          title: "Trigger delete pass",
+          text: `A delete pass <b>removes destination files that no longer exist at the source</b> for <b>${esc(name)}</b>. This is irreversible.`,
+          okLabel: "run delete pass", echo: name,
+        });
+        // The API gates this a second time on confirm === job name; send it.
+        return ok && act(btn, u + "/passes", { delete: true, confirm: name },
+          `delete pass triggered on ${name}`);
+      }
+    }
+  });
+
   const detail = $("#detail");
   function renderDetail() {
     const r = S.report;
@@ -817,7 +1076,7 @@
       const run = p.state && p.state !== "COMPLETE";
       const tag = run ? ` <span class="pill run plain" style="font-size:9px;padding:1px 6px">live</span>` : "";
       return `<tr><td class="l"><span class="pf">pass ${p.pass_no}</span>${tag}</td>
-        <td class="l" style="color:var(--muted)">${(p.state || "").toLowerCase()}</td>
+        <td class="l" style="color:var(--muted)">${esc((p.state || "").toLowerCase())}</td>
         <td>${humanMS(p.duration_ms)}</td><td>${comma(p.delta_files)}</td><td>${humanBytes(p.delta_bytes)}</td>
         <td>${comma(p.orphans)}</td><td class="${(+p.verify_fail) ? "cell-crit" : ""}">${verifyCol(p.verify_ok, p.verify_fail)}</td>
         <td class="${(+p.errors) ? "cell-warn" : ""}">${comma(p.errors)}</td></tr>`;
@@ -826,14 +1085,10 @@
     const st = r.state || "";
     detail.innerHTML = `
       <div class="dhead">
-        <span class="jn">${r.job}</span>
-        <span class="pill ${jobPill[st] || "mut"}">${st.toLowerCase()}</span>
-        <span class="jmeta">${r.converged ? "converged" : (latest.state ? "pass " + latest.pass_no + " · " + (latest.state || "").toLowerCase() : "")}${r.dry_run ? " · dry-run" : ""}</span>
-        <div class="acts">
-          <button class="abtn" disabled title="Phase 2 — write actions">⏸ pause</button>
-          <button class="abtn" disabled title="Phase 2 — write actions">✕ cancel</button>
-          <button class="abtn" disabled title="Phase 2 — write actions">⤓ report</button>
-        </div>
+        <span class="jn">${esc(r.job)}</span>
+        <span class="pill ${jobPill[st] || "mut"}">${esc(st.toLowerCase())}</span>
+        <span class="jmeta">${r.converged ? "converged" : (latest.state ? "pass " + latest.pass_no + " · " + esc((latest.state || "").toLowerCase()) : "")}${r.dry_run ? " · dry-run" : ""}</span>
+        <div class="acts">${jobActions(st)}</div>
       </div>
       <div class="dgrid">${stat}</div>
       <div class="sect-l">convergence — Δfiles per pass (fixpoint = 0)</div>
@@ -848,7 +1103,7 @@
 
   const fleet = $("#fleet"), fleetHb = $("#fleet-hb");
   function renderFleet() {
-    if (!S.agents.length) { fleet.innerHTML = `<tr><td colspan="6" style="color:var(--muted);padding:14px">no agents connected</td></tr>`; fleetHb.textContent = ""; return; }
+    if (!S.agents.length) { fleet.innerHTML = `<tr><td colspan="7" style="color:var(--muted);padding:14px">no agents connected</td></tr>`; fleetHb.textContent = ""; return; }
     const bwmax = Math.max(...S.agents.map(a => (S.rates[a.id] ? S.rates[a.id].bytes : 0)), 1);
     let hbsum = 0, hbn = 0;
     fleet.innerHTML = S.agents.map(a => {
@@ -859,21 +1114,34 @@
       const pct = bwmax ? r.bytes / bwmax * 100 : 0;
       const [bv, bu] = rate(r.bytes);
       if (a.connected && a.last_heartbeat_ms) { hbsum += Date.now() - a.last_heartbeat_ms; hbn++; }
+      // Draining an agent stops new grants but lets in-flight leases finish —
+      // the safe way to take a host out of a migration for maintenance.
+      const toggle = a.enabled
+        ? `<button class="abtn" data-ag="disable" data-id="${esc(a.id)}" title="Stop granting new shards; in-flight leases finish">drain</button>`
+        : `<button class="abtn go" data-ag="enable" data-id="${esc(a.id)}" title="Resume scheduling work to this agent">resume</button>`;
       return `<tr class="${off || drained ? "drained" : ""}">
-        <td><div class="ag"><span class="id">${a.id}</span><span class="host">${a.hostname || ""} · <span class="st-dot ${stcls}">${sttxt}</span></span></div></td>
+        <td><div class="ag"><span class="id">${esc(a.id)}</span><span class="host">${esc(a.hostname || "")} · <span class="st-dot ${stcls}">${sttxt}</span></span></div></td>
         <td>${off ? "—" : countFmt(r.scan)}</td>
         <td>${off ? "—" : countFmt(r.files)}</td>
         <td><div class="tp"><span>${off ? "0" : bv}</span><span style="color:var(--muted);font-size:10px">${bu}</span><div class="bar"><i style="width:${pct}%"></i></div></div></td>
         <td>${r.rss ? humanBytes(r.rss) : "—"}</td>
-        <td>${off ? "—" : ago(a.last_heartbeat_ms)}</td></tr>`;
+        <td>${off ? "—" : ago(a.last_heartbeat_ms)}</td>
+        <td>${toggle}</td></tr>`;
     }).join("");
     fleetHb.textContent = hbn ? "avg hb " + (hbsum / hbn / 1000).toFixed(1) + "s" : "";
   }
+  fleet.addEventListener("click", e => {
+    const btn = e.target.closest("button[data-ag]"); if (!btn) return;
+    const id = btn.dataset.id, on = btn.dataset.ag === "enable";
+    act(btn, `/api/v1/agents/${encodeURIComponent(id)}/${on ? "enable" : "disable"}`,
+      undefined, `${id} ${on ? "resumed scheduling" : "draining"}`);
+  });
 
   function renderRail() {
     const sel = S.selected, ap = sel ? jobActivePass(sel) : null;
     let g;
     if (ap) { g = ap.states; $("#rail-q-label").textContent = `shard queue — ${sel} · pass ${ap.pass}`; }
+    // textContent above, so the job name needs no escaping here.
     else { g = {}; S.queue.depth.forEach(d => g[d.state] = (g[d.state] || 0) + d.count); $("#rail-q-label").textContent = "shard queue — fleet-wide"; }
     const q = g.QUEUED || 0, l = g.LEASED || 0, dn = g.DONE || 0, p = g.PARKED || 0, sum = q + l + dn + p || 1;
     $("#qbar").innerHTML =
@@ -886,8 +1154,8 @@
     const list = (mine.length ? mine : all).slice(0, 4);
     $("#rail-parked").innerHTML = list.length ? list.map(p => `
       <div class="park"><div class="s"></div>
-        <div class="pinf">${p.job} <small>· shard ${p.shard_id} · ${kindLabel(p.kind)}</small><br><small>${p.rel_path || ""}</small></div>
-        <div class="why">${p.error || "parked"}</div></div>`).join("")
+        <div class="pinf">${esc(p.job)} <small>· shard ${esc(p.shard_id)} · ${esc(kindLabel(p.kind))}</small><br><small>${esc(p.rel_path || "")}</small></div>
+        <div class="why">${esc(p.error || "parked")}</div></div>`).join("")
       : `<div class="jmeta" style="padding:6px 4px">no parked shards</div>`;
   }
 
@@ -945,13 +1213,14 @@
   // ================= queue & parked-shards page =================
   const Q = { qdepth:$("#qdepth"), bykind:$("#bykind"), parkedtb:$("#parkedtb"), qbar2:$("#qbar2"),
     qkQ:$("#qk-q"), qkL:$("#qk-l"), qkD:$("#qk-d"), qkP:$("#qk-p"),
+    qkReq:$("#qk-req"), qkRR:$("#qk-rr"), qkRRSub:$("#qk-rr-sub"),
     smQ:$("#sm-q"), smL:$("#sm-l"), smD:$("#sm-d"), smP:$("#sm-p") };
   const qFilter = { job:"all", state:"all" };
   const queueJobs = () => [...new Set(S.queue.depth.map(d => d.job))];
   const chip = (k, v, label, on) => `<button class="chip ${on ? "on" : ""}" data-fk="${k}" data-fv="${v}">${label}</button>`;
   let lastFilterSig = "";
   function buildFilters() {
-    const jc = ["all", ...queueJobs()].map(j => chip("job", j, j === "all" ? "all jobs" : j, qFilter.job === j)).join("");
+    const jc = ["all", ...queueJobs()].map(j => chip("job", esc(j), j === "all" ? "all jobs" : esc(j), qFilter.job === j)).join("");
     const sc = ["all", "QUEUED", "LEASED", "DONE", "PARKED"].map(s => chip("state", s, s === "all" ? "all" : s.toLowerCase(), qFilter.state === s)).join("");
     $("#qfilters").innerHTML =
       `<div class="fgroup"><span class="fl">job</span><div class="chips">${jc}</div></div>` +
@@ -965,6 +1234,7 @@
 
   function renderQueuePage() {
     const depth = S.queue.depth || [];
+    $("#q-updated").textContent = `polled every ${(POLL_MS / 1000).toFixed(1)}s`;
     if (qFilter.job !== "all" && !queueJobs().includes(qFilter.job)) qFilter.job = "all";
     const sig = queueJobs().join(",");
     if (sig !== lastFilterSig) { lastFilterSig = sig; buildFilters(); }
@@ -972,11 +1242,11 @@
       (qFilter.job === "all" || d.job === qFilter.job) && (qFilter.state === "all" || d.state === qFilter.state));
     const rows = [...filtered].sort((a, b) => a.job < b.job ? -1 : a.job > b.job ? 1 : (a.pass_no - b.pass_no) || (stOrd[a.state] - stOrd[b.state]));
     const maxc = Math.max(...depth.map(d => d.count), 1);
-    Q.qdepth.innerHTML = rows.length ? rows.map(d => `<tr data-job="${d.job}" class="clickable" title="Open ${d.job} detail">
-      <td class="l"><span style="color:var(--ink);font-weight:600">${d.job}</span><span class="gojob h">↗</span></td>
-      <td class="l" style="color:var(--muted)">pass ${d.pass_no}</td>
-      <td class="l">${kindLabel(d.kind)}</td>
-      <td class="l"><span class="pill ${stPill[d.state] || "mut"}">${d.state.toLowerCase()}</span></td>
+    Q.qdepth.innerHTML = rows.length ? rows.map(d => `<tr data-job="${esc(d.job)}" class="clickable" title="Open ${esc(d.job)} detail">
+      <td class="l"><span style="color:var(--ink);font-weight:600">${esc(d.job)}</span><span class="gojob h">↗</span></td>
+      <td class="l" style="color:var(--muted)">pass ${esc(d.pass_no)}</td>
+      <td class="l">${esc(kindLabel(d.kind))}</td>
+      <td class="l"><span class="pill ${stPill[d.state] || "mut"}">${esc(d.state.toLowerCase())}</span></td>
       <td><div class="qshards"><span>${comma(d.count)}</span><span class="mini-bar"><i style="width:${d.count / maxc * 100}%"></i></span></div></td></tr>`).join("")
       : `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:22px">no shards match this filter</td></tr>`;
     const fc = document.getElementById("fcount");
@@ -985,7 +1255,7 @@
     const byk = {}; depth.filter(d => d.state === "QUEUED").forEach(d => byk[d.kind] = (byk[d.kind] || 0) + d.count);
     const kmax = Math.max(...Object.values(byk), 1);
     Q.bykind.innerHTML = Object.keys(byk).length ? Object.entries(byk).sort((a, b) => b[1] - a[1]).map(([k, v]) =>
-      `<div class="krow"><span class="kn">${kindLabel(k)}</span><span class="kb"><i style="width:${v / kmax * 100}%"></i></span><span class="kc">${comma(v)}</span></div>`).join("")
+      `<div class="krow"><span class="kn">${esc(kindLabel(k))}</span><span class="kb"><i style="width:${v / kmax * 100}%"></i></span><span class="kc">${comma(v)}</span></div>`).join("")
       : `<div class="jmeta">no queued shards</div>`;
 
     const t = { QUEUED:0, LEASED:0, DONE:0, PARKED:0 }; depth.forEach(d => t[d.state] = (t[d.state] || 0) + d.count);
@@ -998,27 +1268,176 @@
     Q.smQ.textContent = comma(t.QUEUED); Q.smL.textContent = comma(t.LEASED); Q.smD.textContent = comma(t.DONE); Q.smP.textContent = comma(t.PARKED);
     Q.qkQ.textContent = comma(t.QUEUED); Q.qkL.textContent = comma(t.LEASED); Q.qkD.textContent = comma(t.DONE); Q.qkP.textContent = comma(t.PARKED);
 
+    // Retry pressure, straight from the scheduler's own counters: how many
+    // leases expired and were requeued, and what share of all grants that is.
+    const req = S.glob.lease_expiries_total, grants = S.glob.work_grants_total;
+    Q.qkReq.textContent = req == null ? "–" : comma(req);
+    if (req == null || !grants) {
+      Q.qkRR.textContent = "–";
+      Q.qkRRSub.textContent = "of all work grants";
+    } else {
+      Q.qkRR.innerHTML = (req / grants * 100).toFixed(2) + `<span class="u">%</span>`;
+      Q.qkRRSub.textContent = `${comma(req)} of ${comma(grants)} grants`;
+    }
+
     const parked = S.queue.parked || [];
-    Q.parkedtb.innerHTML = parked.length ? parked.map(p => `<tr data-job="${p.job}" class="clickable" title="Open ${p.job} detail">
-      <td class="l" style="color:var(--ink)">#${p.shard_id}</td>
-      <td class="l">${p.job} <span style="color:var(--muted)">· p${p.pass_no}</span><span class="gojob">↗</span></td>
-      <td class="l"><span class="pill mut plain" style="font-size:9px">${kindLabel(p.kind)}</span></td>
-      <td class="l"><div class="path" title="${p.rel_path || ""}">${p.rel_path || ""}</div></td>
-      <td><span class="attempts">${p.attempt}/5</span></td>
-      <td class="l"><span class="errpill">${p.error || "—"}</span></td>
-      <td class="l" style="color:var(--ink-2)">${p.last_agent || "—"}</td>
-      <td>—</td>
-      <td><div class="park-acts"><button class="abtn" disabled title="Phase 2 — re-queue">↻ retry</button><button class="abtn" disabled title="Phase 2 — accept gap">✕ drop</button></div></td></tr>`).join("")
+    // Bulk retry/drop are scoped to the job filter — retrying the whole fleet's
+    // parked backlog in one click is rarely what an operator means.
+    const bulkJob = qFilter.job !== "all" ? qFilter.job : null;
+    const bulkTargets = parked.filter(p => !bulkJob || p.job === bulkJob);
+    $("#park-bulk").innerHTML = bulkJob && bulkTargets.length
+      ? `<button class="abtn" data-pk="retry-job" data-job="${esc(bulkJob)}">↻ retry all ${bulkTargets.length}</button>
+         <button class="abtn danger" data-pk="drop-job" data-job="${esc(bulkJob)}">✕ drop all ${bulkTargets.length}</button>`
+      : (parked.length ? `<span class="eyebrow">filter by job to act in bulk</span>` : "");
+
+    Q.parkedtb.innerHTML = parked.length ? parked.map(p => `<tr data-job="${esc(p.job)}" class="clickable" title="Open ${esc(p.job)} detail">
+      <td class="l" style="color:var(--ink)">#${esc(p.shard_id)}</td>
+      <td class="l">${esc(p.job)} <span style="color:var(--muted)">· p${esc(p.pass_no)}</span><span class="gojob">↗</span></td>
+      <td class="l"><span class="pill mut plain" style="font-size:9px">${esc(kindLabel(p.kind))}</span></td>
+      <td class="l"><div class="path" title="${esc(p.rel_path || "")}">${esc(p.rel_path || "")}</div></td>
+      <td><span class="attempts">${esc(p.attempt)}/5</span></td>
+      <td class="l"><span class="errpill">${esc(p.error || "—")}</span></td>
+      <td class="l" style="color:var(--ink-2)">${esc(p.last_agent || "—")}</td>
+      <td title="${p.parked_at_ms ? esc(new Date(p.parked_at_ms).toISOString()) : ""}">${ago(p.parked_at_ms)}</td>
+      <td><div class="park-acts">
+        <button class="abtn" data-pk="retry" data-id="${esc(p.shard_id)}" title="Re-queue for a fresh attempt on any agent">↻ retry</button>
+        <button class="abtn danger" data-pk="drop" data-id="${esc(p.shard_id)}" data-path="${esc(p.rel_path || "")}" title="Discard the shard, accepting the gap">✕ drop</button>
+      </div></td></tr>`).join("")
       : `<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:22px">no parked shards</td></tr>`;
   }
 
+  // ---------- parked-shard actions ----------
+  async function parkedAction(btn) {
+    const kind = btn.dataset.pk;
+    if (kind === "retry") {
+      return act(btn, `/api/v1/parked/${encodeURIComponent(btn.dataset.id)}/retry`,
+        undefined, `shard #${btn.dataset.id} re-queued`);
+    }
+    if (kind === "drop") {
+      const ok = await confirmAction({
+        title: "Drop parked shard",
+        text: `Discard shard <b>#${esc(btn.dataset.id)}</b>${btn.dataset.path ? ` (<b>${esc(btn.dataset.path)}</b>)` : ""}? Its work is abandoned and the destination keeps that gap — the job can still converge and report success without it.`,
+        okLabel: "drop shard",
+      });
+      return ok && act(btn, `/api/v1/parked/${encodeURIComponent(btn.dataset.id)}/drop`,
+        undefined, `shard #${btn.dataset.id} dropped`);
+    }
+    const job = btn.dataset.job;
+    if (kind === "retry-job") {
+      return act(btn, `/api/v1/jobs/${encodeURIComponent(job)}/parked/retry`,
+        undefined, `re-queued every parked shard of ${job}`);
+    }
+    if (kind === "drop-job") {
+      const ok = await confirmAction({
+        title: "Drop all parked shards",
+        text: `Discard <b>every</b> parked shard of <b>${esc(job)}</b>? Each abandoned shard leaves a permanent gap in the destination.`,
+        okLabel: "drop all", echo: job,
+      });
+      return ok && act(btn, `/api/v1/jobs/${encodeURIComponent(job)}/parked/drop`,
+        undefined, `dropped every parked shard of ${job}`);
+    }
+  }
+  Q.parkedtb.addEventListener("click", e => {
+    const btn = e.target.closest("button[data-pk]"); if (btn) { e.stopPropagation(); parkedAction(btn); }
+  });
+  $("#park-bulk").addEventListener("click", e => {
+    const btn = e.target.closest("button[data-pk]"); if (btn) parkedAction(btn);
+  });
+
+  // ================= errors & verify-failure browser =================
+  // Backed by /api/v1/jobs/{name}/errors, which merges the three journal record
+  // types an operator has to triage — copy errors, fidelity exceptions and
+  // verify failures — and returns a by_class histogram alongside the page. The
+  // class chips are built from that histogram rather than a fixed list, so they
+  // show exactly the errno families this job actually produced.
+  const E = { job:null, pass:"all", class:"", path:"", offset:0, limit:200,
+              data:null, byClass:{} };
+
+  async function loadErrors() {
+    if (!E.job) { E.data = null; renderErrors(); return; }
+    const q = new URLSearchParams({ pass: E.pass, limit: String(E.limit), offset: String(E.offset) });
+    if (E.class) q.set("class", E.class);
+    if (E.path) q.set("path", E.path);
+    try {
+      E.data = await api(`/api/v1/jobs/${encodeURIComponent(E.job)}/errors?` + q);
+      // Keep the unfiltered histogram so selecting a class does not collapse
+      // the chip row to just that class.
+      if (!E.class) E.byClass = E.data.by_class || {};
+    } catch (err) {
+      // A job with no passes yet 404s here; that is an empty state, not a fault.
+      E.data = { count: 0, errors: [], by_class: {} };
+    }
+    // The class chips come from the response histogram, so they can only be
+    // built after the first load — not when the view is opened.
+    renderErrorsFilters();
+    renderErrors();
+  }
+
+  function renderErrorsFilters() {
+    const jobs = S.jobs.map(j => j.name);
+    if (!E.job && jobs.length) { E.job = S.selected && jobs.includes(S.selected) ? S.selected : jobs[0]; loadErrors(); }
+    $("#e-jobs").innerHTML = jobs.length
+      ? jobs.map(j => chip("ejob", esc(j), esc(j), E.job === j)).join("")
+      : `<span class="jmeta">no jobs</span>`;
+    const sel = S.jobs.find(j => j.name === E.job);
+    const np = sel ? sel.pass_count : 0;
+    const passes = ["all"]; for (let i = 1; i <= np; i++) passes.push(String(i));
+    $("#e-passes").innerHTML = passes.map(p =>
+      chip("epass", p, p === "all" ? "all passes" : "pass " + p, E.pass === p)).join("");
+    const classes = Object.entries(E.byClass).sort((a, b) => b[1] - a[1]);
+    $("#e-classes").innerHTML = classes.length
+      ? chip("eclass", "", "all", E.class === "") +
+        classes.map(([c, n]) => chip("eclass", esc(c), `${esc(c)} ${n}`, E.class === c)).join("")
+      : `<span class="jmeta">none</span>`;
+  }
+
+  function renderErrors() {
+    const d = E.data, tb = $("#etb");
+    if (!d) { tb.innerHTML = `<tr><td colspan="6" style="color:var(--muted);padding:20px">select a job</td></tr>`; return; }
+    const recs = d.errors || [];
+    tb.innerHTML = recs.length ? recs.map(r => `<tr>
+      <td>${esc(r.pass)}</td>
+      <td><span class="pill ${r.type === "VERIFY_FAIL" ? "attn" : "pause"} plain" style="font-size:9px">${esc((r.type || "").toLowerCase())}</span></td>
+      <td><span class="errpill">${esc(r.class || "—")}</span></td>
+      <td class="epath-cell">${esc(r.rel_path || "")}</td>
+      <td class="edetail">${esc(r.detail || "")}</td>
+      <td class="edetail">${r.ts_ns ? esc(new Date(r.ts_ns / 1e6).toISOString().replace("T", " ").slice(0, 19)) : "—"}</td>
+    </tr>`).join("")
+      : `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:22px">no errors match this filter</td></tr>`;
+    const total = Object.values(E.byClass).reduce((a, b) => a + b, 0);
+    $("#e-count").textContent = total ? `${comma(total)} record${total === 1 ? "" : "s"} in journal` : "clean";
+    const from = recs.length ? E.offset + 1 : 0;
+    $("#e-range").textContent = `${comma(from)}–${comma(E.offset + recs.length)}${d.truncated ? "+" : ""}`;
+    $("#e-prev").disabled = E.offset === 0;
+    $("#e-next").disabled = !d.truncated;
+  }
+
+  $("#e-jobs").addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    E.job = b.dataset.fv; E.offset = 0; E.class = ""; E.byClass = {};
+    renderErrorsFilters(); loadErrors();
+  });
+  $("#e-passes").addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    E.pass = b.dataset.fv; E.offset = 0; renderErrorsFilters(); loadErrors();
+  });
+  $("#e-classes").addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    E.class = b.dataset.fv; E.offset = 0; renderErrorsFilters(); loadErrors();
+  });
+  $("#e-apply").addEventListener("click", () => { E.path = $("#e-path").value.trim(); E.offset = 0; loadErrors(); });
+  $("#e-path").addEventListener("keydown", e => { if (e.key === "Enter") $("#e-apply").click(); });
+  $("#e-prev").addEventListener("click", () => { E.offset = Math.max(0, E.offset - E.limit); loadErrors(); });
+  $("#e-next").addEventListener("click", () => { E.offset += E.limit; loadErrors(); });
+
   // ---------- view switching + click-through ----------
-  const views = { overview:$("#view-overview"), queue:$("#view-queue") };
+  const views = { overview:$("#view-overview"), queue:$("#view-queue"), errors:$("#view-errors") };
   function showView(v, noScroll) {
     curView = v;
     for (const k in views) views[k].hidden = (k !== v);
     document.querySelectorAll(".nav button").forEach(b => b.classList.toggle("on", b.dataset.v === v));
     if (v === "queue") renderQueuePage();
+    if (v === "errors") { renderErrorsFilters(); loadErrors(); }
     if (!noScroll) scrollTo({ top: 0, behavior: reduce ? "auto" : "smooth" });
   }
   document.querySelectorAll(".nav button").forEach(b => b.addEventListener("click", () => showView(b.dataset.v)));
@@ -1039,14 +1458,46 @@
       : `<div class="jmeta" style="padding:8px 6px">waiting for events…</div>`;
   }
   let soonT = null; const soon = () => { clearTimeout(soonT); soonT = setTimeout(pollAll, 250); };
+
+  // Folds a 1 Hz stats frame into the in-memory report + jobs row for the job
+  // it names, then repaints. Purely additive: the next poll re-reads the
+  // authoritative values, so a dropped or stale frame self-corrects.
+  function applyStats(ev) {
+    const d = ev.data || {};
+    const jr = S.jobs.find(j => j.name === ev.job);
+    if (jr && ev.pass_no === jr.pass_no) {
+      jr.entries_walked = d.entries_walked;
+      jr.pass_state = d.pass_state || jr.pass_state;
+    }
+    if (S.report && S.report.job === ev.job && S.report.passes) {
+      const p = S.report.passes.find(p => p.pass_no === ev.pass_no);
+      if (p) {
+        Object.assign(p, {
+          state: d.pass_state || p.state,
+          entries_walked: d.entries_walked, files_copied: d.files_copied,
+          bytes_copied: d.bytes_copied, meta_fixed: d.meta_fixed,
+          orphans: d.orphans, errors: d.errors,
+          verify_ok: d.verify_ok, verify_fail: d.verify_fail,
+          delta_files: (+d.files_copied || 0) + (+d.meta_fixed || 0),
+          delta_bytes: d.bytes_copied,
+        });
+        renderDetail();
+      }
+    }
+    if (jr) renderJobs();
+  }
   function handleEvent(ev) {
     const d = ev.data || {}; let sev = "", msg = "";
     switch (ev.type) {
-      case "stats": return; // 1 Hz heartbeat — throughput comes from /metrics
-      case "job_state":  sev = d.state === "COMPLETED" ? "good" : d.state === "FAILED" ? "crit" : ""; msg = `<b>${ev.job}</b> → ${(d.state || "").toLowerCase()}`; break;
-      case "pass_state": sev = d.state === "COMPLETE" ? "good" : ""; msg = `<b>${ev.job}</b> pass ${ev.pass_no} ${(d.state || "").toLowerCase()}`; break;
-      case "agent":      sev = d.connected ? "" : "warn"; msg = `agent <b>${d.id}</b> ${d.connected ? "connected" : "disconnected"}`; break;
-      case "shard_parked": sev = "crit"; msg = `shard parked <b>${ev.job || ""}</b> #${d.shard_id || ""}${d.error ? " — " + d.error : ""}`; break;
+      // stats is the coordinator's 1 Hz per-pass heartbeat. Throughput still
+      // comes from /metrics (these counters are per-pass, not rates), but
+      // folding the counters into the live report lets the job detail and the
+      // shard mix advance at 1 Hz instead of waiting for the 2.5 s poll.
+      case "stats": applyStats(ev); return;
+      case "job_state":  sev = d.state === "COMPLETED" ? "good" : d.state === "FAILED" ? "crit" : ""; msg = `<b>${esc(ev.job)}</b> → ${esc((d.state || "").toLowerCase())}`; break;
+      case "pass_state": sev = d.state === "COMPLETE" ? "good" : ""; msg = `<b>${esc(ev.job)}</b> pass ${esc(ev.pass_no)} ${esc((d.state || "").toLowerCase())}`; break;
+      case "agent":      sev = d.connected ? "" : "warn"; msg = `agent <b>${esc(d.id)}</b> ${d.connected ? "connected" : "disconnected"}`; break;
+      case "shard_parked": sev = "crit"; msg = `shard parked <b>${esc(ev.job || "")}</b> #${esc(d.shard_id || "")}${d.error ? " — " + esc(d.error) : ""}`; break;
       default: return;
     }
     evBuf.unshift([new Date(ev.ts_ms || Date.now()).toTimeString().slice(0, 8), sev, msg]);
@@ -1100,7 +1551,7 @@
 
   // ---------- init ----------
   renderFeed(); buildFilters(); setConn("", "connecting…"); renderHeader();
-  connectWS(); pollAll(); setInterval(pollAll, 2500);
+  connectWS(); pollAll(); setInterval(pollAll, POLL_MS);
 })();
 </script>
 </body>
