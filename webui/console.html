@@ -295,6 +295,38 @@
   .tp { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
   .tp .bar { width: 46px; height: 6px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
   .tp .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  /* expandable per-agent in-flight detail */
+  table.ft tr.agrow { cursor: pointer; }
+  table.ft tr.agrow.open td { background: var(--panel-2); }
+  .chev { display: inline-block; width: 9px; color: var(--muted); font-size: 9px; transition: transform .12s ease; }
+  tr.agrow.open .chev { transform: rotate(90deg); color: var(--accent); }
+  @media (prefers-reduced-motion: reduce) { .chev { transition: none; } }
+  td.ifcell { padding: 0 !important; background: var(--panel-2); }
+  .infl { padding: 9px 11px 11px; border-left: 2px solid var(--accent); }
+  .infl-head {
+    display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 7px;
+  }
+  .infl-note { font-family: var(--mono); font-size: 11px; color: var(--ink-2); padding: 3px 0; }
+  .infl-note.warn { color: var(--warn); }
+  .ifl { display: flex; flex-direction: column; gap: 5px; }
+  .ifi {
+    display: grid; grid-template-columns: auto minmax(0,1fr) auto; gap: 9px; align-items: baseline;
+    font-family: var(--mono); font-size: 11px; padding: 5px 7px; border-radius: 6px;
+    background: var(--panel); border: 1px solid var(--line);
+  }
+  .ifi.queued { opacity: .72; }
+  /* A shard running far longer than its peers is the one to investigate, so
+     the longest-running item (the head of the sorted list) is marked. */
+  .ifi.lead { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+  .ifi .ik { font-size: 9.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--accent); white-space: nowrap; }
+  .ifi.queued .ik { color: var(--muted); }
+  .ifi .ip { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ifi .it { color: var(--ink-2); white-space: nowrap; text-align: right; }
+  .ifi .it b { color: var(--ink); font-weight: 600; }
+  .ifi .it .prog { color: var(--muted); }
+
   .st-dot { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--ink-2); }
   .st-dot::before { content:""; width:7px;height:7px;border-radius:50%; background: var(--good); }
   .st-dot.off::before { background: var(--muted); }
@@ -809,7 +841,11 @@
 
   // ---------- live state ----------
   const S = { jobs:[], queue:{depth:[],parked:[]}, agents:[], rates:{}, glob:{},
-              sum:{scan:0,files:0,bytes:0}, selected:null, report:null, info:null };
+              sum:{scan:0,files:0,bytes:0}, selected:null, report:null, info:null,
+              // In-flight detail is fetched only for the one expanded agent:
+              // the endpoint is per-agent, so polling every agent would
+              // reintroduce exactly the N+1 the jobs list was fixed to avoid.
+              expandedAgent:null, inflight:null };
   const POLL_MS = 2500;
   const HN = 90;
   let bwHist = [], filesHist = [], scanHist = [];
@@ -907,6 +943,7 @@
       S.report = S.selected
         ? await api("/api/v1/jobs/" + encodeURIComponent(S.selected) + "/report").catch(() => null)
         : null;
+      await loadInflight();
 
       renderAll();
       setConn("ok", "live");
@@ -914,6 +951,23 @@
     } catch (e) {
       if (String(e.message) !== "401") setConn("err", "disconnected — retrying");
       footUpd.textContent = "connection error";
+    }
+  }
+
+  // ---------- per-agent in-flight snapshot ----------
+  // The endpoint distinguishes three situations that must not be collapsed
+  // into "nothing to show": an agent too old to report detail at all
+  // (supported:false), one that genuinely holds no work (empty list), and one
+  // that has dropped its session (404). Each is surfaced as itself.
+  async function loadInflight() {
+    const id = S.expandedAgent;
+    if (!id) { S.inflight = null; return; }
+    try {
+      S.inflight = await api("/api/v1/agents/" + encodeURIComponent(id) + "/inflight");
+    } catch (e) {
+      S.inflight = { error: /404/.test(String(e.message))
+        ? "agent is no longer connected"
+        : "could not read in-flight work" };
     }
   }
 
@@ -1119,22 +1173,80 @@
       const toggle = a.enabled
         ? `<button class="abtn" data-ag="disable" data-id="${esc(a.id)}" title="Stop granting new shards; in-flight leases finish">drain</button>`
         : `<button class="abtn go" data-ag="enable" data-id="${esc(a.id)}" title="Resume scheduling work to this agent">resume</button>`;
-      return `<tr class="${off || drained ? "drained" : ""}">
-        <td><div class="ag"><span class="id">${esc(a.id)}</span><span class="host">${esc(a.hostname || "")} · <span class="st-dot ${stcls}">${sttxt}</span></span></div></td>
+      // Every row stays expandable, including an offline one: if an agent drops
+      // while its detail is open, the panel has to remain collapsible, and
+      // "no longer connected" is itself the answer to what it is working on.
+      const open = S.expandedAgent === a.id;
+      return `<tr class="agrow ${off || drained ? "drained" : ""} ${open ? "open" : ""}" data-exp="${esc(a.id)}">
+        <td><div class="ag"><span class="id"><span class="chev">▶</span> ${esc(a.id)}</span><span class="host">${esc(a.hostname || "")} · <span class="st-dot ${stcls}">${sttxt}</span></span></div></td>
         <td>${off ? "—" : countFmt(r.scan)}</td>
         <td>${off ? "—" : countFmt(r.files)}</td>
         <td><div class="tp"><span>${off ? "0" : bv}</span><span style="color:var(--muted);font-size:10px">${bu}</span><div class="bar"><i style="width:${pct}%"></i></div></div></td>
         <td>${r.rss ? humanBytes(r.rss) : "—"}</td>
         <td>${off ? "—" : ago(a.last_heartbeat_ms)}</td>
-        <td>${toggle}</td></tr>`;
+        <td>${toggle}</td></tr>` +
+        (open ? `<tr class="ifrow"><td class="ifcell" colspan="7">${inflightPanel()}</td></tr>` : "");
     }).join("");
     fleetHb.textContent = hbn ? "avg hb " + (hbsum / hbn / 1000).toFixed(1) + "s" : "";
   }
-  fleet.addEventListener("click", e => {
-    const btn = e.target.closest("button[data-ag]"); if (!btn) return;
-    const id = btn.dataset.id, on = btn.dataset.ag === "enable";
-    act(btn, `/api/v1/agents/${encodeURIComponent(id)}/${on ? "enable" : "disable"}`,
-      undefined, `${id} ${on ? "resumed scheduling" : "draining"}`);
+  // Renders the expanded agent's in-flight work: what it holds right now, how
+  // long each item has been running, and how far it has got. That last part is
+  // what separates a shard that is stuck from one that is merely slow.
+  function inflightPanel() {
+    const d = S.inflight;
+    if (!d) return `<div class="infl"><div class="infl-note">loading…</div></div>`;
+    if (d.error) return `<div class="infl"><div class="infl-note warn">${esc(d.error)}</div></div>`;
+    if (!d.supported) {
+      return `<div class="infl"><div class="infl-note warn">
+        this agent's build does not report in-flight detail — upgrade it to see what it is holding
+      </div></div>`;
+    }
+    const items = d.inflight || [];
+    const age = d.reported_at_ms ? ago(d.reported_at_ms) : null;
+    // The snapshot rides the heartbeat, so it is always slightly behind; say so
+    // rather than implying it is live.
+    const head = `<div class="infl-head">
+      <span>in-flight work</span>
+      <span>${items.length} item${items.length === 1 ? "" : "s"}</span>
+      ${age ? `<span>as of ${esc(age)} ago</span>` : ""}
+    </div>`;
+    if (!items.length) {
+      return `<div class="infl">${head}<div class="infl-note">holding no work — idle</div></div>`;
+    }
+    const rows = items.map((it, i) => {
+      // running_ms is 0 while an item sits in the agent's own work queue; in
+      // that state held_ms is the meaningful number.
+      const queued = !it.running;
+      const t = queued ? it.held_ms : it.running_ms;
+      const label = queued ? "queued" : "running";
+      // humanMS reads a zero duration as "no value"; here it means an item the
+      // agent picked up within the last second, which is a real answer.
+      const dur = +t > 0 ? humanMS(t) : "0s";
+      const prog = +it.entries_done
+        ? ` <span class="prog">· ${countFmt(it.entries_done)} done</span>` : "";
+      return `<div class="ifi ${queued ? "queued" : ""} ${!queued && i === 0 ? "lead" : ""}">
+        <span class="ik">${esc(kindLabel(it.kind))}</span>
+        <span class="ip" title="${esc(it.rel_path || "")}">${esc(it.rel_path || "—")}</span>
+        <span class="it">${esc(label)} <b>${esc(dur)}</b>${prog}</span>
+      </div>`;
+    }).join("");
+    return `<div class="infl">${head}<div class="ifl">${rows}</div></div>`;
+  }
+
+  fleet.addEventListener("click", async e => {
+    const btn = e.target.closest("button[data-ag]");
+    if (btn) {
+      const id = btn.dataset.id, on = btn.dataset.ag === "enable";
+      return act(btn, `/api/v1/agents/${encodeURIComponent(id)}/${on ? "enable" : "disable"}`,
+        undefined, `${id} ${on ? "resumed scheduling" : "draining"}`);
+    }
+    const row = e.target.closest("tr[data-exp]"); if (!row) return;
+    const id = row.dataset.exp;
+    S.expandedAgent = S.expandedAgent === id ? null : id;
+    S.inflight = null;
+    renderFleet();          // paint the open row immediately…
+    await loadInflight();   // …then fill it once the snapshot arrives
+    renderFleet();
   });
 
   function renderRail() {
