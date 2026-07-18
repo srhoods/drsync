@@ -13,9 +13,15 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/test/lib.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/drsync-fanout.XXXXXX")
-COORD_PORT=${COORD_PORT:-17560}
-HTTP_PORT=${HTTP_PORT:-17561}
+# Ports come from the kernel (test/lib.sh), not a hardcoded pair: fixed ports
+# collide with anything already listening — including another checkout's
+# coordinator — and several of these scripts used to share the same pair, so
+# they could not run side by side. Override to pin them.
+read -r _CP _HP < <(pick_ports)
+COORD_PORT=${COORD_PORT:-$_CP}
+HTTP_PORT=${HTTP_PORT:-$_HP}
 API="http://127.0.0.1:${HTTP_PORT}"
 AUTH="Authorization: Bearer fanouttoken"
 AGENTS=(fan-a fan-b fan-c)
@@ -59,8 +65,7 @@ SRC_FILES=$(find "$SRC" -type f | wc -l)
     -listen-agent "127.0.0.1:${COORD_PORT}" -listen-http "127.0.0.1:${HTTP_PORT}" \
     -api-token fanouttoken -log-level warn >"$WORK/coord.log" 2>&1 &
 COORD_PID=$!
-for _ in $(seq 1 40); do curl -sf "$API/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
-curl -sf "$API/healthz" >/dev/null || fail "coordinator did not come up"
+wait_coordinator "$API" "$AUTH" || exit 1
 
 AGENT_PIDS=""
 for a in "${AGENTS[@]}"; do

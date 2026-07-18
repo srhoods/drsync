@@ -16,8 +16,14 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+. "$ROOT/test/lib.sh"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/drsync-abortreclaim.XXXXXX")
-CP=${CP:-17680}; HP=${HP:-17681}
+# Ports come from the kernel (test/lib.sh), not a hardcoded pair: fixed ports
+# collide with anything already listening — including another checkout's
+# coordinator — and several of these scripts used to share the same pair, so
+# they could not run side by side. Override with CP/HP to pin them.
+read -r _CP _HP < <(pick_ports)
+CP=${CP:-$_CP}; HP=${HP:-$_HP}
 API="http://127.0.0.1:${HP}"; AUTH="Authorization: Bearer abrtok"
 PASS=0
 cleanup() {
@@ -45,8 +51,7 @@ echo small > "$SRC/d/note.txt"
     -listen-http 127.0.0.1:$HP -api-token abrtok -log-level warn \
     >"$WORK/coord.log" 2>&1 &
 CPID=$!
-for _ in $(seq 1 40); do curl -sf "$API/healthz" >/dev/null 2>&1 && break; sleep 0.25; done
-curl -sf "$API/healthz" >/dev/null || fail "coordinator did not come up"
+wait_coordinator "$API" "$AUTH" || exit 1
 
 APIDS=""
 for a in ab-a ab-b; do
