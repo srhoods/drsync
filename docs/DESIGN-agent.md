@@ -42,8 +42,13 @@ decision D9).
 > (blocks<size heuristic; dense fallback when SEEK_DATA is unsupported) —
 > verified: 16 MiB/4 KiB sparse file arrives content-identical using <1 MiB
 > on disk. New `fidelity_exceptions` counter flows agent→proto→coordinator→
-> API. POSIX↔NFSv4 ACL *translation* remains TODO(slice4): cross-flavor
-> pairs currently hit the untranslatable policy.
+> API, and each exception is now also **journalled** as a
+> `JR_FIDELITY_EXCEPTION` record (rel_path, the attribute name, errno), so an
+> unpreservable attribute is visible in `drsync journal cat --type
+> fidelity_exception` and the report — not just counted (`walk_fidelity`,
+> unit-tested by `agent/test/fidelity_test.c`). POSIX↔NFSv4 ACL *translation*
+> remains a tracked follow-up: cross-flavor pairs still hit the untranslatable
+> policy, and it cannot be exercised without an NFSv4 mount.
 > Slice 4 — journals + the delete pass. Agents journal per-file outcomes
 > (`src/jrn.c`): COPIED, META_FIXED, ORPHAN, DIR_META, ERROR,
 > FIDELITY_EXCEPTION, NLINK_DUP, SRC_CHANGED, WOULD_COPY/WOULD_DELETE,
@@ -295,6 +300,15 @@ per file:
   not representable       → per opts.acls.untranslatable: warn (journal
                             FIDELITY_EXCEPTION + apply mode bits only) | fail | skip
 ```
+
+**Status:** the raw same-flavor copies and the untranslatable policy (with
+`JR_FIDELITY_EXCEPTION` now journalled, not just counted) are implemented. The
+two **translate** branches are a tracked follow-up — a cross-flavor pair
+currently falls straight to the untranslatable policy. The translation is
+deferred because it cannot be verified without an NFSv4 mount (local
+filesystems expose `system.posix_acl_*`, never `system.nfs4_acl`), so landing
+it untested would be a correctness risk on exactly the metadata operators care
+about most.
 
 Translation tables follow the IETF POSIX↔NFSv4 ACL mapping draft semantics; the
 read-back verification probe at job start is what turns "should work" into "measured on

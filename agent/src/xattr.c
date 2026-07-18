@@ -2,11 +2,12 @@
  *
  * All readable namespaces are copied. POSIX ACLs are byte-stable kernel blobs
  * carried in system.posix_acl_access/default; NFSv4 ACLs are the XDR blob in
- * system.nfs4_acl (raw copy between v4 mounts per design §5.1 — the
- * POSIX↔NFSv4 translation table is TODO(slice4), so a cross-flavor pair hits
- * the untranslatable policy). Any attribute that cannot be applied is counted
- * as a fidelity exception (or an error under policy=fail) — never dropped
- * silently.
+ * system.nfs4_acl (raw copy between v4 mounts per design §5.1). A cross-flavor
+ * pair (POSIX-ACL source ↔ NFSv4 destination) still hits the untranslatable
+ * policy: the POSIX↔NFSv4 translation table is a tracked follow-up, since it
+ * cannot be exercised without an NFSv4 mount. Any attribute that cannot be
+ * applied is counted AND journaled as a fidelity exception (or an error under
+ * policy=fail) — never dropped silently (walk_fidelity below).
  *
  * Path-based variants go through /proc/self/fd/<dirfd>/<name>, which avoids
  * opening target files at all (matters for the clean-file drift check: two
@@ -25,10 +26,16 @@
 
 void walk_fidelity(struct walk_ctx *ctx, const char *what, const char *path)
 {
+    int e = errno; /* jrn_emit must not clobber the errno we report */
     CTR_ADD(ctx->c.fidelity_exceptions, 1);
-    /* TODO(slice4): JR_FIDELITY_EXCEPTION journal record */
+    /* Journal the exception so it is visible in the operator surface
+     * (`drsync journal cat --type fidelity`, the migration report) — the
+     * design's "counted, never dropped silently" promise. `what` names the
+     * attribute that could not be preserved (e.g. system.nfs4_acl). */
+    jrn_emit(ctx, JR_FIDELITY_EXCEPTION, path, NULL, NULL, e, what);
     LOGW("shard %llu: fidelity: %s %s: %s",
-         (unsigned long long)ctx->it->shard_id, what, path, strerror(errno));
+         (unsigned long long)ctx->it->shard_id, what, path, strerror(e));
+    errno = e;
 }
 
 /* ---- attribute classification / policy ---- */
