@@ -136,6 +136,7 @@ enum {
     WI_VERIFY = 2,    /* VerifyBatch: metadata + sampled checksum re-check */
     WI_ENTRYLIST = 3, /* EntryListShard: a name slice of a pathological dir */
     WI_CHUNK = 4,     /* ChunkTask: one byte range of a big file, or its finalize */
+    WI_DIRFIX = 5,    /* DirFixBatch: re-apply directory metadata after all copies */
 };
 
 /* Per-shard walk overrides (proto WalkOverrides). The coordinator sends these
@@ -162,6 +163,15 @@ struct chunk_info {
     char    *temp_name;     /* malloc'd; owner frees */
 };
 
+/* WI_DIRFIX: one directory's target metadata (proto DirMeta). The DIRFIX phase
+ * re-applies these after all copies in a pass have drained, so a directory whose
+ * mtime was bumped by cross-shard renames into it lands on its source value. */
+struct dirmeta {
+    char    *rel_path; /* malloc'd; owner frees */
+    uint32_t uid, gid, mode;
+    int64_t  atime_ns, mtime_ns;
+};
+
 struct shard_item {
     uint64_t lease_id;
     uint32_t lease_ttl_s;
@@ -173,6 +183,8 @@ struct shard_item {
     char   **paths;     /* WI_DELETE/WI_VERIFY: malloc'd array of rel paths */
     unsigned char *vchecksum; /* WI_VERIFY: per-path checksum flag */
     size_t   n_paths;
+    struct dirmeta *dirs;     /* WI_DIRFIX: malloc'd array; owner frees */
+    size_t   n_dirs;
     struct walk_overrides ov; /* WI_SHARD/WI_ENTRYLIST */
     struct chunk_info chunk;  /* WI_CHUNK */
 };

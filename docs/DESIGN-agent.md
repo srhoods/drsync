@@ -86,8 +86,15 @@ decision D9).
 > `server_side_copy`), both verified by `test/scale_e2e.sh`; coordinator-
 > orchestrated cross-fleet ChunkTask fan-out for big files (`chunk.c`,
 > WI_CHUNK, `chunk_groups` + finalize), verified by `test/chunk_e2e.sh`.
-> Not yet: io_uring data path, dirfix/probe task types, coordinator-side
-> DIRFIX task generation (split-dir metadata currently converges over passes).
+> DIRFIX is now wired end-to-end: the coordinator seeds DirFixBatch shards from
+> the pass's `DIR_META` journal records at the SCANNING→DIRFIX transition
+> (`seedDirfix`, streamed in bounded batches, deepest-first per batch), and the
+> agent's `dirfix.c` executor (WI_DIRFIX) re-applies each directory's
+> owner/mode/mtime after the pass has drained — a diff-then-apply that leaves an
+> already-correct directory untouched. This lands split/fanned-out directory
+> mtimes within the same pass rather than relying on convergence over passes
+> (`test/dirfix_e2e.sh`).
+> Not yet: io_uring data path, probe task type.
 > Verified end-to-end by `test/e2e.sh` (sync + fidelity + verify + delete).
 
 ---
@@ -307,8 +314,14 @@ this exact mount pair" — surfaced in the migration report per mount pair.
   additionally re-read **both** sides (io_uring, same engine) and compare xxh3-128.
   Mismatch ⇒ `VERIFY_FAIL` journal + (per `on_mismatch: recopy`) an immediate copy task.
 - **DIRFIX batch task:** list of (rel_path, uid, gid, mode, atime, mtime) from the pass's
-  `DIR_META` journal records, applied deepest-first (coordinator pre-sorts by depth
-  descending). Restrictive modes (0500 dirs) land after population by construction.
+  `DIR_META` journal records, applied deepest-first (coordinator pre-sorts each batch by
+  depth descending). A **diff-then-apply**: owner/mode/mtime are compared first and a
+  directory already at its source values is left untouched (atime, which drifts on every
+  read, is refreshed when applying but is never the reason to apply). Fixes are counted
+  for observability but deliberately **not** as `meta_fixed` — the walker re-bumps a
+  fanned-out directory every pass, so counting would keep a job from ever converging;
+  correctness comes from DIRFIX running after every pass drains, including the converging
+  one. Restrictive modes (0500 dirs) land after population by construction.
 
 ## 7. Error Taxonomy
 

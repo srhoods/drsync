@@ -250,6 +250,12 @@ void apply_meta(struct walk_ctx *ctx, int fd, const struct estat *ss,
  * Cross-host: ranges of one file are granted to different agents. */
 void process_chunk(const struct shard_item *it);
 
+/* ---- dirfix executor (dirfix.c) ----
+ * Re-applies directory metadata from a DirFixBatch after a pass has drained, so
+ * a directory whose mtime was bumped by cross-shard renames lands on its source
+ * value (docs/DESIGN-coordinator.md §2.2 DIRFIX). */
+void process_dirfix(const struct shard_item *it);
+
 /* ---- walker (walker.c) ---- */
 /* Processes one shard end-to-end and enqueues its ShardResult. */
 void process_shard(const struct shard_item *it);
