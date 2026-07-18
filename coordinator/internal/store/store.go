@@ -375,6 +375,69 @@ func (s *Store) ListJobs() ([]*Job, error) {
 	return out, rows.Err()
 }
 
+// JobSummary is one row of the jobs-list view: the job plus just enough pass
+// rollup for a console row (latest pass and lifetime totals) without a
+// per-job detail fetch.
+//
+// The embedded Job's SpecYAML is deliberately left nil — the list view never
+// renders the spec, and reading every job's spec blob on a 2.5s poll would
+// undo the point of the rollup.
+type JobSummary struct {
+	Job
+	Passes              int
+	LatestPassNo        int
+	LatestPassState     model.PassState
+	LatestEntriesWalked int64
+	FilesCopied         int64
+	BytesCopied         int64
+	Errors              int64
+}
+
+// JobSummaries returns every job with its pass rollup in one query.
+//
+// The console renders this directly, which is why the aggregation lives here
+// rather than in the caller: a list of N jobs used to cost N+1 round trips
+// (list, then a detail fetch per row) every poll, and at fleet scale that
+// dominated the coordinator's request load.
+//
+// The totals subquery and the latest-pass join are kept separate on purpose:
+// mixing SUM() with a bare-column MAX() would leave the non-aggregated columns
+// undefined in SQLite, so the latest pass is selected by an explicit pass_no
+// match instead.
+func (s *Store) JobSummaries() ([]*JobSummary, error) {
+	rows, err := s.rdb.Query(`SELECT j.id, j.name, j.state,
+		  j.dry_run, j.created_at, j.updated_at,
+		  COALESCE(t.npasses, 0), COALESCE(t.files, 0),
+		  COALESCE(t.bytes, 0), COALESCE(t.errors, 0),
+		  COALESCE(lp.pass_no, 0), COALESCE(lp.state, ''),
+		  COALESCE(lp.entries_walked, 0)
+		FROM jobs j
+		LEFT JOIN (SELECT job_id, COUNT(*) npasses, SUM(files_copied) files,
+		                  SUM(bytes_copied) bytes, SUM(errors) errors
+		           FROM passes GROUP BY job_id) t ON t.job_id = j.id
+		LEFT JOIN passes lp ON lp.job_id = j.id AND lp.pass_no =
+		           (SELECT MAX(pass_no) FROM passes WHERE job_id = j.id)
+		ORDER BY j.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*JobSummary
+	for rows.Next() {
+		var v JobSummary
+		var dry int
+		if err := rows.Scan(&v.ID, &v.Name, &v.State, &dry,
+			&v.CreatedAt, &v.UpdatedAt, &v.Passes, &v.FilesCopied, &v.BytesCopied,
+			&v.Errors, &v.LatestPassNo, &v.LatestPassState,
+			&v.LatestEntriesWalked); err != nil {
+			return nil, err
+		}
+		v.DryRun = dry != 0
+		out = append(out, &v)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) SetJobState(id int64, st model.JobState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

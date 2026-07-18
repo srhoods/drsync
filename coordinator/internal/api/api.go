@@ -1,4 +1,4 @@
-// Package api serves the REST surface the CLI and (later) WebUI consume
+// Package api serves the REST surface the CLI and WebUI consume
 // (docs/DESIGN-coordinator.md §6).
 package api
 
@@ -72,8 +72,8 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.met.Registry, promhttp.HandlerOpts{}))
 
-	// Read-only monitoring console (served unauthenticated so the page can load
-	// and then prompt for a token; the data endpoints below still enforce auth).
+	// Operations console (served unauthenticated so the page can load and then
+	// prompt for a token; the data and action endpoints below still enforce auth).
 	mux.HandleFunc("GET /{$}", s.serveUI)
 	mux.HandleFunc("GET /ui", s.serveUI)
 
@@ -175,6 +175,24 @@ type jobView struct {
 	Passes []passView     `json:"passes,omitempty"`
 }
 
+// jobListView is a jobs-list row: the job plus the pass rollup the console
+// needs to draw it. It exists so listing N jobs costs one request rather than
+// one per row (see store.JobSummaries).
+type jobListView struct {
+	Name          string          `json:"name"`
+	State         model.JobState  `json:"state"`
+	DryRun        bool            `json:"dry_run"`
+	PassCount     int             `json:"pass_count"`
+	PassNo        int             `json:"pass_no,omitempty"`
+	PassState     model.PassState `json:"pass_state,omitempty"`
+	EntriesWalked int64           `json:"entries_walked"`
+	FilesCopied   int64           `json:"files_copied"`
+	BytesCopied   int64           `json:"bytes_copied"`
+	Errors        int64           `json:"errors"`
+	CreatedAtMs   int64           `json:"created_at_ms"`
+	UpdatedAtMs   int64           `json:"updated_at_ms"`
+}
+
 type passView struct {
 	PassNo        int             `json:"pass_no"`
 	State         model.PassState `json:"state"`
@@ -255,14 +273,20 @@ func destConflictMsg(dc *store.DestinationConflictError) string {
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
-	jobs, err := s.st.ListJobs()
+	jobs, err := s.st.JobSummaries()
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	out := make([]jobView, 0, len(jobs))
+	out := make([]jobListView, 0, len(jobs))
 	for _, j := range jobs {
-		out = append(out, jobView{Name: j.Name, State: j.State, DryRun: j.DryRun})
+		out = append(out, jobListView{
+			Name: j.Name, State: j.State, DryRun: j.DryRun,
+			PassCount: j.Passes, PassNo: j.LatestPassNo,
+			PassState: j.LatestPassState, EntriesWalked: j.LatestEntriesWalked,
+			FilesCopied: j.FilesCopied, BytesCopied: j.BytesCopied,
+			Errors: j.Errors, CreatedAtMs: j.CreatedAt, UpdatedAtMs: j.UpdatedAt,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }

@@ -1,6 +1,6 @@
 // GET /api/v1/events — the WebSocket event feed (DESIGN-coordinator §6).
 // Emits the events.Bus stream as JSON text frames. Consumers: `drsync events`,
-// `drsync job status --watch`, and the phase-3 WebUI.
+// `drsync job status --watch`, and the WebUI console.
 package api
 
 import (

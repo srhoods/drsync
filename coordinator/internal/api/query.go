@@ -385,6 +385,7 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		parkedHere = append(parkedHere, map[string]any{
 			"shard_id": sh.ID, "pass_no": sh.PassNo, "kind": sh.Kind,
 			"rel_path": sh.RelPath, "attempt": sh.Attempt, "error": sh.Error,
+			"parked_at_ms": sh.UpdatedAt,
 		})
 	}
 
@@ -446,6 +447,9 @@ func (s *Server) getQueue(w http.ResponseWriter, r *http.Request) {
 			"shard_id": sh.ID, "job": sh.Job, "pass_no": sh.PassNo,
 			"kind": sh.Kind, "rel_path": sh.RelPath, "attempt": sh.Attempt,
 			"error": sh.Error, "last_agent": sh.LastAgent,
+			// When the shard entered PARKED — the console's "age" column, which
+			// is how an operator tells a fresh failure from stale residue.
+			"parked_at_ms": sh.UpdatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"depth": depth, "parked": parkedOut})
