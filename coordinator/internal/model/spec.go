@@ -234,6 +234,11 @@ const (
 	// SpreadAlways fans out on every grant, whatever the queue depth. Costs a
 	// coordinator round trip per directory — for diagnosis, not production.
 	SpreadAlways = "always"
+
+	// maxFilterRules / maxFilterPattern mirror the agent's fixed-size filter
+	// table (FILTER_MAX_RULES / FILTER_PATTERN_MAX - 1 in agent/src/msgs.h).
+	maxFilterRules   = 64
+	maxFilterPattern = 255
 )
 
 // SpreadPolicy is the coordinator-side fan-out policy resolved from the spec.
@@ -273,13 +278,28 @@ func (s *JobSpec) Validate() error {
 	if cs == cd || strings.HasPrefix(cs, cd) || strings.HasPrefix(cd, cs) {
 		return fmt.Errorf("source and destination must be disjoint")
 	}
+	// Bounds mirror the agent's fixed-size filter table (FILTER_MAX_RULES /
+	// FILTER_PATTERN_MAX in agent/src/msgs.h). Enforcing them here keeps the
+	// agent's buffers from ever truncating a pattern, which would silently
+	// change matching and copy data the operator meant to exclude.
+	if len(s.Spec.Filters) > maxFilterRules {
+		return fmt.Errorf("filters: %d rules exceeds limit of %d",
+			len(s.Spec.Filters), maxFilterRules)
+	}
 	for i, f := range s.Spec.Filters {
 		if len(f) != 1 {
 			return fmt.Errorf("filters[%d]: want exactly one of include:/exclude:", i)
 		}
-		for k := range f {
+		for k, pat := range f {
 			if k != "include" && k != "exclude" {
 				return fmt.Errorf("filters[%d]: unknown key %q", i, k)
+			}
+			if pat == "" {
+				return fmt.Errorf("filters[%d]: empty pattern", i)
+			}
+			if len(pat) > maxFilterPattern {
+				return fmt.Errorf("filters[%d]: pattern length %d exceeds limit of %d",
+					i, len(pat), maxFilterPattern)
 			}
 		}
 	}

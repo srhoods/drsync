@@ -107,6 +107,28 @@ spec:
 
 Quantity suffixes: `KiB/MiB/GiB/TiB` (binary), plain integers are bytes/counts.
 
+### 1.0.1 Filter semantics
+
+Filters are resolved by the coordinator and carried in `JobOptions`; the **agent
+walker is the sole enforcement point** (`agent/src/filter.c`). Each entry is
+tested by path relative to the job root (`projects/a/x.tmp`), anchored end to
+end, and the **first matching rule wins** — `exclude` drops the entry,
+`include` keeps it; with no match the entry is kept (implicit `include: "**"`).
+Glob syntax:
+
+- `?` matches one character other than `/`;
+- `*` matches zero or more characters other than `/`;
+- `**` matches zero or more characters including `/`; and `**/` additionally
+  matches zero leading path segments, so `**/*.tmp` matches both `x.tmp` and
+  `a/b/c.tmp`.
+- character classes (`[...]`) are **not** supported — `[` is a literal.
+
+An excluded **directory** is pruned whole: the walker never descends into it, so
+nothing beneath it is copied or journalled. Excluding a directory's *contents*
+(`**/.snapshot/**`) leaves the now-empty directory in place; to drop the
+directory too, exclude its path (`**/.snapshot`). At most 64 rules, each pattern
+at most 255 bytes (bounds match the agent's fixed filter table).
+
 ### 1.1 Validation
 
 `drsync job submit spec.yaml` validates before anything runs:
@@ -117,7 +139,8 @@ Quantity suffixes: `KiB/MiB/GiB/TiB` (binary), plain integers are bytes/counts.
 - src ≠ dst and neither is a prefix of the other,
 - destination mount has plausible free space (statfs vs. src estimate once pass 1 has a
   running total; hard check is per-write ENOSPC handling),
-- filters compile,
+- filters are well-formed (each rule is exactly one `include:`/`exclude:`, no
+  empty patterns, ≤ 64 rules, each pattern ≤ 255 bytes),
 - `notifications`: if `on_pass_complete`/`on_job_complete` is set, `recipients` is non-empty
   and every address is well-formed (a permissive sanity check — the SMTP server validates
   authoritatively).

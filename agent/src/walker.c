@@ -4,6 +4,7 @@
  * directory metadata still lands after every rename into it (§3.5).
  * Still TODO: explicit stack for very deep trees. */
 #include "agent.h"
+#include "filter.h"
 #include "wire.h"
 
 #include <dirent.h>
@@ -555,6 +556,19 @@ static uint64_t split_threshold(const struct walk_ctx *ctx)
     return ctx->oe->o.dir_split_threshold;
 }
 
+/* Include/exclude decision for the entry at rel path erel. Rules are evaluated
+ * in order and the first match wins (rsync-like); no match means include. A
+ * path-only test, so it runs before stat — an excluded directory is skipped
+ * whole, never descended. */
+static bool filter_excluded(const struct job_options *o, const char *erel)
+{
+    for (uint32_t i = 0; i < o->n_filters; i++) {
+        if (filter_glob_match(o->filters[i].pattern, erel))
+            return o->filters[i].exclude;
+    }
+    return false;
+}
+
 static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel,
                          int sfd, int dfd, const struct dent *se,
                          const struct dent *de /* NULL if absent in dst */)
@@ -565,6 +579,14 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
     atomic_fetch_add(&g_stat_scanned, 1);
     if (ctx->budget > 0)
         ctx->budget--;
+
+    if (o->n_filters) {
+        char erel[PATH_MAX];
+        if (snprintf(erel, sizeof erel, "%s%s%s", rel, rel[0] ? "/" : "", name) <
+                (int)sizeof erel &&
+            filter_excluded(o, erel))
+            return; /* excluded: not copied; if a dir, its subtree is pruned */
+    }
 
     if (se->st_res != 0) {
         if (se->st_res != -ENOENT) { /* vanished-since-readdir is not an error */
