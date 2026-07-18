@@ -72,12 +72,12 @@ type agentConn struct {
 	hostname   string
 	protoMinor uint32
 	conn       net.Conn
-	wmu      sync.Mutex     // serializes handshake (pre-writer) frames
-	out      chan sendFrame // steady-state frames handed to the writer goroutine
-	stop     chan struct{}  // closed on teardown to stop the writer
-	done     chan struct{}  // closed when the writer has exited
-	drain    bool
-	pause    bool
+	wmu        sync.Mutex     // serializes handshake (pre-writer) frames
+	out        chan sendFrame // steady-state frames handed to the writer goroutine
+	stop       chan struct{}  // closed on teardown to stop the writer
+	done       chan struct{}  // closed when the writer has exited
+	drain      bool
+	pause      bool
 
 	// Journal ack watermarks. onJournalBatch persists a batch and raises
 	// jrnPending; the flusher fsyncs and only then acks up to jrnAcked. Gating
