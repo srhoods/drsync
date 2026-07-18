@@ -50,12 +50,27 @@ go test ./...            # coordinator unit tests
 make -C agent test       # agent unit tests (glob matcher, fidelity, ucopy, temp naming)
 make webui-test          # console behaviour in jsdom (needs Node >= 20)
 make test-all            # go + console
-bash test/e2e.sh         # full lifecycle: sync, converge, verify, gated delete, CLI, events
-bash test/tls_e2e.sh     # mTLS + auth enforcement + reconnect-resume
-bash test/scale_e2e.sh   # entry-list (pathological dir) + chunked copy (huge file)
 ```
 
+Each `test/*_e2e.sh` drives a real coordinator and C agent against a real
+tree, and builds the binaries it needs itself:
+
+| Script | Covers |
+|--------|--------|
+| `e2e.sh` | full lifecycle: sync, converge, verify, gated delete, CLI, events |
+| `chunk_e2e.sh` | cross-host chunk fan-out for a large file |
+| `chunk_abort_reclaim_e2e.sh` | a chunk group abandoned mid-assembly is reclaimed |
+| `chunk_resilience_e2e.sh` | agent dies mid-copy; leases expire and re-grant |
+| `deep_e2e.sh` | directory chain deeper than the walker's in-agent limit |
+| `dirfix_e2e.sh` | DIRFIX over a directory that fans out to entry-lists |
+| `fanout_e2e.sh` | a small volume must still use the whole fleet |
+| `filter_e2e.sh` | include/exclude filters |
+| `probe_e2e.sh` | per-agent mount probe gates pass start |
+| `scale_e2e.sh` | pathological shapes: huge directory, huge file |
+| `temp_reclaim_e2e.sh` | sweep reclaims crash residue, spares live temps |
+| `tls_e2e.sh` | mTLS, auth enforcement, reconnect-resume |
+| `ucopy_e2e.sh` | io_uring copy path with server-side copy disabled |
+
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, build and the Go tests; the
-console tests; the agent build and its unit tests; and `test/e2e.sh`. The
-remaining e2e scripts are not wired in yet — they are the obvious next
-addition.
+console tests; the agent build and its unit tests; and every e2e script above
+as a separate matrix leg.

@@ -91,12 +91,37 @@ jobs:
         run: make -C agent test
 
   e2e:
+    # Each script drives a real coordinator + C agent against a real tree, so
+    # these are the only tests that exercise the agent end to end. They need
+    # io_uring and a filesystem carrying xattrs.
+    #
+    # Every script builds the binaries it needs itself (make -C agent, then
+    # go build), so each leg carries both toolchains rather than being handed
+    # prebuilt binaries — an artifact would just be rebuilt over.
     name: e2e
-    # Only worth the runner time once the pieces it drives compile and pass
-    # their own tests.
+    # Not worth spinning a dozen legs until the code compiles and passes its
+    # own unit tests.
     needs: [go, agent]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
+    strategy:
+      # One broken script should not hide the state of the other eleven.
+      fail-fast: false
+      matrix:
+        script:
+          - e2e                    # full lifecycle: sync, converge, verify, gated delete
+          - chunk_e2e              # cross-host chunk fan-out
+          - chunk_abort_reclaim_e2e # abandoned chunk group is reclaimed
+          - chunk_resilience_e2e   # agent dies mid-copy; leases expire and re-grant
+          - deep_e2e               # directory chain deeper than the walker's in-agent limit
+          - dirfix_e2e             # DIRFIX over a directory that fans out to entry-lists
+          - fanout_e2e             # a small volume must still use the whole fleet
+          - filter_e2e             # include/exclude filters
+          - probe_e2e              # per-agent mount probe gates pass start
+          - scale_e2e              # pathological shapes: huge dir, huge file
+          - temp_reclaim_e2e       # sweep reclaims crash residue, spares live temps
+          - tls_e2e                # mTLS, auth enforcement, reconnect-resume
+          - ucopy_e2e              # io_uring copy path with server-side copy disabled
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -104,17 +129,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # attr supplies setfattr/getfattr, which chunk_e2e and scale_e2e use to
+      # seed and check xattrs. It is not present on the runners by default.
       - name: build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libzstd-dev libssl-dev
+          sudo apt-get install -y --no-install-recommends libzstd-dev libssl-dev attr
 
-      - name: build
-        run: make build
-
-      # Coordinator + C agent sync a real tree, converge, delete-pass, and
-      # check metadata fidelity. This is the only job that exercises the agent
-      # against a live coordinator, so it is also the most environment-
-      # sensitive: it needs io_uring and a filesystem carrying xattrs.
-      - name: e2e
-        run: ./test/e2e.sh
+      - name: ${{ matrix.script }}
+        run: bash test/${{ matrix.script }}.sh
