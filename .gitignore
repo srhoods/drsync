@@ -3,6 +3,10 @@
 /agent/bin/
 agent/src/*.o
 
+# Console test deps. package.json and package-lock.json are tracked so runs are
+# reproducible; the installed tree is not.
+node_modules/
+
 # Runtime state (coordinator store + journals, if pointed inside the tree)
 /var/
 *.db
