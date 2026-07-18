@@ -80,6 +80,11 @@ and delete phases. Browse it with `drsync journal` / `drsync errors`.
   agent that died mid-copy during the job's *final* pass: no later pass runs to
   collect it. Removing `.drsync.tmp.*` by hand is safe **only** when no job
   using that destination is running.
+- **One live job per destination tree.** Submitting a job whose destination
+  overlaps a live job's is rejected (409). The two would reclaim each other's
+  in-progress temps — each agent recognises only its own job as live work — so
+  a big file being assembled by one job can be truncated or lost by the other.
+  Finish or cancel the other job first, or pick a destination outside its tree.
 
 ---
 

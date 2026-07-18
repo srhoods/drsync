@@ -136,6 +136,15 @@ at most 255 bytes (bounds match the agent's fixed filter table).
 
 - schema + unknown-field rejection (typo safety),
 - src/dst paths are absolute, src ≠ dst and neither is a prefix of the other,
+- the destination does not overlap the destination of any **live** job (one not
+  COMPLETED/CANCELLED/FAILED) — rejected with 409. Two jobs writing into one
+  tree damage each other: an agent's orphan sweep reclaims `.drsync.tmp` entries
+  it finds in the destination and can only recognise its own job+pass as live
+  work, so job A's chunk temp — present for the whole multi-host assembly of a
+  big file — reads as stray residue to job B's walk of that directory and is
+  unlinked underneath it. Containment is compared on whole path components, so
+  `/dst/a` and `/dst/ab` are siblings, not an overlap. A finished job holds
+  nothing, so re-syncing its destination with a new job is allowed,
 - destination mount has plausible free space (statfs vs. src estimate once pass 1 has a
   running total; hard check is per-write ENOSPC handling),
 - filters are well-formed (each rule is exactly one `include:`/`exclude:`, no
