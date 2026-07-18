@@ -86,8 +86,19 @@ decision D9).
 > `server_side_copy`), both verified by `test/scale_e2e.sh`; coordinator-
 > orchestrated cross-fleet ChunkTask fan-out for big files (`chunk.c`,
 > WI_CHUNK, `chunk_groups` + finalize), verified by `test/chunk_e2e.sh`.
-> Not yet: io_uring data path, dirfix/probe task types, coordinator-side
-> DIRFIX task generation (split-dir metadata currently converges over passes).
+> The byte-copy fallback (used when copy_file_range is unavailable — cross-
+> device or a mount pair without server-side copy/reflink) now runs on an
+> io_uring registered-buffer engine (`ucopy.c`, WI-agnostic): a depth-2
+> ping-pong over two fixed 1 MiB buffers overlaps the read of the next block
+> with the write of the current one (the read and write are on different mounts
+> in a migration), and the inline xxh3 hash is preserved via a stream-order sink
+> callback. It self-tests READ_FIXED on a memfd and falls back to the serial
+> read/write loop when io_uring is unavailable. Verified by
+> `agent/test/ucopy_test.c` (byte-exact + in-order sink across edge sizes) and
+> `test/ucopy_e2e.sh` (server_side_copy off → engine engaged, byte-exact, verify
+> clean).
+> Not yet: dirfix/probe task types, coordinator-side DIRFIX task generation
+> (split-dir metadata currently converges over passes).
 > Verified end-to-end by `test/e2e.sh` (sync + fidelity + verify + delete).
 
 ---

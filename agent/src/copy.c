@@ -2,10 +2,12 @@
  * by a bounded queue — walkers keep scanning while data moves, and a full
  * queue blocks the walker (backpressure) instead of growing memory.
  *
- * Copy strategy per file: copy_file_range first (server-side copy / reflink
- * when the mount pair supports it), read/write fallback. io_uring
- * registered-buffer data path: TODO(slice2b). Sparse preservation via
- * SEEK_HOLE: TODO(slice3). */
+ * Copy strategy per file: sparse extent copy (SEEK_DATA/SEEK_HOLE) when the
+ * file is sparse, else copy_file_range (server-side copy / reflink when the
+ * mount pair supports it), else a byte-copy fallback. The byte-copy fallback
+ * uses the io_uring registered-buffer engine (ucopy.c) when io_uring is
+ * available — reads of the next block overlap writes of the current one — and a
+ * serial read/write loop otherwise. */
 #include "agent.h"
 
 #define XXH_INLINE_ALL
@@ -465,6 +467,12 @@ static int copy_ranges_parallel(struct walk_ctx *ctx, int in, int out,
     return rc;
 }
 
+/* ucopy sink: fold each block into the running xxh3 state (design §3). */
+static void hash_sink(void *arg, const void *data, size_t n)
+{
+    XXH3_128bits_update((XXH3_state_t *)arg, data, n);
+}
+
 void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
                     const char *rel, const struct estat *ss)
 {
@@ -552,8 +560,20 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
             if (copy_ranges_parallel(ctx, in, out, ss->size, name) < 0)
                 goto drop;
             copied = ss->size;
+        } else if (!cfr && ucopy_available()) {
+            /* io_uring registered-buffer copy: read of the next block overlaps
+             * the write of the current one, and the inline hash is fed in stream
+             * order via the sink. */
+            int64_t rc = ucopy_run(in, out, ss->size, hash_sink, xst);
+            if (rc < 0) {
+                errno = (int)-rc;
+                walk_err(ctx, "io_uring copy", name);
+                goto drop;
+            }
+            copied = (uint64_t)rc;
+            hashed = copied > 0;
         } else if (!cfr) {
-            /* TODO(slice4): io_uring data path with registered buffers */
+            /* Serial fallback when io_uring is unavailable. */
             for (;;) {
                 ssize_t r = read(in, buf, COPY_BUF_SIZE);
                 if (r == 0)
