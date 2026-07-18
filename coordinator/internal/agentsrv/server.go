@@ -3,6 +3,7 @@
 package agentsrv
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -53,6 +54,15 @@ type agentConn struct {
 	done     chan struct{}  // closed when the writer has exited
 	drain    bool
 	pause    bool
+
+	// Journal ack watermarks. onJournalBatch persists a batch and raises
+	// jrnPending; the flusher fsyncs and only then acks up to jrnAcked. Gating
+	// the ack on fsync is what makes it mean "durable" — the agent releases its
+	// send buffer and unblocks the shard's result on the ack, so acking before
+	// fsync would lose journal records on a coordinator crash.
+	jrnMu      sync.Mutex
+	jrnPending uint64
+	jrnAcked   uint64
 }
 
 type sendFrame struct {
@@ -501,9 +511,79 @@ func (s *Server) onJournalBatch(ac *agentConn, b *drsyncpb.JournalBatch) error {
 		return err
 	}
 	s.met.JournalBatches.Inc()
-	// TODO(phase1): fsync-gated ack via periodic Flush; skeleton acks post-write.
-	return ac.send(drsyncpb.FrameType_FRAME_JOURNAL_ACK,
-		&drsyncpb.JournalAck{AckedSeq: b.Seq})
+	// Defer the ack: the batch is written but not yet fsynced. The flusher
+	// (RunJournalFlusher) fsyncs and sends the ack, so the agent never releases
+	// a journal record the coordinator hasn't durably persisted.
+	ac.jrnMu.Lock()
+	if b.Seq > ac.jrnPending {
+		ac.jrnPending = b.Seq
+	}
+	ac.jrnMu.Unlock()
+	return nil
+}
+
+// RunJournalFlusher periodically fsyncs persisted journal batches and then acks
+// each agent up to its durable high-water. It replaces an immediate post-write
+// ack: the fsync barrier is what lets JournalAck mean "durable" (design §5 and
+// agent/src/jrn.c — a shard's result waits on its journal ack). Runs until ctx
+// is cancelled, with a final flush+ack so a clean shutdown persists and
+// acknowledges the last interval's records.
+func (s *Server) RunJournalFlusher(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.flushAndAck()
+			return
+		case <-t.C:
+			s.flushAndAck()
+		}
+	}
+}
+
+func (s *Server) flushAndAck() {
+	// Snapshot each agent's pending high-water BEFORE the fsync. Append and
+	// Flush share the writer's mutex, so any seq captured here (whose Append has
+	// already returned) is on disk once Flush completes — acking up to it is
+	// safe. Batches that arrive during the flush are acked on the next tick.
+	type ackTarget struct {
+		ac  *agentConn
+		seq uint64
+	}
+	s.mu.Lock()
+	var targets []ackTarget
+	for _, ac := range s.agents {
+		ac.jrnMu.Lock()
+		if ac.jrnPending > ac.jrnAcked {
+			targets = append(targets, ackTarget{ac, ac.jrnPending})
+		}
+		ac.jrnMu.Unlock()
+	}
+	s.mu.Unlock()
+	if len(targets) == 0 {
+		return // nothing new to persist
+	}
+
+	if err := s.jw.Flush(); err != nil {
+		// Persisting failed: withhold every ack. Agents keep their send buffers
+		// and their shards blocked on jrn_wait_acked; a later successful flush
+		// acks them. Never ack an un-fsynced batch.
+		s.met.JournalFsyncErr.Inc()
+		slog.Error("journal flush failed; withholding acks", "err", err)
+		return
+	}
+	for _, t := range targets {
+		t.ac.jrnMu.Lock()
+		if t.seq > t.ac.jrnAcked {
+			t.ac.jrnAcked = t.seq
+		}
+		t.ac.jrnMu.Unlock()
+		// Best-effort: if the agent is gone, its next session resends unacked
+		// records (dedup by (shard_id, seq)), so a dropped ack loses nothing.
+		_ = t.ac.send(drsyncpb.FrameType_FRAME_JOURNAL_ACK,
+			&drsyncpb.JournalAck{AckedSeq: t.seq})
+	}
 }
 
 func (s *Server) onStats(ac *agentConn, st *drsyncpb.StatsReport) {

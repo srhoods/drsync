@@ -21,6 +21,7 @@ type Metrics struct {
 	LeaseExpiries   prometheus.Counter
 	ShardsParked    prometheus.Counter
 	JournalBatches  prometheus.Counter
+	JournalFsyncErr prometheus.Counter
 	Grants          prometheus.Counter
 }
 
@@ -52,10 +53,14 @@ func New() *Metrics {
 			Name: "drsync_shards_parked_total", Help: "Shards parked for operator attention."}),
 		JournalBatches: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "drsync_journal_batches_total", Help: "Journal batches persisted."}),
+		JournalFsyncErr: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "drsync_journal_fsync_errors_total",
+			Help: "Journal fsync failures; acks withheld until a later flush succeeds."}),
 		Grants: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "drsync_work_grants_total", Help: "Work items granted to agents."}),
 	}
 	reg.MustRegister(m.ScanEntries, m.CopyFiles, m.CopyBytes, m.AgentUp, m.AgentRSS,
-		m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked, m.JournalBatches, m.Grants)
+		m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked, m.JournalBatches,
+		m.JournalFsyncErr, m.Grants)
 	return m
 }

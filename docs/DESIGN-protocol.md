@@ -55,7 +55,7 @@ Direction key: `A→C` agent to coordinator, `C→A` coordinator to agent.
 | 9 | `ShardResult` | A→C | terminal state of a leased shard: counters (entries walked, tasks emitted/completed, bytes copied), orphan count, error summary, nlink>1 stats, wall/IO timings |
 | 10 | `TaskResult` | A→C | terminal state for coordinator-tracked tasks (chunk copies, dirfix batches, verify batches); batched |
 | 11 | `JournalBatch` | A→C | stream of per-file journal records (see coordinator doc §5); zstd-compressed batches, ≤ 4 MiB; coordinator acks with a high-water sequence number for flow control |
-| 12 | `JournalAck` | C→A | consumed sequence; agent may release its send buffer |
+| 12 | `JournalAck` | C→A | durable high-water sequence (sent only after the coordinator fsyncs the batch — see coordinator doc §5); agent may release its send buffer |
 | 13 | `StatsReport` | A→C | 1 Hz counters: files/bytes scanned/copied/verified, IOPS, latency histograms per mount, error counts by class |
 | 14 | `Control` | C→A | pause / resume / drain (finish leases, take no new work) / cancel-job / shutdown / log-level |
 | 15 | `Error` | both | protocol-level fault before connection teardown |
