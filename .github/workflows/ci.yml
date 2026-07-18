@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A force-push or a quick follow-up commit makes the older run irrelevant;
+# cancel it rather than paying for both. master is exempt so every landed
+# commit keeps a complete result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: coordinator & CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          # Tracks go.mod rather than pinning a second copy of the version
+          # that would drift from it.
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reports unformatted files; run: gofmt -w $unformatted"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: build
+        run: go build ./...
+
+      # -count=1 disables the test cache: a cached pass from a previous run
+      # would report success without executing anything.
+      - name: test
+        run: go test -count=1 ./...
+
+  console:
+    name: webui console
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: webui/test/package-lock.json
+
+      # npm ci installs exactly the locked tree and fails if package.json and
+      # the lockfile disagree — which is the point of tracking the lockfile.
+      - name: install
+        run: npm --prefix webui/test ci
+
+      - name: test
+        run: make webui-test
+
+  agent:
+    name: agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libzstd-dev libssl-dev
+
+      - name: build
+        run: make -C agent
+
+      # Unit tests that need no coordinator or fleet: glob matcher, metadata
+      # fidelity, unbuffered copy, temp naming.
+      - name: test
+        run: make -C agent test
+
+  e2e:
+    name: e2e
+    # Only worth the runner time once the pieces it drives compile and pass
+    # their own tests.
+    needs: [go, agent]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libzstd-dev libssl-dev
+
+      - name: build
+        run: make build
+
+      # Coordinator + C agent sync a real tree, converge, delete-pass, and
+      # check metadata fidelity. This is the only job that exercises the agent
+      # against a live coordinator, so it is also the most environment-
+      # sensitive: it needs io_uring and a filesystem carrying xattrs.
+      - name: e2e
+        run: ./test/e2e.sh
