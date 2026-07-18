@@ -493,7 +493,15 @@ func (s *Server) completeChunk(passID, shardID, leaseID int64, payload []byte, r
 	if err := proto.Unmarshal(payload, &ct); err != nil {
 		return err
 	}
-	if ct.Finalize {
+	if ct.Reclaim {
+		// Post-drain temp cleanup, not part of the group's assembly: it must not
+		// touch n_done (which would re-seed a finalize for a group that has
+		// none) or the group's state. Complete it like any ordinary shard.
+		blob, _ := proto.Marshal(r)
+		if err := s.st.CompleteShard(shardID, leaseID, blob); err != nil {
+			return err
+		}
+	} else if ct.Finalize {
 		if err := s.st.CompleteFinalizeChunk(shardID, leaseID, passID, ct.RelPath); err != nil {
 			return err
 		}

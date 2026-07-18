@@ -285,7 +285,13 @@ Per copy task (one file, or one chunk of a large file):
   then failed the finalize with `open temp for finalize`, or — mid-group — let the
   remaining chunks recreate the temp and finalize rename a hole-ridden file into place.
   Untagged temps from a pre-tag build remain reclaimable; a tagged temp orphaned by a
-  crash is reclaimed by the next pass, whose pass number no longer matches.
+  crash is reclaimed by the next pass, whose pass number no longer matches. A chunk
+  group abandoned mid-assembly (source drift) does not wait that long: the coordinator
+  seeds a **reclaim** chunk task (`ChunkTask.reclaim` — unlink `temp_name`, no source
+  read, no metadata) once the pass's scan phase has drained and nothing can still be
+  writing to the name. The tag is parsed strictly — lowercase hex digits only, no sign,
+  whitespace or `0x` — since a false "live" reading would protect a file from reclaim
+  forever.
 - **Atomicity contract:** readers of the destination never observe a half-copied file
   under its final name — rename is the commit point. (Chunked files: finalize task does
   steps 6–9 once all chunks report done; `chunk_sets` tracking in the coordinator.)

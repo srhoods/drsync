@@ -65,6 +65,19 @@ int main(void)
     check_tag("-3.1.0", 0, 3, false);      /* empty job field */
     check_tag("zz-3.1.0", 0, 3, false);    /* non-hex job */
 
+    /* Forms strtoull would have accepted as a match — a false "live" here means
+     * the file is never reclaimed by any pass of the job. The parse takes hex
+     * digits only: no sign, no whitespace, no "0x", no uppercase. */
+    check_tag(" 1-1.a.0", 1, 1, false);
+    check_tag("+1-1.a.0", 1, 1, false);
+    check_tag("-1-1.a.0", 1, 1, false);
+    check_tag("0x1-1.a.0", 1, 1, false);
+    check_tag("1-0x1.a.0", 1, 1, false);
+    check_tag("\t1-1.a.0", 1, 1, false);
+    check_tag("1A-1.a.0", 0x1a, 1, false); /* we always emit lowercase */
+    /* Overflow cannot alias a real id by wrapping. */
+    check_tag("1ffffffffffffffff-1.a.0", 1, 1, false);
+
     if (failures) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

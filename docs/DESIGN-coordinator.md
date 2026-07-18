@@ -210,8 +210,16 @@ gates on `queued+leased == 0`) would step the pass past a file not yet renamed
 into place. The finalize task re-checks the gen, fsyncs, applies metadata, and
 renames the temp to the final name — the commit point. A chunk that finds the
 source drifted returns `RESULT_SRC_CHANGED`; the group is marked aborted, no
-finalize is seeded, the half-written temp is reclaimed as `.drsync.tmp` residue
-on a later pass, and the file is re-diffed next pass.
+finalize is seeded, and the file is re-diffed next pass. The half-written temp
+is removed by a **reclaim** chunk task (`ChunkTask.reclaim`: unlink `temp_name`,
+nothing else), seeded for every group that never reached `done` at the moment
+the pass leaves SCANNING. That instant is the whole point: `advance` has just
+established `queued+leased == 0`, so no chunk of this pass can still be writing
+to the name, which makes the unlink safe rather than a guess. The agent's own
+orphan sweep cannot do it, because it spares temps tagged with the pass it is
+running (§ below) — so without this task an abandoned temp would survive its
+pass by design, and a job ending on that pass would leave it in the destination
+permanently.
 
 The coordinator names the temp `.drsync.tmp.<job>-<pass>.<shard>.<index>` (hex).
 The `<job>-<pass>` tag is load-bearing, not decorative: the temp has no source

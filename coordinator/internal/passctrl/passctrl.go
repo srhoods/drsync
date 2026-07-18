@@ -183,6 +183,17 @@ func (c *Controller) advance(job *store.Job) error {
 			"job", job.Name, "pass", pass.PassNo)
 		return c.st.SetPassState(pass.ID, model.PassScanning)
 	case model.PassScanning:
+		// Reclaim the temps of chunk groups that never finalized. Safe exactly
+		// here and nowhere earlier: the drain check above proves no chunk shard
+		// of this pass is queued or leased, so no name being unlinked can still
+		// be in use. The agent sweep cannot do this itself — it skips temps
+		// tagged with the pass it is running, which is what stops a re-walk
+		// from deleting a group's temp mid-assembly — so without this a job
+		// ending on this pass would leave them in the destination for good.
+		r, err := c.seedTempReclaim(pass)
+		if err != nil {
+			return err
+		}
 		// Seed DIRFIX shards from the pass journal's DIR_META records, THEN flip
 		// the phase — inserting first keeps the queue non-empty so a tick can't
 		// see DIRFIX drained and skip straight to VERIFY before the fixes run.
@@ -191,7 +202,7 @@ func (c *Controller) advance(job *store.Job) error {
 			return err
 		}
 		slog.Info("pass phase: SCANNING → DIRFIX", "job", job.Name,
-			"pass", pass.PassNo, "dirs", n)
+			"pass", pass.PassNo, "dirs", n, "temps_reclaimed", r)
 		return c.st.SetPassState(pass.ID, model.PassDirfix)
 	case model.PassDirfix:
 		n, err := c.seedVerify(job, pass)
@@ -279,6 +290,46 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) (jobDone, 
 // neither feasible at bounded memory nor meaningful, since batches execute
 // concurrently on different agents and applying one directory's metadata never
 // affects another's.
+// seedTempReclaim queues one reclaim chunk task per chunk group of the pass
+// that never finalized, unlinking the temp it left in the destination. Returns
+// how many were queued.
+//
+// These are the groups aborted on source drift (DESIGN-coordinator.md §4): no
+// finalize is seeded, so the partially assembled temp is left behind. It used
+// to be swept by the next walk that reached the directory, but the agent sweep
+// now deliberately spares any temp carrying the pass it is running — the rule
+// that stops a re-walk from deleting a group's temp while its chunks are still
+// writing — so the residue survives its own pass by design, and a job that ends
+// on this pass would never collect it.
+//
+// The caller must have established that the pass's scan phase has drained
+// (advance's queued+leased check). That is what makes unlinking these names
+// safe rather than a heuristic: nothing is left running that could still be
+// writing to one.
+func (c *Controller) seedTempReclaim(pass *store.Pass) (int, error) {
+	temps, err := c.st.UnfinalizedChunkTemps(pass.ID)
+	if err != nil {
+		return 0, err
+	}
+	shards := make([]store.NewShard, 0, len(temps))
+	for _, t := range temps {
+		payload, err := proto.Marshal(&drsyncpb.ChunkTask{
+			RelPath: t.RelPath, TempName: t.TempName, Reclaim: true})
+		if err != nil {
+			return 0, err
+		}
+		shards = append(shards, store.NewShard{
+			Kind: model.KindChunk, RelPath: t.RelPath, Payload: payload})
+	}
+	if len(shards) == 0 {
+		return 0, nil
+	}
+	if _, err := c.st.InsertShards(pass.ID, 0, shards); err != nil {
+		return 0, err
+	}
+	return len(shards), nil
+}
+
 func (c *Controller) seedDirfix(job *store.Job, pass *store.Pass) (int, error) {
 	total := 0
 	batch := make([]*drsyncpb.DirMeta, 0, dirfixBatchSize)

@@ -138,6 +138,31 @@ void process_chunk(const struct shard_item *it)
     char dir[PATH_MAX];
     const char *base = split_dir(rel, dir, sizeof dir);
 
+    /* Reclaim: remove the temp of a group that never finalized, and nothing
+     * else — no source read, no gen check, no metadata. The coordinator seeds
+     * these only after the pass's scan phase has drained, so no chunk can still
+     * be writing to the name. The walk's own sweep will not do it: it spares
+     * temps tagged with the pass it is running, which is what keeps a re-walk
+     * from deleting a group's temp mid-assembly. */
+    if (ch->reclaim) {
+        if (o->dry_run)
+            goto out;
+        int rfd = open_beneath(ctx.oe->dst_fd, dir, O_RDONLY | O_DIRECTORY);
+        if (rfd < 0) {
+            if (errno != ENOENT) { /* directory gone: the temp went with it */
+                walk_err(&ctx, "open dst dir for reclaim", dir[0] ? dir : "<root>");
+                status = RES_ERROR;
+            }
+            goto out;
+        }
+        if (unlinkat(rfd, ch->temp_name, 0) < 0 && errno != ENOENT) {
+            walk_err(&ctx, "reclaim temp", ch->temp_name);
+            status = RES_ERROR;
+        }
+        close(rfd);
+        goto out;
+    }
+
     int in = open_beneath(ctx.oe->src_fd, rel, O_RDONLY);
     if (in < 0) {
         if (errno == ENOENT)

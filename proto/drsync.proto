@@ -305,6 +305,12 @@ message ChunkTask {
   bool   create_temp = 8; // this chunk creates the shared temp file
   string temp_name   = 9; // coordinator-assigned, stable across chunk retries
   bool   finalize    = 10; // fsync + metadata + rename (granted when all chunks done)
+  // Unlink temp_name and nothing else. Seeded once the pass's scan phase has
+  // drained, for groups that never finalized (source drifted mid-assembly), so
+  // their temp does not outlive the job: the agent orphan sweep deliberately
+  // will not reclaim a temp tagged with the pass it is running, and a job that
+  // ends on this pass has no later pass to do it.
+  bool   reclaim     = 11;
 }
 
 message DirMeta {

@@ -619,6 +619,39 @@ func (s *Store) ShardJobPass(shardID int64) (jobID, passNo int64, err error) {
 	return jobID, passNo, err
 }
 
+// ChunkTemp is one chunk group's destination temp: the file's path and the
+// coordinator-assigned temp name that lives in the file's parent directory.
+type ChunkTemp struct {
+	RelPath  string
+	TempName string
+}
+
+// UnfinalizedChunkTemps lists the temps of a pass's chunk groups that never
+// reached 'done' — aborted mid-assembly on source drift, in practice. Their
+// temps are pure residue, but the agent orphan sweep will not reclaim a temp
+// tagged with the pass it is running (that rule is what stops a re-walk from
+// deleting a group's temp while its chunks are still writing), so a job whose
+// last pass this is would leave them behind forever. Call only once a pass's
+// scan phase has drained: with no chunk shard queued or leased, no name here
+// can still be in use.
+func (s *Store) UnfinalizedChunkTemps(passID int64) ([]ChunkTemp, error) {
+	rows, err := s.rdb.Query(`SELECT rel_path, temp_name FROM chunk_groups
+		WHERE pass_id = ? AND state != 'done'`, passID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChunkTemp
+	for rows.Next() {
+		var t ChunkTemp
+		if err := rows.Scan(&t.RelPath, &t.TempName); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for
 // the result handler to route a completion without a second round trip. Read
 // before the shard transitions, so a chunk's ChunkTask payload is still there.
