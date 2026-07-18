@@ -195,37 +195,130 @@ struct outmsg *out_drain(void)
     return head;
 }
 
-/* ---- leases ---- */
+/* ---- leases ----
+ * Slots are freed in place (lease_id = 0) rather than compacted, so the pointer
+ * a worker caches in lease_start stays valid until it releases the lease. n_used
+ * is a high-water mark bounding the scans, not a count. */
 #define MAX_LEASES 8192
-static uint64_t        leases[MAX_LEASES];
-static size_t          n_leases;
-static pthread_mutex_t lease_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct lease_entry leases[MAX_LEASES];
+static size_t             n_used;
+static pthread_mutex_t    lease_mu = PTHREAD_MUTEX_INITIALIZER;
 
-void lease_add(uint64_t id)
+/* The lease this thread is currently processing (workers run one at a time). */
+static __thread struct lease_entry *tl_lease;
+
+void lease_add(const struct shard_item *it)
 {
     pthread_mutex_lock(&lease_mu);
-    if (n_leases < MAX_LEASES)
-        leases[n_leases++] = id;
+    struct lease_entry *e = NULL;
+    for (size_t i = 0; i < n_used; i++) {
+        if (leases[i].lease_id == 0) {
+            e = &leases[i];
+            break;
+        }
+    }
+    if (!e && n_used < MAX_LEASES)
+        e = &leases[n_used++];
+    if (!e) {
+        pthread_mutex_unlock(&lease_mu);
+        LOGE("lease table full (%d); not tracking lease %llu", MAX_LEASES,
+             (unsigned long long)it->lease_id);
+        return;
+    }
+    e->lease_id = it->lease_id;
+    e->shard_id = it->shard_id;
+    e->job_id = it->job_id;
+    e->kind = it->kind;
+    /* Long paths are truncated: this is a diagnostic label, not an identifier —
+     * shard_id is the identifier. */
+    snprintf(e->rel_path, sizeof e->rel_path, "%s", it->rel_path ? it->rel_path : "");
+    clock_gettime(CLOCK_MONOTONIC, &e->granted_at);
+    e->started_at = (struct timespec){ 0 };
+    e->running = false;
+    atomic_store(&e->entries_done, 0);
     pthread_mutex_unlock(&lease_mu);
 }
 
 void lease_remove(uint64_t id)
 {
     pthread_mutex_lock(&lease_mu);
-    for (size_t i = 0; i < n_leases; i++) {
-        if (leases[i] == id) {
-            leases[i] = leases[--n_leases];
+    for (size_t i = 0; i < n_used; i++) {
+        if (leases[i].lease_id == id) {
+            leases[i].lease_id = 0; /* freed in place; slot may be reused */
             break;
         }
     }
     pthread_mutex_unlock(&lease_mu);
 }
 
-size_t lease_snapshot(uint64_t *dst, size_t cap)
+void lease_start(uint64_t id)
 {
     pthread_mutex_lock(&lease_mu);
-    size_t n = n_leases < cap ? n_leases : cap;
-    memcpy(dst, leases, n * sizeof *dst);
+    tl_lease = NULL;
+    for (size_t i = 0; i < n_used; i++) {
+        if (leases[i].lease_id == id) {
+            clock_gettime(CLOCK_MONOTONIC, &leases[i].started_at);
+            leases[i].running = true;
+            tl_lease = &leases[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lease_mu);
+}
+
+void lease_end(void)
+{
+    tl_lease = NULL;
+}
+
+void lease_publish(uint64_t entries_done)
+{
+    if (tl_lease)
+        atomic_store(&tl_lease->entries_done, entries_done);
+}
+
+size_t lease_snapshot(uint64_t *dst, size_t cap)
+{
+    size_t n = 0;
+    pthread_mutex_lock(&lease_mu);
+    for (size_t i = 0; i < n_used && n < cap; i++) {
+        if (leases[i].lease_id)
+            dst[n++] = leases[i].lease_id;
+    }
+    pthread_mutex_unlock(&lease_mu);
+    return n;
+}
+
+static uint32_t ms_since(const struct timespec *t0, const struct timespec *now)
+{
+    if (t0->tv_sec == 0 && t0->tv_nsec == 0)
+        return 0;
+    int64_t ms = (int64_t)(now->tv_sec - t0->tv_sec) * 1000 +
+                 (now->tv_nsec - t0->tv_nsec) / 1000000;
+    return ms > 0 ? (uint32_t)ms : 0;
+}
+
+size_t lease_inflight(struct inflight_view *dst, size_t cap)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    size_t n = 0;
+    pthread_mutex_lock(&lease_mu);
+    for (size_t i = 0; i < n_used && n < cap; i++) {
+        const struct lease_entry *e = &leases[i];
+        if (!e->lease_id)
+            continue;
+        dst[n].lease_id = e->lease_id;
+        dst[n].shard_id = e->shard_id;
+        dst[n].job_id = e->job_id;
+        dst[n].kind = e->kind;
+        memcpy(dst[n].rel_path, e->rel_path, sizeof dst[n].rel_path);
+        dst[n].held_ms = ms_since(&e->granted_at, &now);
+        dst[n].running_ms = e->running ? ms_since(&e->started_at, &now) : 0;
+        dst[n].running = e->running;
+        dst[n].entries_done = atomic_load(&e->entries_done);
+        n++;
+    }
     pthread_mutex_unlock(&lease_mu);
     return n;
 }

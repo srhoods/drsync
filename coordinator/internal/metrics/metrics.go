@@ -16,6 +16,14 @@ type Metrics struct {
 	AgentUp     *prometheus.GaugeVec
 	AgentRSS    *prometheus.GaugeVec
 
+	// ShardDuration is the agent-measured wall time of a completed shard, by
+	// kind. The agent has always sent this (ShardCounters.wall_ms); this is
+	// where it becomes visible. Watching the high quantiles per kind is the
+	// primary signal for "the job is grinding to a halt" — a rising p99 with a
+	// flat median means a few pathological shards, the reverse means everything
+	// is uniformly slower (usually the mounts or the scheduler).
+	ShardDuration *prometheus.HistogramVec
+
 	// Coordinator-side.
 	ShardQueueDepth *prometheus.GaugeVec
 	LeaseExpiries   prometheus.Counter
@@ -44,6 +52,13 @@ func New() *Metrics {
 		AgentRSS: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "drsync_agent_rss_bytes", Help: "Agent resident set size."},
 			[]string{"agent"}),
+		ShardDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "drsync_shard_duration_seconds",
+			Help: "Agent-measured wall time of a completed shard, by kind.",
+			// 100ms to ~3.4h: shards range from a trivial dirfix batch to a
+			// walk of a pathological directory, and the long tail is the point.
+			Buckets: prometheus.ExponentialBuckets(0.1, 3, 12),
+		}, []string{"kind"}),
 		ShardQueueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "drsync_shard_queue_depth", Help: "Shards by state (active passes)."},
 			[]string{"state"}),
@@ -60,7 +75,7 @@ func New() *Metrics {
 			Name: "drsync_work_grants_total", Help: "Work items granted to agents."}),
 	}
 	reg.MustRegister(m.ScanEntries, m.CopyFiles, m.CopyBytes, m.AgentUp, m.AgentRSS,
-		m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked, m.JournalBatches,
-		m.JournalFsyncErr, m.Grants)
+		m.ShardDuration, m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked,
+		m.JournalBatches, m.JournalFsyncErr, m.Grants)
 	return m
 }

@@ -59,6 +59,7 @@ static void on_signal(int sig)
 void process_item(struct shard_item *it)
 {
     atomic_fetch_add(&g_inflight, 1);
+    lease_start(it->lease_id); /* binds this thread's slot for lease_publish */
     if (it->kind == WI_DELETE)
         process_delete(it);
     else if (it->kind == WI_VERIFY)
@@ -73,6 +74,7 @@ void process_item(struct shard_item *it)
         process_dirfix(it);
     else
         process_shard(it);
+    lease_end(); /* the processors already released the lease itself */
     shard_item_free(it);
     atomic_fetch_sub(&g_inflight, 1);
 }
@@ -193,14 +195,21 @@ static void maybe_request_work(bool from_timer)
         g_request_pending = true;
 }
 
+/* In-flight detail is capped well below MAX_LEASES: an agent holds roughly
+ * (workers + copy_threads) * 2 leases, so this only ever truncates if something
+ * has gone badly wrong — and the renewal list (held) is never truncated. */
+#define HB_INFLIGHT_MAX 256
+
 static int send_heartbeat(void)
 {
     uint64_t held[1024];
     size_t n = lease_snapshot(held, 1024);
+    static struct inflight_view inflight[HB_INFLIGHT_MAX]; /* control thread only */
+    size_t n_inflight = lease_inflight(inflight, HB_INFLIGHT_MAX);
     pb_buf b;
     pb_init(&b);
     enc_heartbeat(&b, ++g_hb_seq, held, n, (uint32_t)wq_depth(),
-                  (uint32_t)cp_depth(), read_rss());
+                  (uint32_t)cp_depth(), read_rss(), inflight, n_inflight);
     return send_pb(FR_HEARTBEAT, &b);
 }
 
@@ -249,7 +258,7 @@ static int dispatch(uint16_t type, const uint8_t *p, size_t n)
         for (size_t i = 0; i < g->n_options; i++)
             opts_store(&g->options[i]);
         for (size_t i = 0; i < g->n_items; i++) {
-            lease_add(g->items[i].lease_id);
+            lease_add(&g->items[i]); /* copies rel_path; wq_push takes the original */
             wq_push(&g->items[i]); /* takes rel_path ownership */
         }
         if (g->n_unsupported)

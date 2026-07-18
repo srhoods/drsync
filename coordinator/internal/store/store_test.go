@@ -394,7 +394,7 @@ func TestPausedJobNotGranted(t *testing.T) {
 func TestDisabledAgentNotGranted(t *testing.T) {
 	s := openTest(t)
 	_, _, shardID := seed(t, s)
-	if err := s.UpsertAgent("agent-a", "host", "v1"); err != nil {
+	if err := s.UpsertAgent("agent-a", "host", "v1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetAgentEnabled("agent-a", false); err != nil {
@@ -695,7 +695,7 @@ func TestCountSchedulableAgents(t *testing.T) {
 	}
 
 	for _, id := range []string{"a", "b", "c"} {
-		if err := s.UpsertAgent(id, id+".host", "v1"); err != nil {
+		if err := s.UpsertAgent(id, id+".host", "v1", 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -786,7 +786,7 @@ func TestPruneStaleProbes(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Only "live" is connected; "gone" was never registered (or disconnected).
-	if err := s.UpsertAgent("live", "h", "v1"); err != nil {
+	if err := s.UpsertAgent("live", "h", "v1", 1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -816,7 +816,7 @@ func TestPruneStaleProbes(t *testing.T) {
 func TestSchedulableAgents(t *testing.T) {
 	s := openTest(t)
 	for _, id := range []string{"a", "b", "c"} {
-		if err := s.UpsertAgent(id, "h", "v1"); err != nil {
+		if err := s.UpsertAgent(id, "h", "v1", 1); err != nil {
 			t.Fatal(err)
 		}
 	}

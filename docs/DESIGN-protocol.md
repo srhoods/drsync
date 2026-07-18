@@ -46,7 +46,7 @@ Direction key: `A→C` agent to coordinator, `C→A` coordinator to agent.
 |---|---|---|---|
 | 1 | `Hello` | A→C | agent id, hostname, protocol version, agent version, capabilities (io_uring statx? copy_file_range? nfs4_acl xattr visible per mount?), resource info (cores, mem-limit, NIC) |
 | 2 | `HelloAck` | C→A | accepted protocol version, agent registered, current fleet epoch, resolved runtime options |
-| 3 | `Heartbeat` | A→C | liveness + implicit renewal of **all** leases held by this agent; includes coarse load (queue depths, in-flight bytes) |
+| 3 | `Heartbeat` | A→C | liveness + implicit renewal of **all** leases held by this agent; includes coarse load (queue depths, in-flight bytes) and, from protocol minor 1, per-lease in-flight detail (§3.2) |
 | 4 | `HeartbeatAck` | C→A | piggybacks control state: pause/resume/drain flags, config-changed epoch |
 | 5 | `WorkRequest` | A→C | credit-based pull: "I have capacity for N shards / M copy tasks"; sent whenever local queues drop below low-water marks |
 | 6 | `WorkGrant` | C→A | 0..N work items, each a `Shard`, `EntryListShard`, `ChunkTask`, `DirFixBatch`, `VerifyBatch`, `DeleteBatch`, or `ProbeTask` (a mount-probe pinned to this agent, gating pass start); each carries a lease (id, TTL) |
@@ -106,6 +106,33 @@ an absent field ("use the job's `shard_budget`"). The *policy* behind the decisi
 (`tuning.spread_mode`) is deliberately not on the wire: agents receive the resolved
 result, never the rule (D9).
 
+### 3.2 In-flight reporting (`Heartbeat.inflight`, minor ≥ 1)
+
+Every heartbeat carries one `InflightItem` per lease the agent holds: shard id,
+kind, rel path (truncated to 256 bytes — a label, not an identifier), how long
+it has been held, how long it has actually been *running*, and how many entries
+it has walked so far.
+
+This exists to answer "what is the fleet doing right now, and what is the slow
+thing" without a log firehose. It is sampled state: each heartbeat replaces the
+previous snapshot wholesale, nothing is retained, and the coordinator drops it
+when the session ends. An agent holds roughly (walkers + copy threads) × 2
+leases, so the cost is tens of small messages per agent per heartbeat.
+
+Two distinctions carry the diagnostic weight:
+
+- **`running` vs held.** A granted lease sits in the agent's work queue before a
+  worker picks it up. A queue full of non-running leases means the agent is
+  over-granted, not slow.
+- **`entries_done` moving vs static.** The agent republishes progress every 256
+  entries, *inside* the per-directory loop, so a shard stuck on one pathological
+  directory still shows movement. A `running_ms` climbing with a static
+  `entries_done` is genuinely wedged — that is the case worth paging on.
+
+Version skew is explicit rather than inferred: the API reports `supported:
+false` for an agent below minor 1 instead of an empty list, because "reports
+nothing" and "is doing nothing" call for opposite responses.
+
 ## 4. Interaction Flows
 
 ### 4.1 Steady state (pull-based)
@@ -155,3 +182,34 @@ at-least-once delivery is sufficient everywhere; nothing needs exactly-once.
   and previous major during migration windows.
 - Capabilities (Hello) gate optional behaviors (e.g. `copy_file_range` availability per
   mount) so mixed fleets degrade per-agent, not fleet-wide.
+
+### 5.1 Minor versions and mixed fleets
+
+`Hello.proto_minor` is the feature level. **Bump the minor whenever a field is
+added and the agent starts populating it**, so the coordinator can distinguish
+"this agent does not report X" from "this agent reports X = 0". The two are
+identical on the wire otherwise, and conflating them turns a stale agent into
+one that merely looks idle.
+
+Enforcement is deliberately asymmetric:
+
+| | Check | Effect of a mismatch |
+|---|---|---|
+| major | `!=` the coordinator's | session refused — the fleet is locked out until every agent is upgraded |
+| minor | `<` `-min-agent-minor` (default 0) | session refused; opt-in only |
+
+The default accepts every major-compatible agent. **Raising `-min-agent-minor`
+mid-migration strands whatever work those agents are holding** until their
+leases expire and are re-granted, so it is an explicit operator decision rather
+than a side effect of deploying a new coordinator. The normal path for an
+additive change is: deploy the coordinator, let it degrade gracefully, roll the
+agents at whatever pace the migration tolerates, and raise the floor afterwards
+only if the telemetry needs to be guaranteed.
+
+The coordinator logs a warning for each connecting agent that is behind, records
+`proto_minor` in the `agents` table, and exposes it with a `stale` flag on
+`GET /api/v1/agents`. `drsyncd` refuses to start when `-min-agent-minor` exceeds
+its own minor — that setting would lock out the entire fleet, including
+correctly-upgraded agents.
+
+Current minors: **1** — `Heartbeat.inflight` (§3.2).

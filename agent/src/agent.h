@@ -19,6 +19,14 @@
 
 #define AGENT_VERSION "0.1.0-slice5"
 
+/* Wire protocol version (proto/drsync.proto §Versioning). Major must match the
+ * coordinator exactly — bumping it locks out the whole fleet until every agent
+ * is upgraded. Minor is additive: bump it when this agent starts populating a
+ * newly added field, so the coordinator can tell "not reported" from "zero".
+ * minor 1: Heartbeat.inflight. */
+#define PROTO_MAJOR 1
+#define PROTO_MINOR 1
+
 /* ---- logging ---- */
 void log_line(const char *level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -58,10 +66,44 @@ void out_push(uint16_t type, pb_buf *b);
 struct outmsg *out_drain(void);
 int  outbox_init(void);
 
-/* ---- held leases (for heartbeat renewal lists) ---- */
-void   lease_add(uint64_t id);
-void   lease_remove(uint64_t id);
+/* ---- held leases (heartbeat renewal + in-flight reporting) ----
+ * Registry slots are index-stable for the life of a lease (freed in place, never
+ * compacted), so a worker can hold a pointer to its own slot and publish
+ * progress into it without re-looking it up. */
+#define LEASE_PATH_MAX 256 /* truncated: enough to identify the subtree */
+
+struct lease_entry {
+    uint64_t        lease_id; /* 0 = free slot */
+    uint64_t        shard_id, job_id;
+    int             kind;                    /* WI_* */
+    char            rel_path[LEASE_PATH_MAX];
+    struct timespec granted_at, started_at;  /* CLOCK_MONOTONIC */
+    bool            running;                 /* false = queued, not yet picked up */
+    atomic_ullong   entries_done;            /* published by the owning worker */
+};
+
+/* Control thread: record a granted lease. Copies what it needs from it, so the
+ * caller may hand it->rel_path to the work queue afterwards. */
+void lease_add(const struct shard_item *it);
+void lease_remove(uint64_t id);
 size_t lease_snapshot(uint64_t *dst, size_t cap);
+
+/* Worker thread: claim/release the lease this thread is processing. lease_start
+ * binds the slot to the calling thread so lease_publish is a pointer store. */
+void lease_start(uint64_t id);
+void lease_end(void);
+void lease_publish(uint64_t entries_done);
+
+/* Snapshot of every held lease for the heartbeat. entries_done is resolved to a
+ * plain value; ages are computed against now. */
+struct inflight_view {
+    uint64_t lease_id, shard_id, job_id, entries_done;
+    int      kind;
+    char     rel_path[LEASE_PATH_MAX];
+    uint32_t held_ms, running_ms;
+    bool     running;
+};
+size_t lease_inflight(struct inflight_view *dst, size_t cap);
 
 /* ---- job options table ---- */
 struct opts_entry {
