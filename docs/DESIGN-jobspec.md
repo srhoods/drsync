@@ -144,7 +144,12 @@ at most 255 bytes (bounds match the agent's fixed filter table).
   big file — reads as stray residue to job B's walk of that directory and is
   unlinked underneath it. Containment is compared on whole path components, so
   `/dst/a` and `/dst/ab` are siblings, not an overlap. A finished job holds
-  nothing, so re-syncing its destination with a new job is allowed,
+  nothing, so re-syncing its destination with a new job is allowed. The check
+  runs inside the job insert, under the same lock, so two concurrent submits of
+  overlapping destinations cannot both succeed. **Start and resume re-check it**
+  against RUNNING/PAUSED jobs — a backstop for rows created before this
+  validation existed; a READY job does not block, or two jobs would each refuse
+  to go first,
 - destination mount has plausible free space (statfs vs. src estimate once pass 1 has a
   running total; hard check is per-write ENOSPC handling),
 - filters are well-formed (each rule is exactly one `include:`/`exclude:`, no

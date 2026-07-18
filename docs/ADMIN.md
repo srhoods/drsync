@@ -85,6 +85,10 @@ and delete phases. Browse it with `drsync journal` / `drsync errors`.
   in-progress temps — each agent recognises only its own job as live work — so
   a big file being assembled by one job can be truncated or lost by the other.
   Finish or cancel the other job first, or pick a destination outside its tree.
+  `job start` and `job resume` re-check against RUNNING/PAUSED jobs and refuse
+  the same way, so a job created before this rule shipped is caught at start
+  rather than corrupting the tree. If an upgrade leaves you holding two such
+  jobs, cancel one — the message names it.
 
 ---
 

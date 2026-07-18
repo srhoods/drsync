@@ -219,21 +219,13 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusUnprocessableEntity, "%v", err)
 		return
 	}
-	if conflict, err := s.destinationConflict(spec); err != nil {
-		httpErr(w, http.StatusInternalServerError, "check destinations: %v", err)
-		return
-	} else if conflict != "" {
-		httpErr(w, http.StatusConflict,
-			"spec.destination.path %q overlaps the destination of job %q, which is still live. "+
-				"Two jobs writing into one tree corrupt each other's in-progress files: each "+
-				"reclaims the other's .drsync.tmp temps as stray residue, so a large file being "+
-				"assembled by one job can be truncated or lost by the other. Finish or cancel %q, "+
-				"or give this job a destination outside that tree.",
-			spec.Spec.Destination.Path, conflict, conflict)
-		return
-	}
 	dryRun := r.URL.Query().Get("dry_run") == "true"
 	job, err := s.st.CreateJob(spec.Metadata.Name, body, dryRun)
+	var dc *store.DestinationConflictError
+	if errors.As(err, &dc) {
+		httpErr(w, http.StatusConflict, "%s", destConflictMsg(dc))
+		return
+	}
 	if err != nil {
 		httpErr(w, http.StatusConflict, "create job: %v", err)
 		return
@@ -242,47 +234,16 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, jobView{Name: job.Name, State: job.State, DryRun: job.DryRun})
 }
 
-// destinationConflict returns the name of a live job whose destination tree
-// overlaps spec's, or "" if there is none.
-//
-// Overlapping destinations are not merely redundant, they are unsafe: an
-// agent's orphan sweep reclaims .drsync.tmp entries it finds in the
-// destination, and it can only recognise its OWN job+pass as live work. Job A's
-// chunk temp — which exists for the whole multi-host assembly of a big file —
-// therefore looks like stray residue to job B's walk of the same directory, and
-// gets unlinked underneath it. A's finalize then fails, or worse, later chunks
-// recreate the temp and A renames a partially written file into place.
-//
-// Only live jobs conflict: a COMPLETED/CANCELLED/FAILED job writes nothing, so
-// re-syncing its destination with a new job is legitimate. A job of the same
-// name is skipped so the store's unique-name conflict reports itself rather
-// than this reading as a self-overlap.
-func (s *Server) destinationConflict(spec *model.JobSpec) (string, error) {
-	jobs, err := s.st.ListJobs()
-	if err != nil {
-		return "", err
-	}
-	for _, j := range jobs {
-		switch j.State {
-		case model.JobCompleted, model.JobCancelled, model.JobFailed:
-			continue
-		}
-		if j.Name == spec.Metadata.Name {
-			continue
-		}
-		other, err := model.ParseSpec(j.SpecYAML)
-		if err != nil {
-			// A stored spec that no longer parses (downgrade, hand-edited row)
-			// must not wedge every future submit; it also cannot be compared.
-			slog.Warn("skipping unparsable stored spec in destination check",
-				"job", j.Name, "err", err)
-			continue
-		}
-		if model.PathsOverlap(spec.Spec.Destination.Path, other.Spec.Destination.Path) {
-			return j.Name, nil
-		}
-	}
-	return "", nil
+// destConflictMsg explains an overlapping destination in operator terms: what
+// breaks, and the two ways out.
+func destConflictMsg(dc *store.DestinationConflictError) string {
+	return fmt.Sprintf(
+		"destination %q overlaps the destination of job %q (%s), which is still live. "+
+			"Two jobs writing into one tree corrupt each other's in-progress files: each "+
+			"reclaims the other's .drsync.tmp temps as stray residue, so a large file being "+
+			"assembled by one job can be truncated or lost by the other. Finish or cancel %q, "+
+			"or use a destination outside that tree.",
+		dc.Dst, dc.Other, dc.OtherDst, dc.Other)
 }
 
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -421,7 +382,7 @@ func (s *Server) jobAction(action string) http.HandlerFunc {
 		case "pause":
 			err = s.setState(name, model.JobRunning, model.JobPaused)
 		case "resume":
-			err = s.setState(name, model.JobPaused, model.JobRunning)
+			err = s.pc.ResumeJob(name) // same destination gate as start
 		case "cancel":
 			var job *store.Job
 			if job, err = s.st.GetJob(name); err == nil {
@@ -430,6 +391,11 @@ func (s *Server) jobAction(action string) http.HandlerFunc {
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			httpErr(w, http.StatusNotFound, "no such job")
+			return
+		}
+		var dc *store.DestinationConflictError
+		if errors.As(err, &dc) {
+			httpErr(w, http.StatusConflict, "cannot %s: %s", action, destConflictMsg(dc))
 			return
 		}
 		if err != nil {

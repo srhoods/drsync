@@ -54,14 +54,57 @@ func (c *Controller) StartJob(name string) error {
 	switch job.State {
 	case model.JobReady:
 	case model.JobPaused:
+		if err := c.destinationFree(job); err != nil {
+			return err
+		}
 		return c.st.SetJobState(job.ID, model.JobRunning)
 	default:
 		return fmt.Errorf("job %q is %s; expected READY", name, job.State)
+	}
+	if err := c.destinationFree(job); err != nil {
+		return err
 	}
 	if err := c.st.SetJobState(job.ID, model.JobRunning); err != nil {
 		return err
 	}
 	return c.seedPass(job.ID, 1)
+}
+
+// ResumeJob returns a PAUSED job to RUNNING. It exists so resume goes through
+// the same destination check as start: while the job was paused another job may
+// have taken over its tree, and resuming into that is the corruption this gate
+// prevents.
+func (c *Controller) ResumeJob(name string) error {
+	job, err := c.st.GetJob(name)
+	if err != nil {
+		return fmt.Errorf("job %q: %w", name, err)
+	}
+	if job.State != model.JobPaused {
+		return fmt.Errorf("job %q is %s; expected PAUSED", name, job.State)
+	}
+	if err := c.destinationFree(job); err != nil {
+		return err
+	}
+	return c.st.SetJobState(job.ID, model.JobRunning)
+}
+
+// destinationFree refuses to start a job whose destination tree is being
+// written by another running job. Submit already rejects overlapping
+// destinations, so this is a backstop rather than the primary gate — but it is
+// the one that holds when submit could not: jobs created before that check
+// existed, and two overlapping submits racing (each passes its check before the
+// other's row is visible, though CreateJob now closes that window by checking
+// under the insert's lock).
+//
+// Only RUNNING/PAUSED count here. A READY job has not started, so blocking on
+// one would deadlock two jobs that each refuse to go first.
+func (c *Controller) destinationFree(job *store.Job) error {
+	spec, err := model.ParseSpec(job.SpecYAML)
+	if err != nil {
+		return fmt.Errorf("job %q: %w", job.Name, err)
+	}
+	return c.st.DestinationConflict(job.Name, spec.Spec.Destination.Path,
+		store.JobStatesRunning...)
 }
 
 func (c *Controller) seedPass(jobID int64, passNo int) error {

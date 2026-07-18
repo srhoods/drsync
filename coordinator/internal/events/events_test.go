@@ -8,6 +8,17 @@ import (
 	"drsync/coordinator/internal/store"
 )
 
+// CreateJob parses the spec (it checks the destination against live jobs), so
+// tests need a real one rather than a placeholder blob.
+const jobSpecYAML = `
+apiVersion: drsync/v1
+kind: Job
+metadata: { name: evjob }
+spec:
+  source: { path: /src }
+  destination: { path: /dst }
+`
+
 func TestBusFanOutAndDrop(t *testing.T) {
 	b := NewBus()
 	ch, cancel := b.Subscribe()
@@ -48,7 +59,7 @@ func TestPollerDiffsStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	job, err := st.CreateJob("evjob", []byte("spec"), false)
+	job, err := st.CreateJob("evjob", []byte(jobSpecYAML), false)
 	if err != nil {
 		t.Fatal(err)
 	}
