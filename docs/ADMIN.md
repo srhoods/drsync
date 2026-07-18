@@ -199,7 +199,8 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 
 | Command | What it does |
 |---------|--------------|
-| `drsync agent list` | Connected agents, liveness, and scheduling status (`SCHED` = `enabled`/`DISABLED`). |
+| `drsync agent list` | Connected agents, liveness, and scheduling status (`SCHED` = `enabled`/`DISABLED`). `PROTO` is the agent's protocol minor; `(old)` marks one behind the coordinator, which still works but reports less telemetry. |
+| `drsync agent inflight <id>` | What the agent is working on right now — shard, kind, path, running vs queued, time held, entries walked so far. The first thing to run when a job slows down; see §6b. |
 | `drsync agent disable <id>` | Stop granting new shards to an agent. It stays connected and finishes its in-flight leases; nothing new is scheduled onto it. Survives agent reconnects. |
 | `drsync agent enable <id>` | Re-admit a disabled agent to scheduling. |
 | `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, fidelity exceptions. The per-pass table ends with a **TOTAL** footer row summing the additive columns (duration, delta-files, delta-bytes, verify, errors; orphans is a per-scan census so it is dashed). Your go/no-go artifact. |
@@ -428,9 +429,59 @@ orphaned directory can remove a large tree.
   connect/disconnect, **parked-shard alerts**, and 1 Hz throughput stats.
 - **Point-in-time:** `drsync report <name>` (convergence + totals),
   `drsync queue` (backlog + parked), `drsync agent list` (fleet liveness).
+- **What an agent is doing right now:** `drsync agent inflight <id>` — see §6b.
 - **Metrics:** the coordinator exposes Prometheus metrics at
   `http://<coord>:7441/metrics` (grants, journal batches, parked shards,
-  per-agent scan/copy rates and RSS). Point Grafana at it for dashboards.
+  per-agent scan/copy rates and RSS, and `drsync_shard_duration_seconds` — a
+  histogram of shard wall time by kind). Point Grafana at it for dashboards.
+
+### 6b. Diagnosing a job that is slowing down
+
+Large jobs sometimes lose throughput over time without producing any errors.
+The fleet counters tell you *that* it is happening; these two tell you *what is
+driving it*.
+
+**1. Which shards are slow, in aggregate.** `drsync_shard_duration_seconds` is
+the agent-measured wall time of every completed shard, labelled by kind:
+
+```promql
+histogram_quantile(0.99, sum by (le, kind) (rate(drsync_shard_duration_seconds_bucket[5m])))
+```
+
+A p99 that climbs while the median stays flat means a few pathological shards
+are holding the pass open — go to step 2. A median that climbs with it means
+everything is uniformly slower, which points at the mounts or the coordinator
+rather than at any one directory.
+
+**2. What each agent is holding right now.**
+
+```
+$ drsync agent inflight agent-3f2a
+SHARD  JOB  KIND  STATE    RUNNING  HELD  ENTRIES  PATH
+8821   4    dir   running  14m30s   14m   2100000  proj/archive/2019
+8830   4    dir   running  12.4s    12s   41000    proj/archive/2020
+8834   4    dir   queued   -        11s   0        proj/archive/2021
+```
+
+Read it as follows:
+
+- **`RUNNING` climbing, `ENTRIES` climbing** — a genuinely huge subtree. It is
+  working, just large; consider a lower `dir_split_threshold` so it fans out
+  across the fleet instead of grinding on one worker (§4.5).
+- **`RUNNING` climbing, `ENTRIES` static** — stuck, not slow. Usually a hung
+  mount or a blocked copy; check that agent's mounts before anything else.
+- **Everything `queued`, little `running`** — the agent is over-granted rather
+  than slow: its workers are busy elsewhere, or its copy queue is full.
+- **`ENTRIES` static at 0 on every shard on every agent** — suspect the
+  coordinator: work is being granted and nothing is starting.
+
+The view is a snapshot from the agent's last heartbeat (5 s by default), so run
+it a couple of times — it is the *movement* between samples that separates slow
+from stuck.
+
+Agents older than protocol minor 1 cannot report this. The command says so
+explicitly rather than printing an empty table, which would read as an idle
+agent (see DESIGN-protocol.md §5.1).
 
 ---
 

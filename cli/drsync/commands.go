@@ -488,18 +488,71 @@ func cmdPass(args []string) error {
 // drsync agent list
 // ---------------------------------------------------------------------------
 
+const agentUsage = "usage: drsync agent list | inflight <id> | enable <id> | disable <id>"
+
 func cmdAgent(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: drsync agent list | enable <id> | disable <id>")
+		return fmt.Errorf("%s", agentUsage)
 	}
 	switch args[0] {
 	case "list":
 		return agentList(args[1:])
+	case "inflight":
+		return agentInflight(args[1:])
 	case "enable", "disable":
 		return agentEnable(args[0], args[1:])
 	default:
-		return fmt.Errorf("usage: drsync agent list | enable <id> | disable <id>")
+		return fmt.Errorf("%s", agentUsage)
 	}
+}
+
+// agentInflight shows what one agent is working on right now, longest-running
+// first — the head of the list is what to investigate when a job slows down.
+func agentInflight(args []string) error {
+	fs := flag.NewFlagSet("agent inflight", flag.ExitOnError)
+	mk := connFlags(fs)
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: drsync agent inflight <id>")
+	}
+	var out struct {
+		Agent     string `json:"agent"`
+		Supported bool   `json:"supported"`
+		Inflight  []struct {
+			ShardID     uint64 `json:"shard_id"`
+			JobID       uint64 `json:"job_id"`
+			Kind        string `json:"kind"`
+			RelPath     string `json:"rel_path"`
+			HeldMS      uint32 `json:"held_ms"`
+			RunningMS   uint32 `json:"running_ms"`
+			Running     bool   `json:"running"`
+			EntriesDone uint64 `json:"entries_done"`
+		} `json:"inflight"`
+	}
+	if err := mk().get("/api/v1/agents/"+fs.Arg(0)+"/inflight", &out); err != nil {
+		return err
+	}
+	if !out.Supported {
+		// Not the same as "holding nothing": say so rather than print an empty
+		// table that reads as an idle agent.
+		return fmt.Errorf("agent %s predates in-flight reporting (protocol minor 1); upgrade it to see this",
+			out.Agent)
+	}
+	if len(out.Inflight) == 0 {
+		fmt.Printf("agent %s is holding no work\n", out.Agent)
+		return nil
+	}
+	tw := newTable()
+	fmt.Fprintln(tw, "SHARD\tJOB\tKIND\tSTATE\tRUNNING\tHELD\tENTRIES\tPATH")
+	for _, it := range out.Inflight {
+		state := "queued"
+		if it.Running {
+			state = "running"
+		}
+		fmt.Fprintf(tw, "%d\t%d\t%s\t%s\t%s\t%s\t%d\t%s\n", it.ShardID, it.JobID,
+			it.Kind, state, humanMS(int64(it.RunningMS)), humanMS(int64(it.HeldMS)), it.EntriesDone, it.RelPath)
+	}
+	return tw.Flush()
 }
 
 func agentList(args []string) error {
@@ -510,6 +563,8 @@ func agentList(args []string) error {
 		ID            string `json:"id"`
 		Hostname      string `json:"hostname"`
 		Version       string `json:"version"`
+		ProtoMinor    uint32 `json:"proto_minor"`
+		Stale         bool   `json:"stale"`
 		State         string `json:"state"`
 		Connected     bool   `json:"connected"`
 		Enabled       bool   `json:"enabled"`
@@ -519,14 +574,20 @@ func agentList(args []string) error {
 		return err
 	}
 	tw := newTable()
-	fmt.Fprintln(tw, "ID\tHOST\tVERSION\tSTATE\tCONNECTED\tSCHED\tLAST-HEARTBEAT")
+	fmt.Fprintln(tw, "ID\tHOST\tVERSION\tPROTO\tSTATE\tCONNECTED\tSCHED\tLAST-HEARTBEAT")
 	for _, a := range agents {
 		sched := "enabled"
 		if !a.Enabled {
 			sched = "DISABLED"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%v\t%s\t%s\n", a.ID, a.Hostname, a.Version,
-			a.State, a.Connected, sched, msTime(a.LastHeartbeat))
+		// A stale agent still works; it just reports less. Flag it rather than
+		// hiding it, so missing telemetry has a visible cause.
+		proto := strconv.FormatUint(uint64(a.ProtoMinor), 10)
+		if a.Stale {
+			proto += " (old)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%v\t%s\t%s\n", a.ID, a.Hostname, a.Version,
+			proto, a.State, a.Connected, sched, msTime(a.LastHeartbeat))
 	}
 	return tw.Flush()
 }

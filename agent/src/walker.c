@@ -26,6 +26,11 @@
 #define SPLIT_BATCH 4096
 #define SPLIT_ACK_TIMEOUT_S 120
 
+/* Publish in-flight progress every 256 entries. One relaxed atomic store per
+ * 256 entries is noise next to the stat/copy work each entry already costs,
+ * and 256 is fine-grained enough to see movement between 5s heartbeats. */
+#define PROGRESS_PUBLISH_MASK 0xFF
+
 /* In-agent recursion cap. Each level costs a walk_dir + handle_entry frame
  * (a couple of PATH_MAX buffers, ~8-12 KiB); 256 keeps worst-case walker stack
  * well under the default 8 MiB thread stack, while being far deeper than any
@@ -885,7 +890,20 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel, int depth)
             i++;
             j++;
         }
+        /* Publish inside the loop, not just at the directory boundary: a single
+         * huge directory can hold a worker here for minutes (handle_entry blocks
+         * when the copy queue is full), and a shard that reports no progress for
+         * that whole time is indistinguishable from a wedged one. Masked to keep
+         * it off the per-entry path. */
+        if ((ctx->c.entries_walked & PROGRESS_PUBLISH_MASK) == 0)
+            lease_publish(ctx->c.entries_walked);
     }
+
+    /* Publish progress at the directory boundary (not per entry — this is a
+     * hot loop) so a heartbeat can tell a shard that is grinding through a huge
+     * tree from one that is wedged. Done before dpend_wait, which may block for
+     * a long time on this directory's copies. */
+    lease_publish(ctx->c.entries_walked);
 
     /* Wait for this directory's async copies, then apply its metadata:
      * every rename into the dir has happened, so mtime sticks (§3.5). */
@@ -1015,7 +1033,10 @@ static void entrylist_walk(struct walk_ctx *ctx, const char *rel,
         /* Entry-list shard: its entries are one directory's children, so a
          * subdirectory among them starts a fresh descent at depth 0. */
         handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], de, 0);
+        if ((ctx->c.entries_walked & PROGRESS_PUBLISH_MASK) == 0)
+            lease_publish(ctx->c.entries_walked);
     }
+    lease_publish(ctx->c.entries_walked);
     dpend_wait(&dp);
     dpend_destroy(&dp);
 

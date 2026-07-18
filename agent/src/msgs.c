@@ -17,17 +17,32 @@ void enc_hello(pb_buf *b, const char *agent_id, const char *hostname,
 {
     pb_put_str(b, 1, agent_id);
     pb_put_str(b, 2, hostname);
-    pb_put_u64(b, 3, 1); /* proto_major */
-    pb_put_u64(b, 4, 0); /* proto_minor */
+    pb_put_u64(b, 3, PROTO_MAJOR);
+    pb_put_u64(b, 4, PROTO_MINOR);
     pb_put_str(b, 5, version);
     pb_put_u64(b, 6, cores);
     pb_put_u64(b, 7, mem_limit);
     pb_put_bool(b, 8, io_uring);
 }
 
+const char *wi_kind_name(int kind)
+{
+    switch (kind) {
+    case WI_SHARD:     return "dir";
+    case WI_DELETE:    return "delete";
+    case WI_VERIFY:    return "verify";
+    case WI_ENTRYLIST: return "entrylist";
+    case WI_CHUNK:     return "chunk";
+    case WI_PROBE:     return "probe";
+    case WI_DIRFIX:    return "dirfix";
+    default:           return "unknown";
+    }
+}
+
 void enc_heartbeat(pb_buf *b, uint64_t seq, const uint64_t *leases, size_t n_leases,
                    uint32_t shard_queue_depth, uint32_t copy_queue_depth,
-                   uint64_t rss_bytes)
+                   uint64_t rss_bytes, const struct inflight_view *inflight,
+                   size_t n_inflight)
 {
     pb_put_u64(b, 1, seq);
     if (n_leases) { /* packed repeated varint */
@@ -41,6 +56,22 @@ void enc_heartbeat(pb_buf *b, uint64_t seq, const uint64_t *leases, size_t n_lea
     pb_put_u64(b, 3, shard_queue_depth);
     pb_put_u64(b, 4, copy_queue_depth);
     pb_put_u64(b, 6, rss_bytes);
+    for (size_t i = 0; i < n_inflight; i++) { /* 8: repeated InflightItem */
+        const struct inflight_view *v = &inflight[i];
+        pb_buf sub;
+        pb_init(&sub);
+        pb_put_u64(&sub, 1, v->lease_id);
+        pb_put_u64(&sub, 2, v->shard_id);
+        pb_put_u64(&sub, 3, v->job_id);
+        pb_put_str(&sub, 4, wi_kind_name(v->kind));
+        pb_put_str(&sub, 5, v->rel_path);
+        pb_put_u64(&sub, 6, v->held_ms);
+        pb_put_u64(&sub, 7, v->running_ms);
+        pb_put_bool(&sub, 8, v->running);
+        pb_put_u64(&sub, 9, v->entries_done);
+        pb_put_msg(b, 8, &sub);
+        pb_free(&sub);
+    }
 }
 
 void enc_work_request(pb_buf *b, uint32_t shard_credits,

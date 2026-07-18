@@ -24,13 +24,36 @@ import (
 	drsyncpb "drsync/proto/gen/drsyncpb"
 )
 
-const ProtoMajor = 1
+// Wire protocol version (proto/drsync.proto §Versioning).
+//
+// ProtoMajor must match the agent's exactly: a mismatch means the two sides
+// disagree about what a field means, so the session is refused. Bumping it
+// locks out every agent until the whole fleet is upgraded — reserve it for
+// genuinely incompatible changes.
+//
+// ProtoMinor is additive. The coordinator accepts any minor and degrades to
+// what the agent actually supports; it is recorded per agent so an operator can
+// see who is behind, and so "the agent does not report this" is distinguishable
+// from "the agent reports zero". Raise MinAgentMinor (the -min-agent-minor
+// flag) only to deliberately exclude old agents.
+const (
+	ProtoMajor = 1
+	ProtoMinor = 1
+
+	// MinorInflight is the minor at which agents began reporting per-lease
+	// in-flight detail in the heartbeat.
+	MinorInflight = 1
+)
 
 type Config struct {
 	HeartbeatInterval time.Duration
 	LeaseTTL          time.Duration
 	TLS               *tls.Config // nil = plaintext (dev only; warn loudly)
 	FleetEpoch        uint64
+	// MinAgentMinor refuses agents below this protocol minor. 0 (the default)
+	// accepts every compatible agent — raising it strands work on any agent
+	// that cannot reconnect, so it is opt-in.
+	MinAgentMinor uint32
 }
 
 type Server struct {
@@ -45,9 +68,10 @@ type Server struct {
 }
 
 type agentConn struct {
-	id       string
-	hostname string
-	conn     net.Conn
+	id         string
+	hostname   string
+	protoMinor uint32
+	conn       net.Conn
 	wmu      sync.Mutex     // serializes handshake (pre-writer) frames
 	out      chan sendFrame // steady-state frames handed to the writer goroutine
 	stop     chan struct{}  // closed on teardown to stop the writer
@@ -63,6 +87,27 @@ type agentConn struct {
 	jrnMu      sync.Mutex
 	jrnPending uint64
 	jrnAcked   uint64
+
+	// Last heartbeat's in-flight snapshot. Sampled state, not history: replaced
+	// wholesale each heartbeat, and dropped with the session.
+	ifMu       sync.Mutex
+	inflight   []*drsyncpb.InflightItem
+	inflightAt time.Time
+}
+
+// Inflight returns the agent's most recent in-flight snapshot and the time it
+// was reported. reports is false when the agent is connected but too old to
+// send the detail — the caller must not render that as "idle".
+func (s *Server) Inflight(agentID string) (items []*drsyncpb.InflightItem, at time.Time, reports bool, connected bool) {
+	s.mu.Lock()
+	ac := s.agents[agentID]
+	s.mu.Unlock()
+	if ac == nil {
+		return nil, time.Time{}, false, false
+	}
+	ac.ifMu.Lock()
+	defer ac.ifMu.Unlock()
+	return ac.inflight, ac.inflightAt, ac.protoMinor >= MinorInflight, true
 }
 
 type sendFrame struct {
@@ -167,7 +212,7 @@ func (s *Server) handle(conn net.Conn) {
 	conn.SetReadDeadline(time.Time{})
 
 	ac := &agentConn{
-		id: hello.AgentId, hostname: hello.Hostname, conn: conn,
+		id: hello.AgentId, hostname: hello.Hostname, protoMinor: hello.ProtoMinor, conn: conn,
 		out: make(chan sendFrame, outBuffer), stop: make(chan struct{}), done: make(chan struct{}),
 	}
 	ack := &drsyncpb.HelloAck{
@@ -177,9 +222,23 @@ func (s *Server) handle(conn net.Conn) {
 		LeaseTtlS:          uint32(s.cfg.LeaseTTL / time.Second),
 		FleetEpoch:         s.cfg.FleetEpoch,
 	}
-	if hello.ProtoMajor != ProtoMajor {
+	// Major must match exactly; minor is only checked against an explicit
+	// operator floor. Rejecting here is final for this session: the agent
+	// retries with backoff, so a misconfigured floor shows up as a fleet that
+	// never connects rather than as silent data loss.
+	switch {
+	case hello.ProtoMajor != ProtoMajor:
 		ack.Accepted = false
 		ack.RejectReason = fmt.Sprintf("protocol major %d unsupported (want %d)", hello.ProtoMajor, ProtoMajor)
+	case hello.ProtoMinor < s.cfg.MinAgentMinor:
+		ack.Accepted = false
+		ack.RejectReason = fmt.Sprintf("protocol minor %d below the configured minimum %d; upgrade the agent",
+			hello.ProtoMinor, s.cfg.MinAgentMinor)
+	}
+	if !ack.Accepted {
+		slog.Warn("agent rejected", "agent", hello.AgentId, "remote", remote,
+			"version", hello.AgentVersion, "proto_major", hello.ProtoMajor,
+			"proto_minor", hello.ProtoMinor, "reason", ack.RejectReason)
 		ac.writeSync(drsyncpb.FrameType_FRAME_HELLO_ACK, ack)
 		return
 	}
@@ -191,7 +250,7 @@ func (s *Server) handle(conn net.Conn) {
 	s.agents[ac.id] = ac
 	s.mu.Unlock()
 
-	if err := s.st.UpsertAgent(ac.id, ac.hostname, hello.AgentVersion); err != nil {
+	if err := s.st.UpsertAgent(ac.id, ac.hostname, hello.AgentVersion, hello.ProtoMinor); err != nil {
 		slog.Error("agent upsert failed", "agent", ac.id, "err", err)
 		return
 	}
@@ -202,7 +261,12 @@ func (s *Server) handle(conn net.Conn) {
 	// a write (see send()).
 	go ac.writeLoop()
 	s.met.AgentUp.WithLabelValues(ac.id).Set(1)
-	slog.Info("agent connected", "agent", ac.id, "host", ac.hostname, "version", hello.AgentVersion)
+	slog.Info("agent connected", "agent", ac.id, "host", ac.hostname,
+		"version", hello.AgentVersion, "proto_minor", hello.ProtoMinor)
+	if hello.ProtoMinor < ProtoMinor {
+		slog.Warn("agent is behind the coordinator's protocol minor; some telemetry will be missing",
+			"agent", ac.id, "agent_minor", hello.ProtoMinor, "coordinator_minor", ProtoMinor)
+	}
 
 	defer func() {
 		close(ac.stop) // stop the writer goroutine
@@ -289,6 +353,13 @@ func (s *Server) dispatch(ac *agentConn, ft drsyncpb.FrameType, payload []byte) 
 }
 
 func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
+	// Latest in-flight snapshot for the fleet view. Kept even when empty: for a
+	// minor >= MinorInflight agent, empty genuinely means "holding nothing".
+	ac.ifMu.Lock()
+	ac.inflight = hb.Inflight
+	ac.inflightAt = time.Now()
+	ac.ifMu.Unlock()
+
 	// Renew only the leases the agent still holds (per the heartbeat), so a
 	// lost grant or a dropped result frame is left to expire and requeue rather
 	// than renewed forever (which stalls the pass).
@@ -442,6 +513,12 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 		if e != nil {
 			err = e
 			break
+		}
+		// Only successful shards are timed: a shard that failed part-way says
+		// nothing about how long the work takes, and would drag the quantiles
+		// toward whatever the failure mode's timeout happens to be.
+		if ms := r.GetCounters().GetWallMs(); ms > 0 {
+			s.met.ShardDuration.WithLabelValues(string(kind)).Observe(float64(ms) / 1000)
 		}
 		if kind == model.KindChunk {
 			err = s.completeChunk(passID, shardID, leaseID, payload, r)

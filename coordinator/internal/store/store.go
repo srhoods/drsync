@@ -222,6 +222,9 @@ func Open(path string) (*Store, error) {
 var migrations = []string{
 	`ALTER TABLE agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1`,
 	`ALTER TABLE shards ADD COLUMN target_agent TEXT`,
+	// 0 for rows written before the column existed, which is also the minor an
+	// agent that predates minor negotiation reports — the two are equivalent.
+	`ALTER TABLE agents ADD COLUMN proto_minor INTEGER NOT NULL DEFAULT 0`,
 }
 
 func (s *Store) Close() error {
@@ -1215,20 +1218,22 @@ type Agent struct {
 	ID            string
 	Hostname      string
 	Version       string
+	ProtoMinor    uint32
 	State         string
 	LastHeartbeat int64
 	Enabled       bool
 }
 
-func (s *Store) UpsertAgent(id, hostname, version string) error {
+func (s *Store) UpsertAgent(id, hostname, version string, protoMinor uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := nowMS()
-	_, err := s.db.Exec(`INSERT INTO agents (id, hostname, version, state, last_heartbeat, registered_at)
-		VALUES (?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO agents (id, hostname, version, proto_minor, state, last_heartbeat, registered_at)
+		VALUES (?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET hostname=excluded.hostname,
-		  version=excluded.version, state='connected', last_heartbeat=excluded.last_heartbeat`,
-		id, hostname, version, "connected", now, now)
+		  version=excluded.version, proto_minor=excluded.proto_minor,
+		  state='connected', last_heartbeat=excluded.last_heartbeat`,
+		id, hostname, version, protoMinor, "connected", now, now)
 	return err
 }
 
@@ -1267,7 +1272,8 @@ func (s *Store) TouchAgent(id string) error {
 }
 
 func (s *Store) ListAgents() ([]*Agent, error) {
-	rows, err := s.rdb.Query(`SELECT id, hostname, version, state, COALESCE(last_heartbeat, 0), enabled FROM agents ORDER BY id`)
+	rows, err := s.rdb.Query(`SELECT id, hostname, version, proto_minor, state,
+		COALESCE(last_heartbeat, 0), enabled FROM agents ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1276,7 +1282,8 @@ func (s *Store) ListAgents() ([]*Agent, error) {
 	for rows.Next() {
 		a := &Agent{}
 		var enabled int
-		if err := rows.Scan(&a.ID, &a.Hostname, &a.Version, &a.State, &a.LastHeartbeat, &enabled); err != nil {
+		if err := rows.Scan(&a.ID, &a.Hostname, &a.Version, &a.ProtoMinor, &a.State,
+			&a.LastHeartbeat, &enabled); err != nil {
 			return nil, err
 		}
 		a.Enabled = enabled != 0

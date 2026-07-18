@@ -3,6 +3,18 @@
 //
 // Rules: field numbers are never reused; additions only; no semantic changes
 // to existing fields. Frame types map 1:1 to the u16 in the frame header.
+//
+// Versioning (Hello.proto_major / proto_minor):
+//   major — incompatible change: a field's meaning changes, a field is removed,
+//           or a new frame becomes mandatory. The coordinator refuses any agent
+//           whose major differs, so a bump means a full fleet upgrade.
+//   minor — purely additive: new optional fields or new frames that both sides
+//           tolerate the absence of. Old agents keep working; the coordinator
+//           degrades to whatever the agent's minor supports.
+// Bump the minor whenever a field is added here, so the coordinator can tell
+// "agent does not report this" apart from "agent reports zero".
+//
+// minor 1: Heartbeat.inflight — per-lease progress detail.
 
 syntax = "proto3";
 
@@ -114,6 +126,21 @@ message MountHealth {
   bool   healthy = 2;
 }
 
+// InflightItem is one lease the agent currently holds, with enough detail to
+// answer "what is this agent doing right now, and for how long". Sent every
+// heartbeat (tens of entries), so it is sampled state rather than a log stream.
+message InflightItem {
+  uint64 lease_id     = 1;
+  uint64 shard_id     = 2;
+  uint64 job_id       = 3;
+  string kind         = 4;  // dir | entrylist | chunk | dirfix | verify | delete | probe
+  string rel_path     = 5;  // truncated to a bounded length by the agent
+  uint32 held_ms      = 6;  // since the grant was accepted
+  uint32 running_ms   = 7;  // since a worker picked it up; 0 while still queued
+  bool   running      = 8;  // false = granted but still sitting in the work queue
+  uint64 entries_done = 9;  // progress so far, to tell "stuck" from "grinding"
+}
+
 message Heartbeat {
   uint64 seq                    = 1;
   repeated uint64 held_lease_ids = 2;  // implicit renewal of all of these
@@ -122,6 +149,7 @@ message Heartbeat {
   uint64 inflight_bytes         = 5;
   uint64 rss_bytes              = 6;
   repeated MountHealth mounts   = 7;
+  repeated InflightItem inflight = 8;  // minor >= 1
 }
 
 message HeartbeatAck {

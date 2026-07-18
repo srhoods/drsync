@@ -8,7 +8,7 @@
 //	drsync job start|pause|resume|cancel <name>
 //	drsync job purge <name> | --completed|--state S [--older-than DUR]
 //	drsync pass trigger <name> [--delete-pass --i-know-this-deletes]
-//	drsync agent list | enable <id> | disable <id>
+//	drsync agent list | inflight <id> | enable <id> | disable <id>
 //	drsync errors <name> [--pass N|all] [--class EACCES] [--path prefix]
 //	drsync journal cat <name> [--pass N|all] [--type orphan] [--summary] [--jsonl]
 //	drsync report <name> [--json]
@@ -58,6 +58,11 @@ PASSES
 AGENTS
   agent list
         Connected agents, liveness, and scheduling status.
+  agent inflight <id>
+        What the agent is working on right now, longest-running first: shard,
+        kind, path, how long it has been running and entries walked so far.
+        Start here when a job's throughput drops — a shard whose RUNNING time
+        climbs while ENTRIES stays put is stuck, not merely slow.
   agent disable <id>
         Stop granting new shards to an agent; it stays connected and finishes
         its in-flight leases (useful to drain a node before maintenance).
