@@ -2,7 +2,10 @@
  * Slice 2: stats are prefetched in batches (io_uring statx, fstatat fallback)
  * and data movement runs on the copy pool; the walker waits per directory so
  * directory metadata still lands after every rename into it (§3.5).
- * Still TODO: explicit stack for very deep trees. */
+ * Descent is recursive but depth-bounded: past MAX_WALK_DEPTH a subdirectory is
+ * pushed back to the coordinator as its own shard (the same queue_split path
+ * budget exhaustion uses) rather than recursed into, so a pathologically deep
+ * tree is sharded across the fleet instead of overflowing the walker stack. */
 #include "agent.h"
 #include "wire.h"
 
@@ -21,6 +24,13 @@
 
 #define SPLIT_BATCH 4096
 #define SPLIT_ACK_TIMEOUT_S 120
+
+/* In-agent recursion cap. Each level costs a walk_dir + handle_entry frame
+ * (a couple of PATH_MAX buffers, ~8-12 KiB); 256 keeps worst-case walker stack
+ * well under the default 8 MiB thread stack, while being far deeper than any
+ * real directory tree — so it only ever engages on pathological input, which is
+ * then sharded back to the coordinator and re-walked at depth 0. */
+#define MAX_WALK_DEPTH 256
 
 void walk_err(struct walk_ctx *ctx, const char *what, const char *path)
 {
@@ -532,7 +542,7 @@ static bool should_chunk(const struct job_options *o, uint64_t size)
 }
 
 /* ---- the walk ---- */
-static void walk_dir(struct walk_ctx *ctx, const char *rel);
+static void walk_dir(struct walk_ctx *ctx, const char *rel, int depth);
 
 /* This shard's entry budget: subdirectories are descended inline while it
  * lasts and pushed back to the coordinator once it runs out. The coordinator's
@@ -557,7 +567,8 @@ static uint64_t split_threshold(const struct walk_ctx *ctx)
 
 static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel,
                          int sfd, int dfd, const struct dent *se,
-                         const struct dent *de /* NULL if absent in dst */)
+                         const struct dent *de /* NULL if absent in dst */,
+                         int depth)
 {
     const struct job_options *o = &ctx->oe->o;
     const char *name = se->name;
@@ -596,9 +607,12 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
             walk_err(ctx, "path", name);
             return;
         }
-        if (ctx->budget > 0)
-            walk_dir(ctx, child); /* TODO: explicit stack for very deep trees */
+        if (ctx->budget > 0 && depth < MAX_WALK_DEPTH)
+            walk_dir(ctx, child, depth + 1);
         else
+            /* Budget spent, or too deep to recurse safely: hand the subtree to
+             * the coordinator as its own shard. It is re-walked at depth 0, so
+             * arbitrarily deep trees are handled with bounded walker stack. */
             queue_split(ctx, child);
         break;
 
@@ -734,7 +748,7 @@ static void handle_orphan(struct walk_ctx *ctx, const char *rel, int dfd,
     jrn_emit(ctx, JR_ORPHAN, orel, NULL, NULL, 0, NULL);
 }
 
-static void walk_dir(struct walk_ctx *ctx, const char *rel)
+static void walk_dir(struct walk_ctx *ctx, const char *rel, int depth)
 {
     if (ctx->fatal)
         return;
@@ -826,13 +840,13 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel)
     while ((i < sn || j < dn) && !ctx->fatal) {
         int cmp = i == sn ? 1 : j == dn ? -1 : strcmp(sv[i].name, dv[j].name);
         if (cmp < 0) {
-            handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], NULL);
+            handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], NULL, depth);
             i++;
         } else if (cmp > 0) {
             handle_orphan(ctx, rel, dfd, dv[j].name);
             j++;
         } else {
-            handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], &dv[j]);
+            handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], &dv[j], depth);
             i++;
             j++;
         }
@@ -870,7 +884,7 @@ void process_shard(const struct shard_item *it)
         status = RES_TRANSIENT;
     } else {
         ctx.budget = shard_budget(&ctx);
-        walk_dir(&ctx, it->rel_path);
+        walk_dir(&ctx, it->rel_path, 0);
         flush_splits(&ctx);
         flush_bigfiles(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
@@ -963,7 +977,9 @@ static void entrylist_walk(struct walk_ctx *ctx, const char *rel,
     dpend_init(&dp);
     for (size_t i = 0; i < n_names && !ctx->fatal; i++) {
         const struct dent *de = (dfd >= 0 && dv[i].st_res == 0) ? &dv[i] : NULL;
-        handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], de);
+        /* Entry-list shard: its entries are one directory's children, so a
+         * subdirectory among them starts a fresh descent at depth 0. */
+        handle_entry(ctx, &dp, rel, sfd, dfd, &sv[i], de, 0);
     }
     dpend_wait(&dp);
     dpend_destroy(&dp);
