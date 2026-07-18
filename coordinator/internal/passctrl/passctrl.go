@@ -61,19 +61,43 @@ func (c *Controller) StartJob(name string) error {
 }
 
 func (c *Controller) seedPass(jobID int64, passNo int) error {
-	pass, err := c.st.CreatePass(jobID, passNo, model.PassScanning)
+	// Gate the pass on a per-agent mount probe: each currently-schedulable agent
+	// gets one probe shard pinned to it (target_agent), and the root walk shard
+	// is withheld until every probe reports OK (advance, PassProbing case). This
+	// catches a missing or misordered mount on ANY host before bulk work runs —
+	// not just on whichever agent happened to grab the root shard.
+	agents, err := c.st.SchedulableAgents()
 	if err != nil {
 		return err
 	}
-	// TODO(phase1): a KindProbe task per registered agent gates the pass on
-	// mount capability probes before the root shard is granted.
-	_, err = c.st.InsertShards(pass.ID, 0, []store.NewShard{
-		{Kind: model.KindDir, RelPath: ""},
-	})
-	if err == nil {
-		slog.Info("pass seeded", "job", jobID, "pass", passNo)
+	if len(agents) == 0 {
+		// Empty fleet: nothing to probe and nothing to grant the root shard to
+		// yet. Fall back to the ungated root shard (a late-joining agent with a
+		// bad mount still fails its own work with RESULT_MOUNT_SICK).
+		pass, err := c.st.CreatePass(jobID, passNo, model.PassScanning)
+		if err != nil {
+			return err
+		}
+		if _, err := c.st.InsertShards(pass.ID, 0,
+			[]store.NewShard{{Kind: model.KindDir, RelPath: ""}}); err != nil {
+			return err
+		}
+		slog.Info("pass seeded (no agents to probe)", "job", jobID, "pass", passNo)
+		return nil
 	}
-	return err
+	pass, err := c.st.CreatePass(jobID, passNo, model.PassProbing)
+	if err != nil {
+		return err
+	}
+	probes := make([]store.NewShard, 0, len(agents))
+	for _, a := range agents {
+		probes = append(probes, store.NewShard{Kind: model.KindProbe, TargetAgent: a})
+	}
+	if _, err := c.st.InsertShards(pass.ID, 0, probes); err != nil {
+		return err
+	}
+	slog.Info("pass seeded; probing mounts", "job", jobID, "pass", passNo, "agents", len(agents))
+	return nil
 }
 
 // Run ticks the lifecycle until ctx is done.
@@ -116,6 +140,16 @@ func (c *Controller) advance(job *store.Job) error {
 	if pass == nil {
 		return nil // between passes; decideNextPass already ran
 	}
+	if pass.State == model.PassProbing {
+		// Drop probes pinned to agents that left after seeding, so the phase is
+		// not stalled by a shard no live agent can lease.
+		if n, err := c.st.PruneStaleProbes(pass.ID); err != nil {
+			return err
+		} else if n > 0 {
+			slog.Warn("pruned probes for departed agents", "job", job.Name,
+				"pass", pass.PassNo, "pruned", n)
+		}
+	}
 	counts, err := c.st.ShardStateCounts(pass.ID)
 	if err != nil {
 		return err
@@ -132,6 +166,18 @@ func (c *Controller) advance(job *store.Job) error {
 	}
 
 	switch pass.State {
+	case model.PassProbing:
+		// Every probe drained without parking (the parked guard above catches a
+		// failed mount and blocks here), so all mounts verified. Insert the root
+		// walk shard BEFORE flipping to SCANNING — otherwise a tick could see
+		// SCANNING with an empty queue and skip the walk straight to DIRFIX.
+		if _, err := c.st.InsertShards(pass.ID, 0,
+			[]store.NewShard{{Kind: model.KindDir, RelPath: ""}}); err != nil {
+			return err
+		}
+		slog.Info("pass phase: PROBING → SCANNING (mounts verified)",
+			"job", job.Name, "pass", pass.PassNo)
+		return c.st.SetPassState(pass.ID, model.PassScanning)
 	case model.PassScanning:
 		// TODO(phase1): generate DirFixBatch tasks from the pass journal's
 		// DIR_META records (deepest-first) and insert as KindDirfix shards.

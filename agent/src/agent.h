@@ -250,6 +250,11 @@ void apply_meta(struct walk_ctx *ctx, int fd, const struct estat *ss,
  * Cross-host: ranges of one file are granted to different agents. */
 void process_chunk(const struct shard_item *it);
 
+/* ---- mount probe (probe.c) ---- */
+/* Verifies this agent's src/dst roots are directories and reports a
+ * ShardResult; gates pass start (docs/DESIGN-protocol.md §3.1 ProbeTask). */
+void process_probe(const struct shard_item *it);
+
 /* ---- walker (walker.c) ---- */
 /* Processes one shard end-to-end and enqueues its ShardResult. */
 void process_shard(const struct shard_item *it);

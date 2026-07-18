@@ -520,6 +520,24 @@ void shard_item_free(struct shard_item *it)
     it->n_paths = 0;
 }
 
+/* ProbeTask { task_id = 1, job_id = 2 }. task_id is the probe shard's id; the
+ * result is reported as a ShardResult keyed by it, so store it as shard_id. */
+static bool dec_probe_task(const uint8_t *p, size_t n, struct shard_item *it)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1: it->shard_id = pb_get_varint(&c); break;
+        case 2: it->job_id = pb_get_varint(&c); break;
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err && it->shard_id && it->job_id;
+}
+
 static bool dec_delete_batch(const uint8_t *p, size_t n, struct shard_item *it)
 {
     pb_cur c;
@@ -795,8 +813,14 @@ static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
             it.kind = WI_CHUNK;
             have_item = true;
             break;
-        case 6: case 9:
-            /* dirfix/probe: later slices.
+        case 9:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_probe_task(sp, sn, &it))
+                goto fail;
+            it.kind = WI_PROBE;
+            have_item = true;
+            break;
+        case 6:
+            /* dirfix: later slice.
              * Skipped; the lease expires and the coordinator re-queues. */
             unsupported = true;
             pb_skip(&c, wt);

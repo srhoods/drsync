@@ -17,6 +17,7 @@ type PassState string
 
 const (
 	PassPending  PassState = "PENDING"
+	PassProbing  PassState = "PROBING" // per-agent mount probes gate the root shard
 	PassScanning PassState = "SCANNING"
 	PassDirfix   PassState = "DIRFIX"
 	PassVerify   PassState = "VERIFY"

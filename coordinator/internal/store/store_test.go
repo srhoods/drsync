@@ -721,3 +721,115 @@ func TestCountSchedulableAgents(t *testing.T) {
 		t.Fatalf("after disable+disconnect: got %d, want 1", n)
 	}
 }
+
+// TestTargetedShardOnlyLeasedByTarget covers probe targeting: a shard pinned to
+// one agent is leasable only by that agent, while untargeted shards stay open to
+// anyone.
+func TestTargetedShardOnlyLeasedByTarget(t *testing.T) {
+	s := openTest(t)
+	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	pass, err := s.CreatePass(job.ID, 1, model.PassProbing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertShards(pass.ID, 0, []NewShard{
+		{Kind: model.KindProbe, TargetAgent: "agent-a"},
+		{Kind: model.KindProbe, TargetAgent: "agent-b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// agent-b may not take agent-a's probe: it gets only its own.
+	rows, err := s.LeaseShards("agent-b", 8, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Kind != model.KindProbe {
+		t.Fatalf("agent-b lease = %+v, want its single probe", rows)
+	}
+	// agent-a takes the remaining probe (its own).
+	rows, err = s.LeaseShards("agent-a", 8, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("agent-a lease = %+v, want its single probe", rows)
+	}
+}
+
+// TestPruneStaleProbes drops probes pinned to departed agents so the probing
+// phase is not stalled by a shard no live agent can lease.
+func TestPruneStaleProbes(t *testing.T) {
+	s := openTest(t)
+	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	pass, err := s.CreatePass(job.ID, 1, model.PassProbing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertShards(pass.ID, 0, []NewShard{
+		{Kind: model.KindProbe, TargetAgent: "live"},
+		{Kind: model.KindProbe, TargetAgent: "gone"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Only "live" is connected; "gone" was never registered (or disconnected).
+	if err := s.UpsertAgent("live", "h", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.PruneStaleProbes(pass.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("pruned %d, want 1 (the departed agent's probe)", n)
+	}
+	// The rollup the phase machine reads must reflect the delete.
+	counts, err := s.ShardStateCounts(pass.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[model.ShardQueued] != 1 {
+		t.Fatalf("queued after prune = %d, want 1", counts[model.ShardQueued])
+	}
+	// The live agent's probe survived and is still leasable by it.
+	rows, err := s.LeaseShards("live", 8, time.Minute)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("live probe lease = %+v, err=%v", rows, err)
+	}
+}
+
+// TestSchedulableAgents lists connected+enabled agents (probe targets).
+func TestSchedulableAgents(t *testing.T) {
+	s := openTest(t)
+	for _, id := range []string{"a", "b", "c"} {
+		if err := s.UpsertAgent(id, "h", "v1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetAgentEnabled("b", false); err != nil { // disabled: excluded
+		t.Fatal(err)
+	}
+	if err := s.SetAgentState("c", "disconnected"); err != nil { // gone: excluded
+		t.Fatal(err)
+	}
+	got, err := s.SchedulableAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"a"}) {
+		t.Fatalf("schedulable = %v, want [a]", got)
+	}
+}
