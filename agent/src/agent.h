@@ -116,6 +116,19 @@ struct statx_req {
  * Always completes every request (res tells the outcome per entry). */
 void stat_batch(struct statx_req *reqs, size_t n);
 
+/* ---- io_uring registered-buffer copy engine (ucopy.c) ---- */
+/* Called in stream order with each block as it is read, so the caller can fold
+ * an inline checksum into the copy for free (design §3). */
+typedef void (*ucopy_sink)(void *arg, const void *data, size_t n);
+/* True once the calling copy thread has a working copy ring (lazy per-thread);
+ * false when io_uring is unavailable — the caller then uses a serial loop. */
+bool ucopy_available(void);
+/* Sequentially copy [0,size) from in to out via overlapped READ_FIXED/
+ * WRITE_FIXED, feeding each block to sink in order. Returns bytes copied (==
+ * size, or less if the source shrank mid-copy — the caller's gen check handles
+ * that) or -errno on a read/write error. Only call when ucopy_available(). */
+int64_t ucopy_run(int in, int out, uint64_t size, ucopy_sink sink, void *sink_arg);
+
 /* relaxed counter add: shard counters are shared walker ↔ copy pool */
 #define CTR_ADD(field, v) __atomic_fetch_add(&(field), (v), __ATOMIC_RELAXED)
 

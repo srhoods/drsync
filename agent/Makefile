@@ -2,11 +2,11 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wshadow -D_GNU_SOURCE -Ivendor
 LDFLAGS ?= -pthread -lzstd -lssl -lcrypto
 
-SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/walker.c src/main.c
+SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/walker.c src/main.c
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test
+test: filter-test fidelity-test ucopy-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -37,5 +37,13 @@ bin/fidelity_test: test/fidelity_test.c src/xattr.o src/jrn.o src/msgs.o src/pb.
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ test/fidelity_test.c src/xattr.o src/jrn.o src/msgs.o src/pb.o -pthread -lzstd
 
+# ucopy engine: byte-exact copies + in-order sink across edge sizes (memfds).
+ucopy-test: bin/ucopy_test
+	./bin/ucopy_test
+
+bin/ucopy_test: test/ucopy_test.c src/ucopy.o src/uring.o
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/ucopy_test.c src/ucopy.o src/uring.o
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/ucopy_test

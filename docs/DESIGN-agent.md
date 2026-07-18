@@ -98,8 +98,21 @@ decision D9).
 > owner/mode/mtime after the pass has drained — a diff-then-apply that leaves an
 > already-correct directory untouched. This lands split/fanned-out directory
 > mtimes within the same pass rather than relying on convergence over passes
-> (`test/dirfix_e2e.sh`).
-> Not yet: io_uring data path, probe task type.
+> (`test/dirfix_e2e.sh`). A per-agent mount probe now gates pass start
+> (WI_PROBE / `probe.c`; `test/probe_e2e.sh`).
+> The byte-copy fallback (used when copy_file_range is unavailable — cross-
+> device or a mount pair without server-side copy/reflink) now runs on an
+> io_uring registered-buffer engine (`ucopy.c`): a depth-2 ping-pong over two
+> fixed 1 MiB buffers overlaps the read of the next block with the write of the
+> current one (the read and write are on different mounts in a migration), and
+> the inline xxh3 hash is preserved via a stream-order sink callback. It
+> self-tests READ_FIXED on a memfd and falls back to the serial read/write loop
+> when io_uring is unavailable. Verified by `agent/test/ucopy_test.c` (byte-exact
+> + in-order sink across edge sizes) and `test/ucopy_e2e.sh` (server_side_copy
+> off → engine engaged, byte-exact, verify clean).
+> Not yet: POSIX↔NFSv4 ACL translation — cross-flavor pairs still hit the
+> untranslatable policy (now journalled as JR_FIDELITY_EXCEPTION, not just
+> counted); the translation needs an NFSv4 mount to develop and verify.
 > Verified end-to-end by `test/e2e.sh` (sync + fidelity + verify + delete).
 
 ---
