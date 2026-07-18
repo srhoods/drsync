@@ -610,12 +610,13 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard, 
 	return ids, tx.Commit()
 }
 
-// ShardJobID resolves the job that owns a shard (via its pass).
-func (s *Store) ShardJobID(shardID int64) (int64, error) {
-	var jobID int64
-	err := s.rdb.QueryRow(`SELECT p.job_id FROM shards s
-		JOIN passes p ON p.id = s.pass_id WHERE s.id = ?`, shardID).Scan(&jobID)
-	return jobID, err
+// ShardJobPass resolves the job and pass number that own a shard. Both are
+// needed to name a chunk temp: the (job, pass) pair is what an agent's orphan
+// sweep compares against to tell a live temp from crash residue.
+func (s *Store) ShardJobPass(shardID int64) (jobID, passNo int64, err error) {
+	err = s.rdb.QueryRow(`SELECT p.job_id, p.pass_no FROM shards s
+		JOIN passes p ON p.id = s.pass_id WHERE s.id = ?`, shardID).Scan(&jobID, &passNo)
+	return jobID, passNo, err
 }
 
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for

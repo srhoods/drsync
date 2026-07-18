@@ -56,7 +56,8 @@ spec:
     buffer_size: 1MiB                # io_uring buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA; auto-fallback to zero-detect
     server_side_copy: auto           # try copy_file_range (NFSv4.2), fallback read/write
-    temp_naming: ".drsync.tmp.{id}"  # in-progress destination names
+    temp_naming: ".drsync.tmp."      # PREFIX for in-progress destination names;
+                                     # "<job>-<pass>.<shard>.<seq>" is appended
     fsync: per_file                  # per_file | batched(n)
 
   metadata:

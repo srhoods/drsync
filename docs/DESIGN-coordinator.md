@@ -211,7 +211,16 @@ into place. The finalize task re-checks the gen, fsyncs, applies metadata, and
 renames the temp to the final name — the commit point. A chunk that finds the
 source drifted returns `RESULT_SRC_CHANGED`; the group is marked aborted, no
 finalize is seeded, the half-written temp is reclaimed as `.drsync.tmp` residue
-on the next walk, and the file is re-diffed next pass. Only the finalize accounts
+on a later pass, and the file is re-diffed next pass.
+
+The coordinator names the temp `.drsync.tmp.<job>-<pass>.<shard>.<index>` (hex).
+The `<job>-<pass>` tag is load-bearing, not decorative: the temp has no source
+counterpart, so an agent walking its directory sees it as an orphan and the
+sweep reclaims prefix-matching orphans as crash residue. Agents skip temps
+carrying their own `(job, pass)`, which is what stops a re-walk of the directory
+— routine, since a requeued parent walk shard keeps its already-fanned-out chunk
+group (`RecordSplit`'s `INSERT OR IGNORE`) — from deleting a temp its chunks are
+still writing into. Only the finalize accounts
 the file (files_copied +1, bytes +size), so a pass that copied solely via chunks
 still shows a nonzero delta and does not falsely converge.
 

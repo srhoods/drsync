@@ -2,8 +2,10 @@ package agentsrv
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -278,5 +280,65 @@ func TestReadLoopNotBlockedByWrites(t *testing.T) {
 			&drsyncpb.Heartbeat{Seq: uint64(i)}); err != nil {
 			t.Fatalf("heartbeat %d blocked/failed — read loop stalled on a write: %v", i, err)
 		}
+	}
+}
+
+// TestChunkTempNamePassTagged is the "open temp for finalize" regression. A
+// chunk temp lives in the destination directory, with no source counterpart,
+// for the whole multi-host copy — indistinguishable from crash residue to an
+// agent's orphan sweep, which unlinks prefix-matching destination orphans. The
+// directory can legitimately be re-walked while the group runs (the parent walk
+// shard is requeued after a lease lapse or a journal-ack timeout, and
+// RecordSplit deliberately keeps the existing group rather than re-fanning it),
+// and an untagged temp was then reclaimed out from under the live chunks: the
+// finalize failed on ENOENT, or — if the unlink landed mid-group — the
+// remaining chunks recreated the temp with O_CREAT and finalize renamed a
+// hole-ridden file into place.
+//
+// The leading "<job>-<pass>." tag is what the agent compares against its own
+// (job, pass) to keep the temp. The format is shared with agent/src/tempname.c
+// (temp_name_fmt / temp_tag_matches); this pins the coordinator's half.
+func TestChunkTempNamePassTagged(t *testing.T) {
+	srv := newTestServer(t)
+
+	// The seeded root scan shard stands in for the walk shard that discovers a
+	// big file and ships it for fan-out.
+	rows, err := srv.st.LeaseShards("agent-1", 1, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("leased %d shards, want the seeded root scan shard", len(rows))
+	}
+	parent := rows[0]
+
+	_, groups, err := srv.planBigFiles(parent.ID, []*drsyncpb.ShardSplit_BigFile{
+		{RelPath: []byte("a/big.bin"), Size: 1 << 30, MtimeNs: 42},
+		{RelPath: []byte("a/big2.bin"), Size: 1 << 30, MtimeNs: 43},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("planned %d groups, want 2", len(groups))
+	}
+
+	wantTag := fmt.Sprintf("%x-%x.", parent.JobID, parent.PassNo)
+	for i, g := range groups {
+		want := fmt.Sprintf(".drsync.tmp.%s%x.%x", wantTag, parent.ID, i)
+		if g.TempName != want {
+			t.Errorf("group %d temp = %q, want %q", i, g.TempName, want)
+		}
+		// The sweep strips the prefix and compares the tag; an untagged name
+		// (the old "<shard>.<index>" form) is what the agent reclaims.
+		if !strings.HasPrefix(strings.TrimPrefix(g.TempName, ".drsync.tmp."), wantTag) {
+			t.Errorf("group %d temp %q carries no (job, pass) tag — a concurrent "+
+				"walk of its directory would reclaim it mid-copy", i, g.TempName)
+		}
+	}
+	// Every chunk of a file must target that one temp, including the finalize
+	// task seeded on data-chunk completion.
+	if fin := finalizeShard("a/big.bin", groups[0].TempName, nil); fin.Kind != model.KindChunk {
+		t.Fatalf("finalize shard kind = %v", fin.Kind)
 	}
 }

@@ -69,7 +69,13 @@ and delete phases. Browse it with `drsync journal` / `drsync errors`.
   counted as a *fidelity exception* (or fails the entry under policy), never
   silently dropped. `security.selinux` is deliberately excluded.
 - **`.drsync.tmp.*` temp files** are drsync's own; crash residue is reclaimed
-  automatically on the next walk.
+  automatically on a later walk. The name carries the job and pass that created
+  it (`.drsync.tmp.<job>-<pass>.<shard>.<seq>`, hex), so a pass never deletes a
+  temp its own in-flight copies — including the long-lived temp of a big file
+  being assembled across several hosts — are still writing. Residue therefore
+  survives until the next pass rather than being swept within the current one;
+  that is deliberate. Don't delete `.drsync.tmp.*` by hand while a job is
+  running.
 
 ---
 
@@ -107,7 +113,7 @@ spec:
     buffer_size: 1MiB
     preserve_sparse: true         # SEEK_HOLE/SEEK_DATA extent copy
     server_side_copy: auto        # auto | off | require  (copy_file_range / NFSv4.2 SSC / reflink)
-    temp_naming: ".drsync.tmp."
+    temp_naming: ".drsync.tmp."   # prefix only; job/pass/shard suffix is appended
     fsync: per_file               # per_file | batched  (batched is ~5× faster, weaker crash durability)
 
   metadata:
