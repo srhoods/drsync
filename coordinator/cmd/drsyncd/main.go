@@ -44,17 +44,17 @@ const coordinatorVersion = "0.1.0-slice5"
 
 func main() {
 	var (
-		agentAddr  = flag.String("listen-agent", ":7440", "agent protocol listen address")
-		httpAddr   = flag.String("listen-http", ":7441", "REST/metrics listen address")
-		dataDir    = flag.String("data-dir", "/var/lib/drsync", "state store + journal directory")
-		apiToken   = flag.String("api-token", "", "bearer token for the REST API (empty = no auth, dev only)")
-		tlsCert    = flag.String("tls-cert", "", "coordinator TLS certificate (PEM)")
-		tlsKey     = flag.String("tls-key", "", "coordinator TLS key (PEM)")
-		tlsCA      = flag.String("tls-ca", "", "CA bundle for verifying agent client certs (PEM)")
-		leaseTTL   = flag.Duration("lease-ttl", 30*time.Second, "shard lease TTL")
-		hbEvery    = flag.Duration("heartbeat-interval", 5*time.Second, "agent heartbeat interval")
-		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
-		minMinor   = flag.Uint("min-agent-minor", 0,
+		agentAddr = flag.String("listen-agent", ":7440", "agent protocol listen address")
+		httpAddr  = flag.String("listen-http", ":7441", "REST/metrics listen address")
+		dataDir   = flag.String("data-dir", "/var/lib/drsync", "state store + journal directory")
+		apiToken  = flag.String("api-token", "", "bearer token for the REST API (empty = no auth, dev only)")
+		tlsCert   = flag.String("tls-cert", "", "coordinator TLS certificate (PEM)")
+		tlsKey    = flag.String("tls-key", "", "coordinator TLS key (PEM)")
+		tlsCA     = flag.String("tls-ca", "", "CA bundle for verifying agent client certs (PEM)")
+		leaseTTL  = flag.Duration("lease-ttl", 30*time.Second, "shard lease TTL")
+		hbEvery   = flag.Duration("heartbeat-interval", 5*time.Second, "agent heartbeat interval")
+		logLevel  = flag.String("log-level", "info", "debug|info|warn|error")
+		minMinor  = flag.Uint("min-agent-minor", 0,
 			"refuse agents below this protocol minor (0 = accept all compatible agents)")
 		smtpConfig = flag.String("smtp-config", defaultSMTPConfig, "SMTP config for email notifications (absent default = disabled)")
 	)
