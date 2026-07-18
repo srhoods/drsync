@@ -93,7 +93,9 @@ JOB=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/dirfix")
 
 # --- assertions ---------------------------------------------------------------
 # 1. converged in a single pass — so no "next pass" could have fixed the dir.
-NP=$(echo "$JOB" | grep -o '"pass_no":' | wc -l)
+# counts occurrences, not lines; `|| true` stops a no-match grep from
+# aborting the script under pipefail + set -e.
+NP=$(echo "$JOB" | { grep -o '"pass_no":' || true; } | wc -l)
 [[ "$NP" -eq 1 ]] || fail "expected 1 pass, got $NP (the single-pass premise is broken)"
 
 # 2. the split directory's mtime is the SOURCE mtime, not copy-time. This is the

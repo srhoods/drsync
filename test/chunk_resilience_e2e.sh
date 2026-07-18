@@ -52,7 +52,11 @@ for a in res-a res-b res-c; do
     APIDS="$APIDS $!"
 done
 for _ in $(seq 1 40); do
-    n=$(curl -sf -H "$AUTH" "$API/api/v1/agents" | grep -o '"connected":true' | wc -l)
+    # grep -o|wc counts OCCURRENCES (the payload is a single JSON line, so
+    # grep -c would cap at 1). The `|| true` keeps a no-match grep — normal
+    # while agents are still connecting — from aborting the script via
+    # pipefail+set -e instead of retrying; same trap e2e.sh documents on has().
+    n=$(curl -sf -H "$AUTH" "$API/api/v1/agents" | { grep -o '"connected":true' || true; } | wc -l)
     [[ "$n" -eq 3 ]] && break; sleep 0.25
 done
 [[ "${n:-0}" -eq 3 ]] || fail "expected 3 agents, got ${n:-0}"

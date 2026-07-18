@@ -222,7 +222,9 @@ VF=$(echo "$JOB" | grep -o '"verify_fail":[0-9]*' | tr -dc '0-9\n' | sort -u | t
 [[ "${V1:-0}" -ge "$P1" ]] || fail "pass1 verified only ${V1:-0} of $P1 copied entries"
 echo "$JOB" | grep -q '"verify_fail":[1-9]' && fail "verify failures reported: $JOB"
 
-N_PASSES=$(echo "$JOB" | grep -o '"pass_no":' | wc -l)
+# counts occurrences, not lines; `|| true` stops a no-match grep from
+# aborting the script under pipefail + set -e.
+N_PASSES=$(echo "$JOB" | { grep -o '"pass_no":' || true; } | wc -l)
 echo "sync converged in $N_PASSES passes (pass1 copied $P1 files), fidelity checks OK"
 
 # --- operator surface: CLI + events + query endpoints --------------------------
