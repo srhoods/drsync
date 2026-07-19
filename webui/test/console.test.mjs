@@ -148,6 +148,31 @@ test("class chips are built from the by_class histogram", () => {
 });
 
 // --------------------------------------------------------------------------
+// Rates
+// --------------------------------------------------------------------------
+
+test("a closely-spaced poll does not blank the fleet's rates", async () => {
+  // An event-triggered refresh (soon(), 250ms after a job/pass/agent/park
+  // event) used to land too close to the previous sample to difference, which
+  // zeroed every agent AND consumed the baseline — so the reading alternated
+  // between zero and roughly double. Rates are now averaged over a window, so
+  // a close sample changes nothing visible.
+  const before = c.text("#k-bw");
+  assert.notEqual(before, "\u2013", "throughput never populated");
+
+  // Two rapid refreshes, as a burst of events would cause.
+  c.nav(1).click(); c.nav(0).click();
+  await c.tick(300);
+
+  for (const id of ["#k-bw", "#k-files", "#k-scan"]) {
+    assert.notEqual(c.text(id), "0", `${id} dropped to zero after a close poll`);
+    assert.notEqual(c.text(id), "\u2013", `${id} blanked after a close poll`);
+  }
+  const fleet = c.$("#fleet").textContent;
+  assert.ok(/MiB|GiB|KiB/.test(fleet), "fleet throughput column blanked");
+});
+
+// --------------------------------------------------------------------------
 // Per-agent in-flight work
 // --------------------------------------------------------------------------
 

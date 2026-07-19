@@ -147,6 +147,12 @@
 
   /* ---- layout grid ---- */
   .grid { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  /* Full-width panel stack (overview). */
+  .stack { display: flex; flex-direction: column; gap: 16px; }
+  /* Attention's three sections share the panel's width instead of stacking
+     into three narrow strips. */
+  .attn { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1.1fr) minmax(0,1fr); gap: 20px; padding: 14px 16px 16px; align-items: start; }
+  @media (max-width: 1000px) { .attn { grid-template-columns: 1fr; } }
   .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
   .panel > .head {
@@ -284,6 +290,17 @@
   /* ---- fleet table ---- */
   .fleet-wrap { overflow-x: auto; }
   table.ft { width: 100%; border-collapse: collapse; font-family: var(--mono); font-variant-numeric: tabular-nums; min-width: 460px; }
+  /* Fixed layout + explicit widths: with auto layout the column widths track
+     the widest cell, so a rate going from "1.2k" to "980" resized the columns
+     and shifted every row. The agent column takes the slack. */
+  table.ft.fleet-t { table-layout: fixed; }
+  table.ft.fleet-t th:nth-child(1), table.ft.fleet-t td:nth-child(1) { width: auto; }
+  table.ft.fleet-t th:nth-child(2), table.ft.fleet-t td:nth-child(2),
+  table.ft.fleet-t th:nth-child(3), table.ft.fleet-t td:nth-child(3) { width: 92px; }
+  table.ft.fleet-t th:nth-child(4), table.ft.fleet-t td:nth-child(4) { width: 190px; }
+  table.ft.fleet-t th:nth-child(5), table.ft.fleet-t td:nth-child(5) { width: 96px; }
+  table.ft.fleet-t th:nth-child(6), table.ft.fleet-t td:nth-child(6) { width: 64px; }
+  table.ft.fleet-t th:nth-child(7), table.ft.fleet-t td:nth-child(7) { width: 96px; }
   table.ft th { font-size: 9px; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); font-weight: 500; text-align: right; padding: 8px 9px; border-bottom: 1px solid var(--line); }
   table.ft th:first-child, table.ft td:first-child { text-align: left; }
   table.ft td { font-size: 11.5px; padding: 9px; text-align: right; color: var(--ink-2); border-bottom: 1px solid var(--grid); }
@@ -498,52 +515,53 @@
     </div>
   </section>
 
-  <div class="grid">
-    <!-- MAIN COLUMN -->
-    <div class="col">
-      <section class="panel">
-        <div class="head">
-          <h2>Jobs</h2><span class="eyebrow">migration lifecycle</span>
-          <span class="spacer" style="flex:1"></span>
-          <span class="eyebrow" id="job-hint">select a job for detail</span>
-        </div>
-        <div class="body" id="joblist"></div>
-        <div class="detail" id="detail"></div>
-      </section>
+  <!-- Every panel spans the full width. The tables here (fleet, jobs) have
+       enough columns that a narrow rail wrapped their cells, and a row whose
+       height changes as values change makes the whole column jump. -->
+  <div class="stack">
+    <section class="panel">
+      <div class="head">
+        <h2>Jobs</h2><span class="eyebrow">migration lifecycle</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="eyebrow" id="job-hint">select a job for detail</span>
+      </div>
+      <div class="body" id="joblist"></div>
+      <div class="detail" id="detail"></div>
+    </section>
 
-      <section class="panel">
-        <div class="head"><h2>Aggregate throughput</h2><span class="eyebrow">bytes copied · fleet-wide · 90s</span></div>
-        <div class="tl-wrap">
-          <div class="tl-top">
-            <div class="tl-big"><span id="tl-now">–</span> <span class="u"></span></div>
-            <div class="tl-leg"><span><i></i> bytes/s</span><span id="tl-peak">peak –</span></div>
-          </div>
-          <canvas id="tl" height="150" aria-label="Aggregate throughput timeline"></canvas>
-        </div>
-      </section>
-    </div>
+    <section class="panel">
+      <div class="head"><h2>Fleet</h2><span class="eyebrow">agent performance</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="eyebrow" id="fleet-hb"></span>
+      </div>
+      <div class="body fleet-wrap">
+        <table class="ft fleet-t" aria-label="Agent performance">
+          <thead><tr>
+            <th>agent</th><th>scan /s</th><th>files /s</th><th>throughput</th><th>rss</th><th>hb</th><th></th>
+          </tr></thead>
+          <tbody id="fleet"></tbody>
+        </table>
+      </div>
+    </section>
 
-    <!-- RAIL COLUMN -->
-    <div class="col">
-      <section class="panel">
-        <div class="head"><h2>Fleet</h2><span class="eyebrow">agent performance</span>
-          <span class="spacer" style="flex:1"></span>
-          <span class="eyebrow" id="fleet-hb"></span>
+    <section class="panel">
+      <div class="head"><h2>Aggregate throughput</h2><span class="eyebrow">bytes copied · fleet-wide · 90s</span></div>
+      <div class="tl-wrap">
+        <div class="tl-top">
+          <div class="tl-big"><span id="tl-now">–</span> <span class="u"></span></div>
+          <div class="tl-leg"><span><i></i> bytes/s</span><span id="tl-peak">peak –</span></div>
         </div>
-        <div class="body fleet-wrap">
-          <table class="ft" aria-label="Agent performance">
-            <thead><tr>
-              <th>agent</th><th>scan /s</th><th>files /s</th><th>throughput</th><th>rss</th><th>hb</th><th></th>
-            </tr></thead>
-            <tbody id="fleet"></tbody>
-          </table>
-        </div>
-      </section>
+        <canvas id="tl" height="150" aria-label="Aggregate throughput timeline"></canvas>
+      </div>
+    </section>
 
-      <section class="panel">
-        <div class="head"><h2>Attention</h2><span class="eyebrow">queue · parked · events</span></div>
-        <div class="body">
-          <div class="sect-l" id="rail-q-label" style="margin-top:6px">shard queue</div>
+    <section class="panel">
+      <div class="head"><h2>Attention</h2><span class="eyebrow">queue · parked · events</span></div>
+      <!-- Three sections side by side: full width would otherwise leave each
+           of them a narrow strip in a very wide panel. -->
+      <div class="body attn">
+        <div>
+          <div class="sect-l" id="rail-q-label" style="margin-top:0">shard queue</div>
           <div class="qbar" id="qbar" role="img" aria-label="Shard queue composition"></div>
           <div class="qleg">
             <span class="q"><i></i> queued <b class="mono" id="q-q">–</b></span>
@@ -551,15 +569,17 @@
             <span class="d"><i></i> done <b class="mono" id="q-d">–</b></span>
             <span class="p"><i></i> parked <b class="mono" id="q-p">–</b></span>
           </div>
-
-          <div class="sect-l">parked shards</div>
+        </div>
+        <div>
+          <div class="sect-l" style="margin-top:0">parked shards</div>
           <div class="parked" id="rail-parked"></div>
-
-          <div class="sect-l">event stream</div>
+        </div>
+        <div>
+          <div class="sect-l" style="margin-top:0">event stream</div>
           <div class="feed" id="feed"></div>
         </div>
-      </section>
-    </div>
+      </div>
+    </section>
   </div>
  </div><!-- /view-overview -->
 
@@ -852,7 +872,6 @@
   let curView = "overview";
 
   // ---------- /metrics parse + rate diff ----------
-  let lastMetrics = null;
   const METRIC_RE = /^drsync_(scan_entries_total|copy_files_total|copy_bytes_total|agent_rss_bytes|agent_up)\{agent="([^"]+)"\}\s+([0-9.eE+-]+)/;
   // Fleet-wide counters carry no labels. lease_expiries/work_grants are what
   // the queue view's requeue tiles report: both are already maintained by the
@@ -874,22 +893,49 @@
     }
     return { by, glob };
   }
+  // Rates are averaged over a sliding window rather than differenced between
+  // consecutive polls.
+  //
+  // Two things made the per-poll figures jump. Agents report their cumulative
+  // counters once a second, so a 2.5s window catches two ticks or three — a
+  // ±50% swing on a perfectly steady agent. And an event-triggered refresh
+  // (soon(), 250ms after a job/pass/agent/park event) landed a sample too
+  // close to the previous one to difference, which used to yield a rate of
+  // zero for every agent AND consume the baseline, so the reading alternated
+  // between zero and roughly double.
+  //
+  // Differencing against the oldest sample still inside the window fixes both:
+  // the divisor is always seconds, not milliseconds, and short gaps between
+  // polls no longer matter because the baseline is not consumed by them.
+  const RATE_WINDOW_MS = 10000;
+  let samples = []; // [{ t, by }], oldest first, spanning ~RATE_WINDOW_MS
   function computeRates(by) {
-    const now = Date.now(), rates = {}, sum = { scan:0, files:0, bytes:0 };
-    if (lastMetrics) {
-      const dt = (now - lastMetrics.t) / 1000;
-      if (dt > 0.4) for (const id in by) {
-        const cur = by[id], prev = lastMetrics.by[id];
-        const r = { rss: cur.rss || 0, up: cur.up || 0, scan:0, files:0, bytes:0 };
-        if (prev) {
-          r.scan = Math.max(0, (cur.scan - prev.scan) / dt);
-          r.files = Math.max(0, (cur.files - prev.files) / dt);
-          r.bytes = Math.max(0, (cur.bytes - prev.bytes) / dt);
-        }
-        rates[id] = r; sum.scan += r.scan; sum.files += r.files; sum.bytes += r.bytes;
+    const now = Date.now();
+    samples.push({ t: now, by });
+    // Keep the oldest sample that is still at or beyond the window edge, so
+    // the baseline covers the full window rather than sliding in under it.
+    while (samples.length > 2 && now - samples[1].t >= RATE_WINDOW_MS) samples.shift();
+
+    const base = samples[0];
+    const dt = (now - base.t) / 1000;
+    // Too early to say anything truthful. Returning null keeps the previous
+    // reading on screen instead of flashing zeros — an agent showing nothing
+    // must mean it is doing nothing.
+    if (samples.length < 2 || dt < 0.5) return null;
+
+    const rates = {}, sum = { scan: 0, files: 0, bytes: 0 };
+    for (const id in by) {
+      const cur = by[id], prev = base.by[id];
+      const r = { rss: cur.rss || 0, up: cur.up || 0, scan: 0, files: 0, bytes: 0 };
+      if (prev) {
+        // max(0) covers an agent restart resetting its counters; that agent
+        // reads zero until the restart falls out of the window.
+        r.scan = Math.max(0, (cur.scan - prev.scan) / dt);
+        r.files = Math.max(0, (cur.files - prev.files) / dt);
+        r.bytes = Math.max(0, (cur.bytes - prev.bytes) / dt);
       }
+      rates[id] = r; sum.scan += r.scan; sum.files += r.files; sum.bytes += r.bytes;
     }
-    lastMetrics = { t: now, by };
     return { rates, sum };
   }
   function pushHist(sum) {
@@ -931,8 +977,11 @@
       if (!S.info) S.info = await api("/api/v1/info").catch(() => null);
 
       const { by, glob } = parseMetrics(mtext);
-      const { rates, sum } = computeRates(by);
-      S.rates = rates; S.sum = sum; S.glob = glob; pushHist(sum);
+      S.glob = glob;
+      // null = no full window yet; keep the last good reading and add nothing
+      // to the history rather than drawing a zero that never happened.
+      const r = computeRates(by);
+      if (r) { S.rates = r.rates; S.sum = r.sum; pushHist(r.sum); }
 
       if (!S.selected || !S.jobs.find(j => j.name === S.selected)) {
         const run = S.jobs.find(j => j.state === "RUNNING");
@@ -1649,7 +1698,7 @@
   $("#cfg-save").addEventListener("click", async () => {
     cfg.base = cfgBase.value.trim().replace(/\/+$/, ""); cfg.token = cfgToken.value.trim();
     localStorage.setItem("drsync.base", cfg.base); localStorage.setItem("drsync.token", cfg.token);
-    cfgMsg.textContent = "connecting…"; cfgMsg.className = "cfg-msg"; lastMetrics = null; S.info = null; renderHeader();
+    cfgMsg.textContent = "connecting…"; cfgMsg.className = "cfg-msg"; samples = []; S.info = null; renderHeader();
     try {
       await api("/api/v1/jobs");
       cfgMsg.textContent = "connected"; cfgMsg.className = "cfg-msg ok";
