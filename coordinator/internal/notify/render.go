@@ -9,7 +9,12 @@ import (
 // PassReport is the data for a per-pass completion email. It is a plain data
 // carrier so the notify package has no dependency on store/passctrl internals.
 type PassReport struct {
-	Job        string
+	Job string
+	// Src/Dst are the job's source and destination roots. Recipients often
+	// watch several migrations at once, and a job name alone does not say
+	// which trees moved.
+	Src        string
+	Dst        string
 	PassNo     int
 	IsDelete   bool // a delete pass (orphan reclamation) vs a normal sync pass
 	DryRun     bool
@@ -44,6 +49,8 @@ type JobPass struct {
 // JobReport is the data for the end-of-job summary email.
 type JobReport struct {
 	Job              string
+	Src              string
+	Dst              string
 	State            string
 	DryRun           bool
 	Passes           []JobPass
@@ -113,9 +120,9 @@ func renderPass(r PassReport) (subject, htmlBody, textBody string) {
 		}
 	}
 
-	htmlBody = htmlDoc(r.Job, title, statusText, statusColor, r.DryRun, note,
+	htmlBody = htmlDoc(r.Job, r.Src, r.Dst, title, statusText, statusColor, r.DryRun, note,
 		metricsTable(rows), "")
-	textBody = textDoc(r.Job, title, statusText, r.DryRun, note, rows, nil)
+	textBody = textDoc(r.Job, r.Src, r.Dst, title, statusText, r.DryRun, note, rows, nil)
 	return
 }
 
@@ -161,9 +168,9 @@ func renderJob(r JobReport) (subject, htmlBody, textBody string) {
 		note = "The job stopped without reaching a zero-delta fixpoint (pass ceiling reached)."
 	}
 
-	htmlBody = htmlDoc(r.Job, "Migration complete", statusText, statusColor, r.DryRun, note,
+	htmlBody = htmlDoc(r.Job, r.Src, r.Dst, "Migration complete", statusText, statusColor, r.DryRun, note,
 		metricsTable(rows), passTrajectoryHTML(r.Passes))
-	textBody = textDoc(r.Job, "Migration complete", statusText, r.DryRun, note, rows, r.Passes)
+	textBody = textDoc(r.Job, r.Src, r.Dst, "Migration complete", statusText, r.DryRun, note, rows, r.Passes)
 	return
 }
 
@@ -184,7 +191,7 @@ func jobStatus(r JobReport) (string, string) {
 // HTML rendering — table-based, inline styles (email-client safe)
 // ---------------------------------------------------------------------------
 
-func htmlDoc(job, title, statusText, statusColor string, dryRun bool, note, metrics, extra string) string {
+func htmlDoc(job, src, dst, title, statusText, statusColor string, dryRun bool, note, metrics, extra string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `<div style="margin:0;padding:24px 0;background:%s;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:%s;">`, colPage, colInk)
 	fmt.Fprintf(&b, `<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><tr><td align="center">`)
@@ -201,6 +208,21 @@ func htmlDoc(job, title, statusText, statusColor string, dryRun bool, note, metr
 	fmt.Fprintf(&b, `<div style="font-size:20px;font-weight:700;color:%s;">%s</div>`, colInk, html.EscapeString(title))
 	fmt.Fprintf(&b, `<div style="font-size:14px;color:%s;padding-top:4px;">job <span style="font-weight:600;color:%s;">%s</span></div>`,
 		colMuted, colInk, html.EscapeString(job))
+	// Paths wrap rather than overflow: migration roots are often long, and a
+	// clipped path is worse than a wrapped one when the point is to identify
+	// which trees moved.
+	if src != "" || dst != "" {
+		fmt.Fprintf(&b, `<div style="font-size:13px;color:%s;padding-top:8px;line-height:1.6;word-break:break-all;">`, colMuted)
+		if src != "" {
+			fmt.Fprintf(&b, `<div>source <span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:%s;">%s</span></div>`,
+				colInk, html.EscapeString(src))
+		}
+		if dst != "" {
+			fmt.Fprintf(&b, `<div>destination <span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:%s;">%s</span></div>`,
+				colInk, html.EscapeString(dst))
+		}
+		b.WriteString(`</div>`)
+	}
 	fmt.Fprintf(&b, `<div style="padding-top:14px;"><span style="display:inline-block;background:%s;color:#ffffff;font-size:12px;font-weight:600;padding:5px 12px;border-radius:999px;text-transform:uppercase;letter-spacing:0.4px;">%s</span>`,
 		statusColor, html.EscapeString(statusText))
 	if dryRun {
@@ -305,10 +327,16 @@ func passTrajectoryHTML(passes []JobPass) string {
 // Plain-text rendering (multipart/alternative fallback)
 // ---------------------------------------------------------------------------
 
-func textDoc(job, title, statusText string, dryRun bool, note string, rows [][2]string, passes []JobPass) string {
+func textDoc(job, src, dst, title, statusText string, dryRun bool, note string, rows [][2]string, passes []JobPass) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "drsync — %s\n", title)
 	fmt.Fprintf(&b, "job: %s\n", job)
+	if src != "" {
+		fmt.Fprintf(&b, "source: %s\n", src)
+	}
+	if dst != "" {
+		fmt.Fprintf(&b, "destination: %s\n", dst)
+	}
 	fmt.Fprintf(&b, "status: %s\n", statusText)
 	if dryRun {
 		b.WriteString("mode: DRY RUN (no data modified)\n")
