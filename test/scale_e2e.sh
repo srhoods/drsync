@@ -110,6 +110,20 @@ DIFF=$(diff -r "$SRC" "$DST" 2>&1 | grep -v "zzz-orphan" || true)
 [[ -f "$DST/bigdir/zzz-orphan.txt" ]] || fail "orphan deleted (violates D5)"
 [[ -f "$DST/bigdir/sub/deep.txt" ]] || fail "subdir inside split dir not synced"
 
+# 3b. the orphan inside the SPLIT directory was actually DETECTED, not merely
+#     left in place. A split directory does not use the sorted merge the normal
+#     path does — it streams the source and marks the destination listing — so
+#     this is its own code path, and a regression in it looks exactly like "the
+#     directory had no orphans". The delete pass is seeded from these journal
+#     records, so losing them silently means orphans are never reclaimed.
+ORPHANED=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/scale/journal?type=ORPHAN" | python3 -c '
+import sys, json
+recs = json.load(sys.stdin).get("records", [])
+print("\n".join(r.get("rel_path", "") for r in recs))
+')
+grep -qx "bigdir/zzz-orphan.txt" <<<"$ORPHANED" \
+    || fail "orphan in the split dir was not journaled (got: $(tr "\n" " " <<<"$ORPHANED"))"
+
 # 4. verify pass re-read the chunked file (hash journaled as 0) with no failures
 curl -sf -H "$AUTH" "$API/api/v1/jobs/scale" | grep -q '"verify_fail":[1-9]' \
     && fail "verify failures reported"

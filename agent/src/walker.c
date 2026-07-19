@@ -140,7 +140,12 @@ static int dent_cmp(const void *a, const void *b)
 }
 
 /* Reads all names of an open dir fd (sorted). On success *dp owns the fd. */
-static int read_entries(int fd, DIR **dp, struct dent **out, size_t *n_out)
+/* Reads up to `limit` entries, unsorted, leaving the DIR open. Used to decide
+ * whether a directory is pathological after reading only limit names, instead
+ * of materialising millions of them to find out. The caller rewinds before
+ * streaming, so the prefix read here is only ever used for that decision. */
+static int read_entries_upto(int fd, DIR **dp, struct dent **out, size_t *n_out,
+                             size_t limit)
 {
     DIR *d = fdopendir(fd);
     if (!d) {
@@ -151,7 +156,7 @@ static int read_entries(int fd, DIR **dp, struct dent **out, size_t *n_out)
     size_t n = 0, cap = 0;
     errno = 0;
     struct dirent *de;
-    while ((de = readdir(d))) {
+    while (n < limit && (de = readdir(d))) {
         if (de->d_name[0] == '.' &&
             (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0')))
             continue;
@@ -172,7 +177,6 @@ static int read_entries(int fd, DIR **dp, struct dent **out, size_t *n_out)
     }
     if (errno)
         goto fail;
-    qsort(v, n, sizeof *v, dent_cmp);
     *dp = d;
     *out = v;
     *n_out = n;
@@ -187,6 +191,15 @@ fail:;
     closedir(d);
     errno = e;
     return -1;
+}
+
+/* Reads a whole directory, sorted — the ordinary case. */
+static int read_entries(int fd, DIR **dp, struct dent **out, size_t *n_out)
+{
+    if (read_entries_upto(fd, dp, out, n_out, SIZE_MAX) < 0)
+        return -1;
+    qsort(*out, *n_out, sizeof **out, dent_cmp);
+    return 0;
 }
 
 static void free_entries(struct dent *v, size_t n)
@@ -438,43 +451,90 @@ static void flush_entrylist(struct walk_ctx *ctx, const char *dir_rel,
  * names only (no per-entry stats here), journal destination-only names as
  * orphans inline, and ship the source-side names as entry-list shards. Each
  * shard then runs the same statx/diff/copy pipeline over its slice. */
-static void split_entrylist(struct walk_ctx *ctx, const char *rel,
-                            struct dent *sv, size_t sn,
-                            struct dent *dv, size_t dn, int dfd)
+/* Locates a name in the sorted destination listing, or -1. */
+static ssize_t dst_find(struct dent *dv, size_t dn, const char *name)
 {
-    char **batch = NULL;
-    size_t nb = 0, cap = 0;
-    size_t i = 0, j = 0;
+    size_t lo = 0, hi = dn;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = strcmp(name, dv[mid].name);
+        if (c == 0)
+            return (ssize_t)mid;
+        if (c < 0)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return -1;
+}
+
+/* Streams a pathological directory's source names out as entry-list shards.
+ *
+ * The source is never materialised: names are shipped in batches as readdir
+ * yields them, so the fleet starts work after one batch instead of after a
+ * full readdir of millions of entries, and this shard's peak memory is one
+ * batch rather than the whole directory.
+ *
+ * Orphan detection still has to be exact — the delete pass is seeded from the
+ * ORPHAN journal records written here — and it cannot be a sorted merge any
+ * more, because a merge needs the complete source set. Instead the destination
+ * (which must be enumerated regardless) is sorted once, each streamed source
+ * name marks its destination match, and whatever is left unmarked at the end
+ * is destination-only. Same result as the merge, same syscalls, half the peak
+ * memory, and no sort of the source at all. */
+static void split_entrylist_stream(struct walk_ctx *ctx, const char *rel, DIR *sd,
+                                   struct dent *dv, size_t dn, int dfd)
+{
     size_t batch_max = ctx->oe->o.entrylist_batch ? ctx->oe->o.entrylist_batch
                                                   : ENTRYLIST_BATCH_DEFAULT;
-    while ((i < sn || j < dn) && !ctx->fatal) {
-        int cmp = i == sn ? 1 : j == dn ? -1 : strcmp(sv[i].name, dv[j].name);
-        if (cmp > 0) { /* destination-only: orphan (D5 report-only) */
-            handle_orphan(ctx, rel, dfd, dv[j].name);
-            j++;
+    char **batch = calloc(batch_max, sizeof *batch);
+    uint8_t *seen = dn ? calloc(dn, 1) : NULL;
+    if (!batch || (dn && !seen)) {
+        walk_err(ctx, "oom entrylist stream", rel[0] ? rel : "<root>");
+        free(batch);
+        free(seen);
+        return;
+    }
+    size_t nb = 0;
+    struct dirent *de;
+    errno = 0;
+    while (!ctx->fatal && (de = readdir(sd))) {
+        if (de->d_name[0] == '.' &&
+            (de->d_name[1] == '\0' || (de->d_name[1] == '.' && de->d_name[2] == '\0')))
             continue;
+        if (dn) {
+            ssize_t at = dst_find(dv, dn, de->d_name);
+            if (at >= 0)
+                seen[at] = 1;
         }
-        if (nb == cap) {
-            cap = cap ? cap * 2 : 1024;
-            char **nv = realloc(batch, cap * sizeof *nv);
-            if (!nv) {
-                CTR_ADD(ctx->c.errors, 1);
-                break;
-            }
-            batch = nv;
+        // d_name is only valid until the next readdir, and a batch spans many
+        // of them, so each name is copied and released once the batch ships.
+        batch[nb] = strdup(de->d_name);
+        if (!batch[nb]) {
+            CTR_ADD(ctx->c.errors, 1);
+            break;
         }
-        batch[nb++] = sv[i].name; /* borrowed from sv; freed with the dent array */
-        if (cmp == 0)
-            j++;
-        i++;
-        if (nb >= batch_max) {
+        if (++nb >= batch_max) {
             flush_entrylist(ctx, rel, batch, nb);
+            for (size_t i = 0; i < nb; i++)
+                free(batch[i]);
             nb = 0;
         }
+        errno = 0;
     }
+    if (errno)
+        walk_err(ctx, "read src dir", rel[0] ? rel : "<root>");
     if (nb && !ctx->fatal)
         flush_entrylist(ctx, rel, batch, nb);
+    for (size_t i = 0; i < nb; i++)
+        free(batch[i]);
     free(batch);
+
+    /* Destination-only names: orphans (D5 report-only). */
+    for (size_t j = 0; j < dn && !ctx->fatal; j++)
+        if (!seen[j])
+            handle_orphan(ctx, rel, dfd, dv[j].name);
+    free(seen);
 }
 
 static void queue_split(struct walk_ctx *ctx, const char *rel)
@@ -817,14 +877,22 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel, int depth)
         .atim = sst_raw.st_atim, .mtim = sst_raw.st_mtim,
     };
 
+    /* Read only far enough to tell a pathological directory from an ordinary
+     * one. A directory over the threshold is streamed out below and never
+     * materialised, so this prefix is used for the decision and then dropped. */
+    uint64_t split_at = split_threshold(ctx);
+    size_t probe = split_at ? (size_t)split_at + 1 : SIZE_MAX;
     DIR *sd = NULL;
     struct dent *sv = NULL;
     size_t sn = 0;
-    if (read_entries(sfd_raw, &sd, &sv, &sn) < 0) {
+    if (read_entries_upto(sfd_raw, &sd, &sv, &sn, probe) < 0) {
         walk_err(ctx, "read src dir", rel[0] ? rel : "<root>");
         return;
     }
     int sfd = dirfd(sd);
+    bool big = split_at && sn > split_at;
+    if (!big)
+        qsort(sv, sn, sizeof *sv, dent_cmp); /* the merge below needs it sorted */
 
     DIR *dd = NULL;
     struct dent *dv = NULL;
@@ -859,9 +927,14 @@ static void walk_dir(struct walk_ctx *ctx, const char *rel, int depth)
      * pass has drained, so the mtime lands correctly within the same pass. The
      * xattrs/ACLs applied here do not drift from renames, so DIRFIX need only
      * re-apply owner/mode/times. */
-    uint64_t split_at = split_threshold(ctx);
-    if (split_at && sn > split_at) {
-        split_entrylist(ctx, rel, sv, sn, dv, dn, dfd);
+    if (big) {
+        /* The prefix read to make the decision is dropped: streaming restarts
+         * from the top of the directory so no name is emitted twice. */
+        free_entries(sv, sn);
+        sv = NULL;
+        sn = 0;
+        rewinddir(sd);
+        split_entrylist_stream(ctx, rel, sd, dv, dn, dfd);
         if (dfd >= 0 && !o->dry_run && !ctx->fatal) {
             xattr_copy_fd(ctx, sfd, dfd, rel[0] ? rel : "<root>"); /* incl. ACLs */
             apply_meta_dirfd(ctx, dfd, &sst, rel[0] ? rel : "<root>");
