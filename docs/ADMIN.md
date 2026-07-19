@@ -153,6 +153,7 @@ spec:
   tuning:
     shard_budget: 250000          # entries a shard handles before it self-splits
     dir_split_threshold: 50000    # a directory bigger than this is fanned out as entry-list shards
+    entrylist_batch: 4000         # names per entry-list shard = the granularity of that fan-out
     statx_batch: 256              # statx in flight per walker = io_uring ring depth
                                   #   (rounded up to a power of two, clamped 1–4096;
                                   #   keep ≤ nfs4 max_session_slots)
@@ -302,11 +303,21 @@ extreme.
   count exceeds `tuning.dir_split_threshold` (default 50 000) is enumerated once
   and fanned out to the fleet as **entry-list shards** — the fleet stats and
   copies its entries in parallel instead of one agent grinding through it.
-  Lower the threshold if single directories dominate your runtime:
+
+  `dir_split_threshold` decides only **whether** to fan out. Once tripped,
+  lowering it further changes nothing: the number of shards a directory becomes
+  is `ceil(entries / tuning.entrylist_batch)`. A 1.4 M-entry directory at the
+  default batch is 350 shards. Raise the batch to make each shard cover more
+  entries, so the directory occupies fewer of the fleet's slots at once:
 
   ```bash
-  drsync job submit huge-dirs.yaml --start --set spec.tuning.dir_split_threshold=20000
+  drsync job submit huge-dirs.yaml --start --set spec.tuning.entrylist_batch=20000
   ```
+
+  Fleet-wide, the scheduler already caps how many shards of one directory may
+  be leased at a time, so a single pathological directory cannot fill every
+  agent's prefetch window and stall the rest of the tree. The cap yields when
+  that directory is the only work left, so it never idles the fleet.
 
 - **Very large files.** A file at/above `copy.chunk_threshold` (default 1 GiB)
   and larger than one `copy.chunk_size` (default 1 GiB) is **copied across the

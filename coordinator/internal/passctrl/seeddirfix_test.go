@@ -94,7 +94,7 @@ func TestSeedDirfixFromJournal(t *testing.T) {
 	}
 
 	// Read back the seeded dirfix shard(s).
-	leased, err := c.st.LeaseShards("dirfix-reader", 1_000_000, time.Hour)
+	leased, err := c.st.LeaseShards("dirfix-reader", 1_000_000, time.Hour, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

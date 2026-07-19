@@ -127,6 +127,29 @@ func walkOverrides(pol *jobPolicy, agents int64, c store.SchedulerCounts) *drsyn
 	}
 }
 
+// dirLeaseShare is how many shards of a single parent each agent may hold
+// before the scheduler starts preferring other work.
+const dirLeaseShare = 8
+
+// maxPerParent bounds how much of the fleet one directory may occupy at once.
+//
+// A directory over dir_split_threshold fans out into ceil(entries /
+// entrylist_batch) sibling shards — 350 of them for a 1.4M-entry directory —
+// which are allocated a contiguous run of ids and so are granted as one block.
+// Uncapped, they fill every agent's prefetch window and the rest of the tree
+// stops progressing until that directory drains.
+//
+// Scaled by fleet size so the cap does not throttle a large fleet, and never
+// below one agent's share so a single-agent fleet still makes progress. The
+// cap only shifts *preference*: if a saturated directory is the only work
+// left, LeaseShards grants it anyway rather than idle the fleet.
+func maxPerParent(agents int64) int {
+	if agents < 1 {
+		agents = 1
+	}
+	return int(agents) * dirLeaseShare
+}
+
 // fairShare caps a grant so the first agent to poll cannot take the whole
 // queue. An agent asks for (workers + copy_threads) * 2 credits — 48 on a
 // default host — which is more than the entire queue early in a job, so
@@ -154,7 +177,8 @@ func fairShare(credits int, queued, agents int64) int {
 func (s *Scheduler) Grant(agentID string, req *drsyncpb.WorkRequest) (*drsyncpb.WorkGrant, error) {
 	credits := int(req.GetShardCredits()) + int(req.GetTaskCredits())
 	agents, counts := s.fleet()
-	rows, err := s.st.LeaseShards(agentID, fairShare(credits, counts.Queued, agents), s.LeaseTTL)
+	rows, err := s.st.LeaseShards(agentID, fairShare(credits, counts.Queued, agents),
+		s.LeaseTTL, maxPerParent(agents))
 	if err != nil {
 		return nil, err
 	}

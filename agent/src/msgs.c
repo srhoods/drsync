@@ -453,6 +453,7 @@ static bool dec_tuning_opts(const uint8_t *p, size_t n, struct job_options *o)
         case 2: o->dir_split_threshold = pb_get_varint(&c); break;
         case 3: o->statx_batch = (uint32_t)pb_get_varint(&c); break;
         case 4: o->mtime_slop_ns = (int64_t)pb_get_varint(&c); break;
+        case 6: o->entrylist_batch = (uint32_t)pb_get_varint(&c); break;
         default: pb_skip(&c, wt);
         }
     }

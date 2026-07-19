@@ -254,6 +254,10 @@ message TuningOptions {
   uint32 statx_batch         = 3;
   int64  mtime_slop_ns       = 4;
   uint32 op_deadline_s       = 5;  // watchdog per-syscall deadline
+  // Names per entry-list shard when a directory over dir_split_threshold is
+  // fanned out. Sets the granularity of that fan-out: a 1.4M-entry directory
+  // becomes ceil(1.4M / entrylist_batch) shards.
+  uint32 entrylist_batch     = 6;
 }
 
 message JobOptions {
