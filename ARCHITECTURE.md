@@ -354,7 +354,7 @@ drsync/
 
 ---
 
-## 10. Decisions (ratified 2026-07-10)
+## 10. Decisions (D1–D9 ratified 2026-07-10; D10 2026-07-19)
 
 | # | Decision | Choice | Consequence |
 |---|---|---|---|
@@ -367,6 +367,7 @@ drsync/
 | **D7** | Fleet sizing | **4 agent hosts, 100 GbE each; dedicated coordinator host**; source FS delivers 10 Gbps–100s of Gbps | Defaults tuned for this shape (see DESIGN-agent §2). Fleet data ceiling ≈ 50 GB/s (full-duplex copy ≈ 12.5 GB/s/host); in practice source-limited. Scan target ≥ 100k stat/s/host ⇒ 1B entries dual-walked in ≈ 45 min |
 | **D8** | NFSv4 | **NFSv4 (incl. v4 ACLs) supported from the outset** — destination estate is moving to NFSv4 | ACL engine handles POSIX ACLs and NFSv4 ACLs (`system.nfs4_acl`) with per-job policy for untranslatable pairs; `copy_file_range` server-side copy used opportunistically on v4.2 |
 | **D9** | Job definition | **YAML job specs**, CLI flags as an alternative/override | YAML parsing lives only in the Go control plane; agents receive fully-resolved options as protobuf (no YAML in C) |
+| **D10** | Orphan detection in a split directory | **Stays with the splitting shard** — destination enumeration is *not* fanned out as its own shard kind | A pathological directory's source names stream out as entry-list shards while the destination listing is marked in place, so orphans cost one sorted listing and no extra syscalls. The rejected alternative — a destination-slice shard testing each name for source existence — costs one statx per destination entry per pass, and since the destination is built by drsync, pass 2+ would pay ~N statx to find ~0 orphans. The variant that avoids that (a shard re-reading both sides) only relocates the work: same total, same peak memory, plus a new shard kind across proto/agent/coordinator and orphan detection — which seeds the delete pass — moved onto a new code path |
 
 ## 11. Detailed Design Documents
 
