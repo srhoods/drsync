@@ -303,7 +303,7 @@ func TestChunkTempNamePassTagged(t *testing.T) {
 
 	// The seeded root scan shard stands in for the walk shard that discovers a
 	// big file and ships it for fan-out.
-	rows, err := srv.st.LeaseShards("agent-1", 1, 30*time.Second)
+	rows, err := srv.st.LeaseShards("agent-1", 1, 30*time.Second, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

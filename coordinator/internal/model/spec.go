@@ -103,6 +103,7 @@ type JobSpec struct {
 		Tuning struct {
 			ShardBudget       uint64 `yaml:"shard_budget"`
 			DirSplitThreshold uint64 `yaml:"dir_split_threshold"`
+			EntrylistBatch    uint32 `yaml:"entrylist_batch"`
 			StatxBatch        uint32 `yaml:"statx_batch"`
 			MtimeSlopNS       int64  `yaml:"mtime_slop_ns"`
 			// Fan-out control. Coordinator-side only: these never reach an agent
@@ -209,6 +210,12 @@ func (s *JobSpec) ApplyDefaults() {
 	}
 	if sp.Tuning.DirSplitThreshold == 0 {
 		sp.Tuning.DirSplitThreshold = 50_000
+	}
+	// Names per entry-list shard. This, not dir_split_threshold, sets how many
+	// shards a pathological directory becomes: dir_split_threshold only decides
+	// whether to fan out at all, so lowering it does nothing once tripped.
+	if sp.Tuning.EntrylistBatch == 0 {
+		sp.Tuning.EntrylistBatch = 4_000
 	}
 	if sp.Tuning.StatxBatch == 0 {
 		sp.Tuning.StatxBatch = 256
@@ -384,6 +391,7 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 		Tuning: &drsyncpb.TuningOptions{
 			ShardBudget:       sp.Tuning.ShardBudget,
 			DirSplitThreshold: sp.Tuning.DirSplitThreshold,
+			EntrylistBatch:    sp.Tuning.EntrylistBatch,
 			StatxBatch:        sp.Tuning.StatxBatch,
 			MtimeSlopNs:       sp.Tuning.MtimeSlopNS,
 		},

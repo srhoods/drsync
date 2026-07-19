@@ -340,10 +340,13 @@ static void copy_symlink(struct walk_ctx *ctx, const char *dir_rel, int sfd,
 }
 
 /* ---- split queue ---- */
-/* Names per entry-list shard. Sized to fan a pathological directory out into
- * MANY shards so walkers and agents chew through it in parallel (design §2.3) —
- * a large batch would make one giant shard that only one thread can process. */
-#define ENTRYLIST_BATCH 4000
+/* Default names per entry-list shard. Sized to fan a pathological directory out
+ * into MANY shards so walkers and agents chew through it in parallel (design
+ * §2.3) — a large batch would make one giant shard that only one thread can
+ * process. tuning.entrylist_batch overrides it: this, not dir_split_threshold,
+ * decides how many shards a huge directory becomes, so it is the knob that
+ * matters when one directory is swamping the fleet. */
+#define ENTRYLIST_BATCH_DEFAULT 4000
 
 static void handle_orphan(struct walk_ctx *ctx, const char *rel, int dfd,
                           const char *name);
@@ -442,6 +445,8 @@ static void split_entrylist(struct walk_ctx *ctx, const char *rel,
     char **batch = NULL;
     size_t nb = 0, cap = 0;
     size_t i = 0, j = 0;
+    size_t batch_max = ctx->oe->o.entrylist_batch ? ctx->oe->o.entrylist_batch
+                                                  : ENTRYLIST_BATCH_DEFAULT;
     while ((i < sn || j < dn) && !ctx->fatal) {
         int cmp = i == sn ? 1 : j == dn ? -1 : strcmp(sv[i].name, dv[j].name);
         if (cmp > 0) { /* destination-only: orphan (D5 report-only) */
@@ -462,7 +467,7 @@ static void split_entrylist(struct walk_ctx *ctx, const char *rel,
         if (cmp == 0)
             j++;
         i++;
-        if (nb >= ENTRYLIST_BATCH) {
+        if (nb >= batch_max) {
             flush_entrylist(ctx, rel, batch, nb);
             nb = 0;
         }

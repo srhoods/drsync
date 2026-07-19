@@ -1907,8 +1907,12 @@ type TuningOptions struct {
 	StatxBatch        uint32                 `protobuf:"varint,3,opt,name=statx_batch,json=statxBatch,proto3" json:"statx_batch,omitempty"`
 	MtimeSlopNs       int64                  `protobuf:"varint,4,opt,name=mtime_slop_ns,json=mtimeSlopNs,proto3" json:"mtime_slop_ns,omitempty"`
 	OpDeadlineS       uint32                 `protobuf:"varint,5,opt,name=op_deadline_s,json=opDeadlineS,proto3" json:"op_deadline_s,omitempty"` // watchdog per-syscall deadline
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Names per entry-list shard when a directory over dir_split_threshold is
+	// fanned out. Sets the granularity of that fan-out: a 1.4M-entry directory
+	// becomes ceil(1.4M / entrylist_batch) shards.
+	EntrylistBatch uint32 `protobuf:"varint,6,opt,name=entrylist_batch,json=entrylistBatch,proto3" json:"entrylist_batch,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TuningOptions) Reset() {
@@ -1972,6 +1976,13 @@ func (x *TuningOptions) GetMtimeSlopNs() int64 {
 func (x *TuningOptions) GetOpDeadlineS() uint32 {
 	if x != nil {
 		return x.OpDeadlineS
+	}
+	return 0
+}
+
+func (x *TuningOptions) GetEntrylistBatch() uint32 {
+	if x != nil {
+		return x.EntrylistBatch
 	}
 	return 0
 }
@@ -4513,14 +4524,15 @@ const file_drsync_proto_rawDesc = "" +
 	"\rFSYNC_BATCHED\x10\x02\"d\n" +
 	"\fLimitOptions\x12.\n" +
 	"\x13bandwidth_per_agent\x18\x01 \x01(\x04R\x11bandwidthPerAgent\x12$\n" +
-	"\x0eiops_per_agent\x18\x02 \x01(\x04R\fiopsPerAgent\"\xcb\x01\n" +
+	"\x0eiops_per_agent\x18\x02 \x01(\x04R\fiopsPerAgent\"\xf4\x01\n" +
 	"\rTuningOptions\x12!\n" +
 	"\fshard_budget\x18\x01 \x01(\x04R\vshardBudget\x12.\n" +
 	"\x13dir_split_threshold\x18\x02 \x01(\x04R\x11dirSplitThreshold\x12\x1f\n" +
 	"\vstatx_batch\x18\x03 \x01(\rR\n" +
 	"statxBatch\x12\"\n" +
 	"\rmtime_slop_ns\x18\x04 \x01(\x03R\vmtimeSlopNs\x12\"\n" +
-	"\rop_deadline_s\x18\x05 \x01(\rR\vopDeadlineS\"\xda\x03\n" +
+	"\rop_deadline_s\x18\x05 \x01(\rR\vopDeadlineS\x12'\n" +
+	"\x0fentrylist_batch\x18\x06 \x01(\rR\x0eentrylistBatch\"\xda\x03\n" +
 	"\n" +
 	"JobOptions\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x19\n" +

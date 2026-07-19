@@ -39,7 +39,7 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				if _, err := s.LeaseShards("w", 16, -time.Second); err != nil {
+				if _, err := s.LeaseShards("w", 16, -time.Second, 0); err != nil {
 					errCh <- err
 					return
 				}
@@ -121,7 +121,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	assertCountsConsistent(t, s, "after seed (1 QUEUED)")
 
 	// Split the root shard into children (parent -> SPLIT, +2 QUEUED children).
-	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute, 0); err != nil {
 		t.Fatal(err)
 	}
 	assertCountsConsistent(t, s, "after lease (1 LEASED)")
@@ -133,7 +133,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	assertCountsConsistent(t, s, "after split")
 
 	// Lease + complete a child.
-	rows, err := s.LeaseShards("agent-b", 1, time.Minute)
+	rows, err := s.LeaseShards("agent-b", 1, time.Minute, 0)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lease child: %v %v", rows, err)
 	}
@@ -144,7 +144,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 
 	// Drive the other child to PARKED via repeated lease+expiry.
 	for i := 0; i < MaxShardAttempts+1; i++ {
-		s.LeaseShards("agent-c", 1, -time.Second)
+		s.LeaseShards("agent-c", 1, -time.Second, 0)
 		s.ExpireLeases(time.Now())
 	}
 	assertCountsConsistent(t, s, "after park")
@@ -261,7 +261,7 @@ func TestRenewLeasesByIDOnlyHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Lease both shards to agent-a with an already-past TTL (due to expire).
-	rows, err := s.LeaseShards("agent-a", 4, -time.Second)
+	rows, err := s.LeaseShards("agent-a", 4, -time.Second, 0)
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("want 2 leased, got %v err=%v", rows, err)
 	}
@@ -291,7 +291,7 @@ func TestLeaseLifecycle(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)
 
-	rows, err := s.LeaseShards("agent-a", 4, time.Minute)
+	rows, err := s.LeaseShards("agent-a", 4, time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +301,7 @@ func TestLeaseLifecycle(t *testing.T) {
 	lease := rows[0].LeaseID
 
 	// Second grant: nothing queued.
-	rows2, _ := s.LeaseShards("agent-b", 4, time.Minute)
+	rows2, _ := s.LeaseShards("agent-b", 4, time.Minute, 0)
 	if len(rows2) != 0 {
 		t.Fatalf("double-granted shard: %+v", rows2)
 	}
@@ -324,13 +324,13 @@ func TestLeaseExpiryRequeuesThenParks(t *testing.T) {
 	seed(t, s)
 
 	for i := 0; i < MaxShardAttempts; i++ {
-		rows, err := s.LeaseShards("agent-a", 1, -time.Second) // already expired
+		rows, err := s.LeaseShards("agent-a", 1, -time.Second, 0) // already expired
 		if err != nil {
 			t.Fatal(err)
 		}
 		if i < MaxShardAttempts && len(rows) != 1 {
 			// anti-affinity skips agent-a on retries; lease from another agent
-			rows, err = s.LeaseShards("agent-b", 1, -time.Second)
+			rows, err = s.LeaseShards("agent-b", 1, -time.Second, 0)
 			if err != nil || len(rows) != 1 {
 				t.Fatalf("attempt %d: rows=%v err=%v", i, rows, err)
 			}
@@ -351,7 +351,7 @@ func TestLeaseExpiryRequeuesThenParks(t *testing.T) {
 func TestSplitIdempotency(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)
-	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -382,7 +382,7 @@ func TestPausedJobNotGranted(t *testing.T) {
 	if err := s.SetJobState(jobID, model.JobPaused); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.LeaseShards("agent-a", 4, time.Minute)
+	rows, err := s.LeaseShards("agent-a", 4, time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +401,7 @@ func TestDisabledAgentNotGranted(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Disabled agent: no grant, even with queued work.
-	rows, err := s.LeaseShards("agent-a", 4, time.Minute)
+	rows, err := s.LeaseShards("agent-a", 4, time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestDisabledAgentNotGranted(t *testing.T) {
 		t.Fatalf("disabled agent granted work: %+v", rows)
 	}
 	// Another, enabled agent still gets the shard.
-	rows, err = s.LeaseShards("agent-b", 4, time.Minute)
+	rows, err = s.LeaseShards("agent-b", 4, time.Minute, 0)
 	if err != nil || len(rows) != 1 || rows[0].ID != shardID {
 		t.Fatalf("enabled agent grant = %+v, err=%v", rows, err)
 	}
@@ -436,7 +436,7 @@ func TestSoleAgentRequeuedShardNotStranded(t *testing.T) {
 
 	granted := 0
 	for i := 0; i < MaxShardAttempts+2; i++ {
-		rows, err := s.LeaseShards("agent-a", 1, -time.Second) // sole agent, expired ttl
+		rows, err := s.LeaseShards("agent-a", 1, -time.Second, 0) // sole agent, expired ttl
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -469,7 +469,7 @@ func TestSoftAffinityPrefersFreshWork(t *testing.T) {
 	shard2 := ids[0]
 
 	// Poison shard1 for agent-a: lease then expire it.
-	if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
+	if _, err := s.LeaseShards("agent-a", 1, -time.Second, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := s.ExpireLeases(time.Now()); err != nil {
@@ -477,7 +477,7 @@ func TestSoftAffinityPrefersFreshWork(t *testing.T) {
 	}
 
 	// agent-a, one credit: must get the fresh shard2, not its poisoned shard1.
-	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +504,7 @@ func TestRetryAndDropParkedShard(t *testing.T) {
 	if counts[model.ShardParked] != 0 || counts[model.ShardQueued] != 1 {
 		t.Fatalf("after retry counts=%+v, want 1 queued 0 parked", counts)
 	}
-	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute, 0)
 	if err != nil || len(rows) != 1 || rows[0].Attempt != 1 {
 		t.Fatalf("retried shard not grantable fresh: rows=%+v err=%v", rows, err)
 	}
@@ -564,7 +564,7 @@ func mustPass(t *testing.T, s *Store, shardID int64) int64 {
 func parkShard(t *testing.T, s *Store) {
 	t.Helper()
 	for i := 0; i < MaxShardAttempts+1; i++ {
-		if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
+		if _, err := s.LeaseShards("agent-a", 1, -time.Second, 0); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := s.ExpireLeases(time.Now()); err != nil {
@@ -582,7 +582,7 @@ func parkShard(t *testing.T, s *Store) {
 func (s *Store) ExpireLeasesForce(t *testing.T) error {
 	t.Helper()
 	for i := 0; i < MaxShardAttempts+2; i++ {
-		if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
+		if _, err := s.LeaseShards("agent-a", 1, -time.Second, 0); err != nil {
 			return err
 		}
 		// A far-future "now" expires any outstanding lease, including one still
@@ -627,7 +627,7 @@ func TestSchedulerCounts(t *testing.T) {
 	}
 
 	// Leasing the root must not make the fleet look starved.
-	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute, 0); err != nil {
 		t.Fatal(err)
 	}
 	if c, err = s.SchedulerCounts(); err != nil {
@@ -747,7 +747,7 @@ func TestTargetedShardOnlyLeasedByTarget(t *testing.T) {
 	}
 
 	// agent-b may not take agent-a's probe: it gets only its own.
-	rows, err := s.LeaseShards("agent-b", 8, time.Minute)
+	rows, err := s.LeaseShards("agent-b", 8, time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -755,7 +755,7 @@ func TestTargetedShardOnlyLeasedByTarget(t *testing.T) {
 		t.Fatalf("agent-b lease = %+v, want its single probe", rows)
 	}
 	// agent-a takes the remaining probe (its own).
-	rows, err = s.LeaseShards("agent-a", 8, time.Minute)
+	rows, err = s.LeaseShards("agent-a", 8, time.Minute, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,7 +806,7 @@ func TestPruneStaleProbes(t *testing.T) {
 		t.Fatalf("queued after prune = %d, want 1", counts[model.ShardQueued])
 	}
 	// The live agent's probe survived and is still leasable by it.
-	rows, err := s.LeaseShards("live", 8, time.Minute)
+	rows, err := s.LeaseShards("live", 8, time.Minute, 0)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("live probe lease = %+v, err=%v", rows, err)
 	}
