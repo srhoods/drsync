@@ -531,7 +531,8 @@ func (c *Controller) notifyPassComplete(job *store.Job, pass *store.Pass, isDele
 		dur = time.Now().UnixMilli() - pass.Started.Int64
 	}
 	c.notifier.PassComplete(n.Recipients, notify.PassReport{
-		Job: job.Name, PassNo: pass.PassNo, IsDelete: isDelete, DryRun: job.DryRun,
+		Job: job.Name, Src: spec.Spec.Source.Path, Dst: spec.Spec.Destination.Path,
+		PassNo: pass.PassNo, IsDelete: isDelete, DryRun: job.DryRun,
 		DurationMS: dur, FilesCopied: pass.FilesCopied, BytesCopied: pass.BytesCopied,
 		MetaFixed: pass.MetaFixed, Orphans: pass.Orphans, VerifyOK: pass.VerifyOK,
 		VerifyFail: pass.VerifyFail, Errors: pass.Errors,
@@ -558,6 +559,7 @@ func (c *Controller) notifyJobComplete(job *store.Job) {
 		slog.Warn("notify: build job report failed", "job", job.Name, "err", err)
 		return
 	}
+	rep.Src, rep.Dst = spec.Spec.Source.Path, spec.Spec.Destination.Path
 	c.notifier.JobComplete(n.Recipients, rep)
 }
 

@@ -194,3 +194,53 @@ func TestFormatting(t *testing.T) {
 		t.Errorf("humanDuration(45s) = %q", got)
 	}
 }
+
+// Both email types carry the source and destination roots. Recipients often
+// watch several migrations at once, where a job name alone does not say which
+// trees moved — and for a delete pass, which tree is about to lose files.
+func TestRenderCarriesPaths(t *testing.T) {
+	const src, dst = "/mnt/gpfs/home", "/mnt/weka/home"
+
+	_, passHTML, passText := renderPass(PassReport{
+		Job: "home", Src: src, Dst: dst, PassNo: 2, FilesCopied: 5,
+	})
+	_, jobHTML, jobText := renderJob(JobReport{
+		Job: "home", Src: src, Dst: dst, State: "COMPLETED", Converged: true,
+	})
+
+	for _, c := range []struct{ name, body string }{
+		{"pass html", passHTML}, {"pass text", passText},
+		{"job html", jobHTML}, {"job text", jobText},
+	} {
+		if !strings.Contains(c.body, src) {
+			t.Errorf("%s is missing the source path", c.name)
+		}
+		if !strings.Contains(c.body, dst) {
+			t.Errorf("%s is missing the destination path", c.name)
+		}
+	}
+}
+
+// Paths are operator-supplied and land in an HTML body, so they are escaped
+// like every other interpolated value.
+func TestRenderEscapesPaths(t *testing.T) {
+	_, body, _ := renderPass(PassReport{Job: "j", Src: `/mnt/<img src=x>`, Dst: "/d"})
+	if strings.Contains(body, "<img src=x") {
+		t.Error("source path reached the HTML body unescaped")
+	}
+	if !strings.Contains(body, "&lt;img src=x") {
+		t.Error("source path missing from the body in escaped form")
+	}
+}
+
+// A job whose spec somehow carries no paths must render without empty labels
+// dangling in the output.
+func TestRenderOmitsBlankPaths(t *testing.T) {
+	_, body, text := renderPass(PassReport{Job: "j", PassNo: 1})
+	if strings.Contains(text, "source:") || strings.Contains(text, "destination:") {
+		t.Error("text body prints empty path labels")
+	}
+	if strings.Contains(body, ">source ") || strings.Contains(body, ">destination ") {
+		t.Error("html body prints empty path labels")
+	}
+}
