@@ -6,6 +6,24 @@
 # recreate their range in the shared temp, and a re-run finalize whose temp was
 # already renamed by a lost-result predecessor still reports the file done
 # rather than parking (which would stall the pass).
+#
+# Known-flaky watch (2026-07-19): 18 kept work dirs from this script and
+# chunk_abort_reclaim_e2e accumulated in /tmp over the preceding week, so both
+# had been failing repeatedly somewhere. NOT REPRODUCED: 37 runs across current
+# master and a08cde1, idle, at load average 5 on 4 cores, and 6-way concurrent,
+# all passed. The logs that would have said why were in those work dirs and are
+# gone, so the cause is unknown rather than fixed.
+#
+# The timing this script depends on, as the standing suspects:
+#   - -lease-ttl 3s is deliberately short so the killed agent's chunk leases
+#     expire quickly. It also means a live agent starved past 3s loses leases
+#     spuriously; enough of those and a chunk reaches MaxShardAttempts and
+#     parks, which the "no parks" assertion below rightly fails on.
+#   - the fixed `sleep 1` before the kill assumes chunks are in flight by then.
+#     Too early and nothing is recovered (the test passes vacuously); too late
+#     and the copy may already be done.
+# Both scripts now run as their own CI leg on every push, where a failure keeps
+# its logs — that is the detector. Do not "fix" the timing without evidence.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

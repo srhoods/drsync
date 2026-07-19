@@ -13,6 +13,17 @@
 # passes.max: 1 is the point of the test: with a second pass the temp would be
 # reclaimed by the next walk as a foreign-pass tag, and the sweep would not be
 # what is under test.
+#
+# Known-flaky watch (2026-07-19): see the same note in chunk_resilience_e2e.sh.
+# Both scripts left kept work dirs in /tmp repeatedly during the preceding week
+# and neither reproduced in 37 runs; the diagnostic logs are gone, so the cause
+# is unknown rather than fixed.
+#
+# This script's standing suspect is the window it has to hit: it polls every
+# 20ms for n_done >= 1 and then appends to the source, so the drift has to land
+# between the first chunk completing and the last. If the copy outruns the
+# poller the group finalizes and the `state = aborted` assertion fails. CI runs
+# this as its own leg and keeps logs on failure — that is the detector.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
