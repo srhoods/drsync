@@ -28,3 +28,4 @@ id_rsa*
 
 # Local working notes — intentionally untracked
 docs/PROJECT-SUMMARY.md
+tools/fsprobe/fsprobe
