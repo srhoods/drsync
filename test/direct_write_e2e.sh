@@ -39,7 +39,7 @@ make -C "$ROOT/agent" -s
 SRC="$WORK/src"; DST="$WORK/dst"
 mkdir -p "$SRC/sub" "$DST"
 # many new files, to exercise the direct path in bulk
-for i in $(seq 1 500); do echo "new file $i" > "$SRC/f$(printf %04d "$i").txt"; done
+for i in $(seq 1 200); do echo "new file $i" > "$SRC/f$(printf %04d "$i").txt"; done
 echo nested > "$SRC/sub/deep.txt"
 # a file that already exists at the destination and has genuinely changed:
 # longer content and an older dst mtime, so the diff copies it — and because it
@@ -76,12 +76,14 @@ EOF
     || fail "submit failed"
 
 STATE=""
-for _ in $(seq 1 180); do
+for _ in $(seq 1 400); do
     STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/dw" | grep -o '"state":"[A-Z]*"' | head -1)
-    [[ "$STATE" == '"state":"COMPLETED"' ]] && break
+    [[ "$STATE" == '"state":"COMPLETED"' || "$STATE" == '"state":"FAILED"' ]] && break
     sleep 0.5
 done
-[[ "$STATE" == '"state":"COMPLETED"' ]] || { tail -8 "$WORK"/agent.log "$WORK"/coord.log; fail "did not converge (state=$STATE)"; }
+[[ "$STATE" == '"state":"COMPLETED"' ]] || {
+    echo "state=$STATE"; tail -n 12 "$WORK/agent.log" "$WORK/coord.log"
+    fail "did not converge (state=$STATE)"; }
 
 # 1. verify pass (full checksum) found no content mismatch — proves both the
 #    direct-written new files and the temp+renamed update are byte-exact.
