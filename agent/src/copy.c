@@ -473,6 +473,39 @@ static void hash_sink(void *arg, const void *data, size_t n)
     XXH3_128bits_update((XXH3_state_t *)arg, data, n);
 }
 
+/* Plain read/write copy — the always-correct fallback, and the recovery path
+ * when a faster engine produces a wrong-sized destination. in and out must be
+ * positioned at the start; appends to *copied and (if xst) the hash. Returns 0,
+ * or -1 with the error already logged. */
+static int serial_copy(struct walk_ctx *ctx, int in, int out, const char *name,
+                       uint8_t *buf, uint64_t *copied, XXH3_state_t *xst)
+{
+    for (;;) {
+        ssize_t r = read(in, buf, COPY_BUF_SIZE);
+        if (r == 0)
+            return 0;
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            walk_err(ctx, "read", name);
+            return -1;
+        }
+        for (ssize_t off = 0; off < r;) {
+            ssize_t w = write(out, buf + off, (size_t)(r - off));
+            if (w < 0) {
+                if (errno == EINTR)
+                    continue;
+                walk_err(ctx, "write", name);
+                return -1;
+            }
+            off += w;
+        }
+        if (xst)
+            XXH3_128bits_update(xst, buf, (size_t)r);
+        *copied += (uint64_t)r;
+    }
+}
+
 void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
                     const char *rel, const struct estat *ss)
 {
@@ -514,6 +547,13 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
     uint64_t copied = 0;
     bool data_done = false;
     bool hashed = false;
+    /* Whether the engine that ran writes an exact-length destination by
+     * construction: the sparse path ftruncates to ss->size, and the serial path
+     * uses plain write() (which honours its length on every filesystem). The
+     * clever engines — copy_file_range, io_uring, parallel chunk — do not, so
+     * their output is size-checked below. Once that check fires and disables
+     * io_uring, later files fall to the trusted serial path and skip the check. */
+    bool size_trusted = false;
     static __thread XXH3_state_t *xst;
     if (!xst)
         xst = XXH3_createState();
@@ -523,8 +563,10 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
         int rc = copy_sparse(ctx, in, out, ss, name, buf, &copied, NULL);
         if (rc == -2)
             goto drop;
-        if (rc == 0)
+        if (rc == 0) {
             data_done = true;
+            size_trusted = true; /* ftruncate set the exact size */
+        }
         /* rc == -1: no SEEK_DATA on this mount — dense engines below */
     }
 
@@ -576,29 +618,45 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
             hashed = copied > 0;
         } else if (!cfr) {
             /* Serial fallback when io_uring is unavailable. */
-            for (;;) {
-                ssize_t r = read(in, buf, COPY_BUF_SIZE);
-                if (r == 0)
-                    break;
-                if (r < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    walk_err(ctx, "read", name);
-                    goto drop;
-                }
-                for (ssize_t off = 0; off < r;) {
-                    ssize_t w = write(out, buf + off, (size_t)(r - off));
-                    if (w < 0) {
-                        if (errno == EINTR)
-                            continue;
-                        walk_err(ctx, "write", name);
-                        goto drop;
-                    }
-                    off += w;
-                }
-                XXH3_128bits_update(xst, buf, (size_t)r);
-                hashed = true;
-                copied += (uint64_t)r;
+            if (serial_copy(ctx, in, out, name, buf, &copied, xst) < 0)
+                goto drop;
+            hashed = copied > 0;
+            size_trusted = true; /* plain write() honours its length */
+        }
+    }
+
+    /* Trust the destination size, not the engine's own byte count: an engine
+     * that wrote the wrong length must never be finalized. The io_uring
+     * self-test probes only READ_FIXED, so a filesystem whose WRITE_FIXED
+     * ignores the submitted length — GPFS flushes the whole 1 MiB registered
+     * buffer, padding a sub-buffer file with stale data — is caught only here.
+     * On a mismatch, disable the fast engine for this thread and redo the file
+     * with the serial copy, which is always correct. (Sparse and serial set
+     * size_trusted, so they never reach this.) */
+    if (!o->dry_run && !size_trusted) {
+        struct stat dchk;
+        if (fstat(out, &dchk) < 0) {
+            walk_err(ctx, "stat dest", name);
+            goto drop;
+        }
+        if ((uint64_t)dchk.st_size != ss->size) {
+            ucopy_disable();
+            LOGW("shard %llu: copy engine wrote %lld bytes for %s (expected %llu); "
+                 "io_uring disabled, redoing serially",
+                 (unsigned long long)ctx->it->shard_id, (long long)dchk.st_size,
+                 name, (unsigned long long)ss->size);
+            if (ftruncate(out, 0) < 0 || lseek(in, 0, SEEK_SET) < 0) {
+                walk_err(ctx, "reset for serial recopy", name);
+                goto drop;
+            }
+            XXH3_128bits_reset(xst);
+            copied = 0;
+            if (serial_copy(ctx, in, out, name, buf, &copied, xst) < 0)
+                goto drop;
+            hashed = copied > 0;
+            if (fstat(out, &dchk) < 0 || (uint64_t)dchk.st_size != ss->size) {
+                walk_err(ctx, "dest size still wrong after serial recopy", name);
+                goto drop;
             }
         }
     }
