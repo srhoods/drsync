@@ -6,7 +6,7 @@ SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test ucopy-test tempname-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -36,6 +36,14 @@ fidelity-test: bin/fidelity_test
 bin/fidelity_test: test/fidelity_test.c src/xattr.o src/jrn.o src/msgs.o src/pb.o
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ test/fidelity_test.c src/xattr.o src/jrn.o src/msgs.o src/pb.o -pthread -lzstd
+
+# File-copy xattr path: fresh-destination copy + reconcile of a pre-existing one.
+xattr-copy-test: bin/xattr_copy_test
+	./bin/xattr_copy_test
+
+bin/xattr_copy_test: test/xattr_copy_test.c src/xattr.o src/jrn.o src/msgs.o src/pb.o
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/xattr_copy_test.c src/xattr.o src/jrn.o src/msgs.o src/pb.o -pthread -lzstd
 
 # ucopy engine: byte-exact copies + in-order sink across edge sizes (memfds).
 ucopy-test: bin/ucopy_test
@@ -55,4 +63,4 @@ bin/tempname_test: src/tempname.c test/tempname_test.c
 	$(CC) $(CFLAGS) -o $@ src/tempname.c test/tempname_test.c
 
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/ucopy_test bin/tempname_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test

@@ -7,7 +7,7 @@ export PATH := $(GOBIN):$(PATH)
 # it is also the name of a directory. Without .PHONY, make sees that directory,
 # considers the target up to date, and silently skips the build — so on a fresh
 # clone `make build` produced no agent binary and e2e failed at agent launch.
-.PHONY: all proto build agent test test-all webui-test e2e vet clean tools
+.PHONY: all proto build agent fsprobe test test-all webui-test e2e vet clean tools
 
 all: proto build test
 
@@ -27,6 +27,13 @@ build: agent
 agent:
 	$(MAKE) -C agent
 	@mkdir -p bin && cp agent/bin/drsync-agent bin/
+
+# Standalone filesystem profiler for diagnosing slow destinations (GPFS/Weka).
+# Not part of `build`: it ships to filer hosts on its own, and depends on
+# nothing else in the tree. See tools/fsprobe/README.md.
+fsprobe:
+	$(MAKE) -C tools/fsprobe
+	@mkdir -p bin && cp tools/fsprobe/fsprobe bin/
 
 test:
 	go test ./...

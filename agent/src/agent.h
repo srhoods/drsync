@@ -253,6 +253,9 @@ void walk_fidelity(struct walk_ctx *ctx, const char *what, const char *path);
  * (or errors under policy=fail), never silent drops. */
 /* fd-based: regular files (during copy) and directories */
 void xattr_copy_fd(struct walk_ctx *ctx, int src_fd, int dst_fd, const char *logname);
+/* For a destination just created by us (a copy temp): skips the destination
+ * probe and stale-removal, which a fresh file cannot need. */
+void xattr_copy_fd_fresh(struct walk_ctx *ctx, int src_fd, int dst_fd, const char *logname);
 /* path-based via /proc/self/fd (no target open); nofollow for symlinks */
 void xattr_copy_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *name,
                    bool nofollow);
