@@ -56,7 +56,7 @@ chmod 0640 "$SRC/f0001.txt"
     >"$WORK/coord.log" 2>&1 &
 COORD_PID=$!
 wait_coordinator "$API" "$AUTH" || exit 1
-"$ROOT/bin/drsync-agent" -c 127.0.0.1:$COORD_PORT -i dw-agent -w 4 -C 8 \
+"$ROOT/agent/bin/drsync-agent" -c 127.0.0.1:$COORD_PORT -i dw-agent -w 4 -C 8 \
     >"$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 sleep 1
