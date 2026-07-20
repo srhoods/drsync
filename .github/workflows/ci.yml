@@ -115,6 +115,7 @@ jobs:
           - chunk_resilience_e2e   # agent dies mid-copy; leases expire and re-grant
           - deep_e2e               # directory chain deeper than the walker's in-agent limit
           - dirfix_e2e             # DIRFIX over a directory that fans out to entry-lists
+          - direct_write_e2e       # copy.direct_write: new files no-temp, updates atomic
           - fanout_e2e             # a small volume must still use the whole fleet
           - filter_e2e             # include/exclude filters
           - probe_e2e              # per-agent mount probe gates pass start

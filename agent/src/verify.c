@@ -120,7 +120,9 @@ static void recopy(struct walk_ctx *ctx, const char *rel, const struct stat *ss)
     }
     struct estat es;
     estat_of(&es, ss);
-    copy_file_task(ctx, spfd, dpfd, leaf, rel, &es);
+    /* Recopy replaces a file that failed verification and therefore exists:
+     * never direct — the atomic temp+rename must not expose a torn replacement. */
+    copy_file_task(ctx, spfd, dpfd, leaf, rel, &es, false);
     close(spfd);
     close(dpfd);
 }

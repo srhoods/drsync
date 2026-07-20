@@ -78,6 +78,7 @@ struct copy_task {
     struct estat      ss;
     char              name[NAME_MAX + 1];
     char             *rel; /* job-root-relative path (journal identity) */
+    bool              direct; /* write straight to the final name, no temp+rename */
     struct copy_task *next;
 };
 
@@ -99,7 +100,8 @@ int cp_depth(void)
 }
 
 void cp_submit(struct walk_ctx *ctx, struct dpend *dp, int sfd, int dfd,
-               const char *dir_rel, const char *name, const struct estat *ss)
+               const char *dir_rel, const char *name, const struct estat *ss,
+               bool direct)
 {
     struct copy_task *t = calloc(1, sizeof *t);
     if (!t) {
@@ -111,6 +113,7 @@ void cp_submit(struct walk_ctx *ctx, struct dpend *dp, int sfd, int dfd,
     t->sfd = sfd;
     t->dfd = dfd;
     t->ss = *ss;
+    t->direct = direct;
     snprintf(t->name, sizeof t->name, "%s", name);
     if (asprintf(&t->rel, "%s%s%s", dir_rel, dir_rel[0] ? "/" : "", name) < 0) {
         walk_err(ctx, "oom copy task", name);
@@ -201,7 +204,7 @@ static int cq_pop_timed(struct copy_task **out, int timeout_ms)
 
 static void run_copy_task(struct copy_task *t)
 {
-    copy_file_task(t->ctx, t->sfd, t->dfd, t->name, t->rel, &t->ss);
+    copy_file_task(t->ctx, t->sfd, t->dfd, t->name, t->rel, &t->ss, t->direct);
     dpend_done(t->dp);
     free(t->rel);
     free(t);
@@ -474,7 +477,7 @@ static void hash_sink(void *arg, const void *data, size_t n)
 }
 
 void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
-                    const char *rel, const struct estat *ss)
+                    const char *rel, const struct estat *ss, bool direct)
 {
     const struct job_options *o = &ctx->oe->o;
 
@@ -492,16 +495,43 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
         walk_err(ctx, "open src", name);
         return;
     }
-    /* The (job, pass) tag in the name keeps a concurrent walk's orphan sweep
-     * from reclaiming this temp as crash residue while we are writing it. */
+    /* target is what we open and write. Normally a temp: the (job, pass) tag in
+     * its name keeps a concurrent walk's orphan sweep from reclaiming it as
+     * crash residue while we write, and the rename into place is atomic.
+     *
+     * With direct_write and a destination that does not yet exist (the caller's
+     * guarantee), we write straight to the final name and skip the rename — the
+     * rename is ~half the per-file metadata cost on a filesystem that
+     * serializes directory ops (GPFS/Weka). The trade is atomicity: a crash
+     * mid-write leaves a partial file at its real name. That is safe here only
+     * because the file is new (no good data to lose) and the next pass re-copies
+     * it — the diff sees the size/mtime mismatch. An unexpected collision at the
+     * final name (a torn file from a previous crashed direct write) falls back
+     * to the atomic temp+rename, which repairs it. */
     char tmp[NAME_MAX + 1];
-    unsigned seq = __atomic_fetch_add(&ctx->tmp_seq, 1, __ATOMIC_RELAXED);
-    temp_name_fmt(tmp, sizeof tmp,
-                  o->temp_prefix[0] ? o->temp_prefix : ".drsync.tmp.",
-                  ctx->it->job_id, ctx->it->pass_no, ctx->it->shard_id, seq);
-    int out = openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    const char *target;
+    if (direct) {
+        target = name;
+    } else {
+        unsigned seq = __atomic_fetch_add(&ctx->tmp_seq, 1, __ATOMIC_RELAXED);
+        temp_name_fmt(tmp, sizeof tmp,
+                      o->temp_prefix[0] ? o->temp_prefix : ".drsync.tmp.",
+                      ctx->it->job_id, ctx->it->pass_no, ctx->it->shard_id, seq);
+        target = tmp;
+    }
+    int out = openat(dfd, target, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out < 0 && direct && errno == EEXIST) {
+        /* Something is already at the final name — repair it atomically. */
+        direct = false;
+        unsigned seq = __atomic_fetch_add(&ctx->tmp_seq, 1, __ATOMIC_RELAXED);
+        temp_name_fmt(tmp, sizeof tmp,
+                      o->temp_prefix[0] ? o->temp_prefix : ".drsync.tmp.",
+                      ctx->it->job_id, ctx->it->pass_no, ctx->it->shard_id, seq);
+        target = tmp;
+        out = openat(dfd, target, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    }
     if (out < 0) {
-        walk_err(ctx, "create temp", name);
+        walk_err(ctx, direct ? "create dest" : "create temp", name);
         close(in);
         return;
     }
@@ -616,10 +646,10 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
         goto drop;
     }
     /* xattrs + ACLs before closing the src fd (design §5 order: xattrs →
-     * ACLs → chown → chmod → times). The temp was opened O_CREAT|O_EXCL, so it
-     * holds no xattrs — the fresh variant skips the destination probe, which on
-     * a clustered filesystem is a per-file metadata round trip that buys
-     * nothing here. */
+     * ACLs → chown → chmod → times). The destination (temp or direct final) was
+     * opened O_CREAT|O_EXCL, so it holds no xattrs — the fresh variant skips the
+     * destination probe, a per-file metadata round trip that buys nothing on a
+     * clustered filesystem. */
     xattr_copy_fd_fresh(ctx, in, out, name);
     close(in);
     in = -1;
@@ -629,7 +659,8 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
         goto drop;
     }
     apply_meta(ctx, out, ss, name);
-    if (renameat(dfd, tmp, dfd, name) < 0) {
+    /* Temp path renames into place; direct path is already at the final name. */
+    if (!direct && renameat(dfd, target, dfd, name) < 0) {
         walk_err(ctx, "rename", name);
         goto drop;
     }
@@ -649,5 +680,8 @@ drop:
     if (in >= 0)
         close(in);
     close(out);
-    unlinkat(dfd, tmp, 0);
+    /* Remove what we were writing: the temp, or — on the direct path — the
+     * partial file at its final name, so the destination is cleanly absent and
+     * the next pass re-copies from scratch. */
+    unlinkat(dfd, target, 0);
 }

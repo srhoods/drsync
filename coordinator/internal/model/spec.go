@@ -73,6 +73,7 @@ type JobSpec struct {
 			ServerSideCopy string   `yaml:"server_side_copy"`
 			TempNaming     string   `yaml:"temp_naming"`
 			Fsync          string   `yaml:"fsync"`
+			DirectWrite    bool     `yaml:"direct_write"`
 		} `yaml:"copy"`
 		Metadata struct {
 			Owner  *bool `yaml:"owner"`
@@ -369,6 +370,7 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 			BufferSize:     uint64(sp.Copy.BufferSize),
 			PreserveSparse: *sp.Copy.PreserveSparse,
 			TempPrefix:     sp.Copy.TempNaming,
+			DirectWrite:    sp.Copy.DirectWrite,
 		},
 		Metadata: &drsyncpb.MetadataOptions{
 			Owner:  *sp.Metadata.Owner,

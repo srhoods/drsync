@@ -128,6 +128,7 @@ struct job_options {
     uint32_t server_side_copy; /* SSC_* (0 = unset ⇒ auto) */
     char     temp_prefix[64];
     bool     fsync_per_file;
+    bool     direct_write; /* copy a new file straight to its final name */
     /* metadata */
     bool meta_owner, meta_mode, meta_times, meta_xattrs, meta_specials;
     bool acl_posix, acl_nfs4;

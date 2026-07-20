@@ -128,6 +128,7 @@ spec:
     server_side_copy: auto        # auto | off | require  (copy_file_range / NFSv4.2 SSC / reflink)
     temp_naming: ".drsync.tmp."   # prefix only; job/pass/shard suffix is appended
     fsync: per_file               # per_file | batched  (batched is ~5× faster, weaker crash durability)
+    direct_write: false           # new files skip the temp+rename (~2× on GPFS/Weka); updates stay atomic
 
   metadata:
     owner: true
