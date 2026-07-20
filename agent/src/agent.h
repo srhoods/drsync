@@ -165,6 +165,8 @@ typedef void (*ucopy_sink)(void *arg, const void *data, size_t n);
 /* True once the calling copy thread has a working copy ring (lazy per-thread);
  * false when io_uring is unavailable — the caller then uses a serial loop. */
 bool ucopy_available(void);
+/* Disable the io_uring copy engine for this thread after a bad copy result. */
+void ucopy_disable(void);
 /* Sequentially copy [0,size) from in to out via overlapped READ_FIXED/
  * WRITE_FIXED, feeding each block to sink in order. Returns bytes copied (==
  * size, or less if the source shrank mid-copy — the caller's gen check handles
