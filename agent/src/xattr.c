@@ -189,8 +189,15 @@ static int xset_read(const struct xtarget *t, struct xset *out)
 }
 
 /* ---- copy: src set → dst (set src attrs, remove dst-only attrs) ---- */
+/* dst_fresh: the destination was just created by us (a copy temp opened
+ * O_CREAT|O_EXCL) and provably holds no xattrs. Skipping the destination probe
+ * and the stale-removal pass then costs nothing in correctness but removes a
+ * per-file listxattr (and, for the common no-xattr file, leaves just a single
+ * source probe). On a clustered filesystem — GPFS, Weka — those probes are
+ * synchronous metadata round trips that dominate a small-file copy, so this is
+ * the difference measured as ~3x on GPFS. */
 static void xcopy(struct walk_ctx *ctx, const struct xtarget *src,
-                  const struct xtarget *dst, const char *logname)
+                  const struct xtarget *dst, const char *logname, bool dst_fresh)
 {
     const struct job_options *o = &ctx->oe->o;
     if (!o->meta_xattrs)
@@ -201,7 +208,7 @@ static void xcopy(struct walk_ctx *ctx, const struct xtarget *src,
         walk_err(ctx, "read xattrs", logname);
         return;
     }
-    bool have_ds = xset_read(dst, &ds) == 0;
+    bool have_ds = !dst_fresh && xset_read(dst, &ds) == 0;
 
     for (size_t i = 0; i < ss.n; i++) {
         bool acl_enabled = true;
@@ -249,7 +256,15 @@ static void proc_path(char *buf, size_t cap, int dirfd, const char *name)
 void xattr_copy_fd(struct walk_ctx *ctx, int src_fd, int dst_fd, const char *logname)
 {
     struct xtarget s = { .fd = src_fd }, d = { .fd = dst_fd };
-    xcopy(ctx, &s, &d, logname);
+    xcopy(ctx, &s, &d, logname, false);
+}
+
+/* Like xattr_copy_fd, but for a destination we just created (a copy temp): it
+ * has no xattrs, so the destination probe and stale-removal are skipped. */
+void xattr_copy_fd_fresh(struct walk_ctx *ctx, int src_fd, int dst_fd, const char *logname)
+{
+    struct xtarget s = { .fd = src_fd }, d = { .fd = dst_fd };
+    xcopy(ctx, &s, &d, logname, true);
 }
 
 void xattr_copy_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *name,
@@ -260,7 +275,7 @@ void xattr_copy_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *nam
     proc_path(dp, sizeof dp, ddirfd, name);
     struct xtarget s = { .fd = -1, .path = sp, .nofollow = nofollow };
     struct xtarget d = { .fd = -1, .path = dp, .nofollow = nofollow };
-    xcopy(ctx, &s, &d, name);
+    xcopy(ctx, &s, &d, name, false);
 }
 
 /* Drift check for otherwise-clean regular files (diff predicate step 6):

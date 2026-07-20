@@ -616,8 +616,11 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
         goto drop;
     }
     /* xattrs + ACLs before closing the src fd (design §5 order: xattrs →
-     * ACLs → chown → chmod → times) */
-    xattr_copy_fd(ctx, in, out, name);
+     * ACLs → chown → chmod → times). The temp was opened O_CREAT|O_EXCL, so it
+     * holds no xattrs — the fresh variant skips the destination probe, which on
+     * a clustered filesystem is a per-file metadata round trip that buys
+     * nothing here. */
+    xattr_copy_fd_fresh(ctx, in, out, name);
     close(in);
     in = -1;
 
