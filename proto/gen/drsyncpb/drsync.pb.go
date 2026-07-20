@@ -1758,8 +1758,15 @@ type CopyOptions struct {
 	TempPrefix     string                     `protobuf:"bytes,6,opt,name=temp_prefix,json=tempPrefix,proto3" json:"temp_prefix,omitempty"` // ".drsync.tmp."
 	FsyncMode      CopyOptions_FsyncMode      `protobuf:"varint,7,opt,name=fsync_mode,json=fsyncMode,proto3,enum=drsync.v1.CopyOptions_FsyncMode" json:"fsync_mode,omitempty"`
 	FsyncBatch     uint32                     `protobuf:"varint,8,opt,name=fsync_batch,json=fsyncBatch,proto3" json:"fsync_batch,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Copy a NEW file straight to its final name instead of via a temp + rename.
+	// Halves the per-file metadata cost on filesystems that serialize directory
+	// operations (GPFS/Weka), at the cost of atomicity: a crash mid-write leaves
+	// a partial file at its real name, which the next pass re-copies. Only ever
+	// applied when the destination file does not already exist; updates keep the
+	// atomic temp+rename. Default off.
+	DirectWrite   bool `protobuf:"varint,9,opt,name=direct_write,json=directWrite,proto3" json:"direct_write,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CopyOptions) Reset() {
@@ -1846,6 +1853,13 @@ func (x *CopyOptions) GetFsyncBatch() uint32 {
 		return x.FsyncBatch
 	}
 	return 0
+}
+
+func (x *CopyOptions) GetDirectWrite() bool {
+	if x != nil {
+		return x.DirectWrite
+	}
+	return false
 }
 
 type LimitOptions struct {
@@ -4498,7 +4512,7 @@ const file_drsync_proto_rawDesc = "" +
 	"OnMismatch\x12\x1b\n" +
 	"\x17ON_MISMATCH_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12ON_MISMATCH_RECOPY\x10\x01\x12\x14\n" +
-	"\x10ON_MISMATCH_FAIL\x10\x02\"\x91\x04\n" +
+	"\x10ON_MISMATCH_FAIL\x10\x02\"\xb4\x04\n" +
 	"\vCopyOptions\x12'\n" +
 	"\x0fchunk_threshold\x18\x01 \x01(\x04R\x0echunkThreshold\x12\x1d\n" +
 	"\n" +
@@ -4512,7 +4526,8 @@ const file_drsync_proto_rawDesc = "" +
 	"\n" +
 	"fsync_mode\x18\a \x01(\x0e2 .drsync.v1.CopyOptions.FsyncModeR\tfsyncMode\x12\x1f\n" +
 	"\vfsync_batch\x18\b \x01(\rR\n" +
-	"fsyncBatch\"Q\n" +
+	"fsyncBatch\x12!\n" +
+	"\fdirect_write\x18\t \x01(\bR\vdirectWrite\"Q\n" +
 	"\x0eServerSideCopy\x12\x13\n" +
 	"\x0fSSC_UNSPECIFIED\x10\x00\x12\f\n" +
 	"\bSSC_AUTO\x10\x01\x12\v\n" +

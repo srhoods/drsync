@@ -294,11 +294,12 @@ extern atomic_ullong g_steal_copies;
 /* Blocking bounded submit (backpressure). sfd/dfd stay valid until the task
  * completes: the walker's dpend_wait precedes closing them. */
 void cp_submit(struct walk_ctx *ctx, struct dpend *dp, int sfd, int dfd,
-               const char *dir_rel, const char *name, const struct estat *ss);
+               const char *dir_rel, const char *name, const struct estat *ss,
+               bool direct);
 /* Synchronous copy used by the copy threads (and dry-run accounting).
  * rel is the job-root-relative path of the file (journal identity). */
 void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
-                    const char *rel, const struct estat *ss);
+                    const char *rel, const struct estat *ss, bool direct);
 /* Applies owner/mode/times to an open fd (chown before chmod, times last).
  * xattrs/ACLs are the caller's job first (they need the src fd). */
 void apply_meta(struct walk_ctx *ctx, int fd, const struct estat *ss,

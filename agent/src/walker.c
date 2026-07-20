@@ -763,7 +763,10 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
             queue_bigfile(ctx, rel, name, ss);
             break;
         }
-        cp_submit(ctx, dp, sfd, dfd, rel, name, ss); /* async: copy pool */
+        /* Direct-write only a file that does not already exist at the
+         * destination (ds == NULL): overwriting a live file in place would
+         * corrupt it on a crash, so an update keeps the atomic temp+rename. */
+        cp_submit(ctx, dp, sfd, dfd, rel, name, ss, o->direct_write && !ds);
         break;
     }
 

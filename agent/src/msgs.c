@@ -378,6 +378,7 @@ static bool dec_copy_opts(const uint8_t *p, size_t n, struct job_options *o)
         case 5: o->server_side_copy = (uint32_t)pb_get_varint(&c); break;
         case 6: pb_get_strn(&c, o->temp_prefix, sizeof o->temp_prefix); break;
         case 7: o->fsync_per_file = pb_get_varint(&c) == 1; /* FSYNC_PER_FILE */ break;
+        case 9: o->direct_write = pb_get_varint(&c) != 0; break;
         default: pb_skip(&c, wt);
         }
     }

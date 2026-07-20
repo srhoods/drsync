@@ -241,6 +241,13 @@ message CopyOptions {
   }
   FsyncMode fsync_mode  = 7;
   uint32 fsync_batch    = 8;
+  // Copy a NEW file straight to its final name instead of via a temp + rename.
+  // Halves the per-file metadata cost on filesystems that serialize directory
+  // operations (GPFS/Weka), at the cost of atomicity: a crash mid-write leaves
+  // a partial file at its real name, which the next pass re-copies. Only ever
+  // applied when the destination file does not already exist; updates keep the
+  // atomic temp+rename. Default off.
+  bool direct_write     = 9;
 }
 
 message LimitOptions {

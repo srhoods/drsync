@@ -59,6 +59,12 @@ spec:
     temp_naming: ".drsync.tmp."      # PREFIX for in-progress destination names;
                                      # "<job>-<pass>.<shard>.<seq>" is appended
     fsync: per_file                  # per_file | batched(n)
+    direct_write: false              # copy a NEW file straight to its final name,
+                                     # skipping the temp+rename — ~2x on filesystems
+                                     # that serialize directory ops (GPFS/Weka).
+                                     # Trades atomicity: a crash mid-write leaves a
+                                     # partial file, re-copied next pass. Only new
+                                     # files; updates keep the atomic temp+rename.
 
   metadata:
     owner: true                      # uid/gid (needs root)
