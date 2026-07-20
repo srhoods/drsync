@@ -272,6 +272,17 @@ bool ucopy_available(void)
     return tls_state == 1;
 }
 
+/* Permanently stop this thread from using the io_uring copy engine. Called when
+ * a copy is found to have produced a wrong-sized destination — the READ_FIXED
+ * self-test cannot detect a filesystem whose WRITE_FIXED ignores the submitted
+ * length (observed on GPFS: it flushes the whole registered buffer), so the
+ * only reliable signal is a bad result at copy time. The caller then falls back
+ * to the serial byte copy. */
+void ucopy_disable(void)
+{
+    tls_state = -1;
+}
+
 int64_t ucopy_run(int in, int out, uint64_t size, ucopy_sink sink, void *sink_arg)
 {
     struct ucopy_ring *r = &tls_ring;
