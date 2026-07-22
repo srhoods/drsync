@@ -74,7 +74,7 @@ func writeJournal(t *testing.T, root string, jobID int64, passNo int, rels []str
 // checksummed, plus the number of verify shards.
 func countVerify(t *testing.T, c *Controller) (entries, checksummed, shards int) {
 	t.Helper()
-	leased, err := c.st.LeaseShards("verify-reader", 1_000_000, time.Hour, 0)
+	leased, err := c.st.LeaseShards("verify-reader", 1_000_000, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

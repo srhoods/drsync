@@ -52,7 +52,7 @@ func TestSeedTempReclaimOnlyUnfinalized(t *testing.T) {
 	}
 
 	// Drive a/done.bin's group to 'done'; b/dead.bin's stays unfinalized.
-	leased, err := c.st.LeaseShards("a1", 100, time.Hour, 0)
+	leased, err := c.st.LeaseShards("a1", 100, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestSeedTempReclaimOnlyUnfinalized(t *testing.T) {
 	}
 
 	// The seeded task names the dead group's temp, and nothing else.
-	queued, err := c.st.LeaseShards("a2", 100, time.Hour, 0)
+	queued, err := c.st.LeaseShards("a2", 100, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
