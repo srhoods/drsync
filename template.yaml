@@ -1,0 +1,103 @@
+# drsync job template — copy this, edit source/destination, and submit with:
+#     drsync job submit template.yaml --start
+#
+# Every value below is the shipped default unless noted, so a minimal job only
+# needs apiVersion, kind, metadata.name and the two paths — the rest can be
+# deleted to inherit defaults. Sizes accept KiB/MiB/GiB/TiB suffixes (binary);
+# plain integers are bytes or counts. Only the fields shown here are recognised;
+# unknown keys are rejected at submit time. Full reference: docs/DESIGN-jobspec.md
+# and docs/ADMIN.md.
+
+apiVersion: drsync/v1
+kind: Job
+
+metadata:
+  name: example-sync                 # REQUIRED, unique; also the journal directory name
+  description: "example drsync job"   # optional, free text
+
+spec:
+  # REQUIRED. Absolute paths, identical on every agent host, and disjoint from
+  # each other. These are the roots on the source and destination mounts.
+  source:
+    path: /mnt/src/data
+  destination:
+    path: /mnt/dst/data
+
+  # Optional include/exclude rules, evaluated in order — first match wins; no
+  # match keeps the entry (implicit `include: "**"`). Globs: ? and * stop at /,
+  # ** crosses /. Max 64 rules, each pattern <= 255 bytes. Delete this block to
+  # copy everything.
+  filters:
+    - exclude: "**/.snapshot/**"     # snapshot dirs of either filesystem
+    - exclude: "**/*.tmp"
+
+  passes:
+    max: 10                          # hard ceiling; convergence usually stops sooner
+    schedule: continuous             # continuous | manual (operator triggers each pass)
+    converge_when:                   # stop once a pass's delta is under EITHER (OR-combined)
+      delta_files_below: 0           # 0 = only the zero-delta fixpoint stops the job
+      delta_bytes_below: 0           # e.g. 50GiB to stop while a small delta remains
+
+  copy:
+    chunk_threshold: 1GiB            # files >= this are eligible to split into chunk tasks
+    chunk_size: 1GiB                 # bytes per chunk; a file > this fans out across agents
+    buffer_size: 1MiB                # copy buffer unit
+    preserve_sparse: true            # SEEK_HOLE/DATA, with zero-detect fallback
+    server_side_copy: auto           # auto | off | require (copy_file_range / reflink)
+    temp_naming: ".drsync.tmp."      # prefix for in-progress destination names
+    fsync: per_file                  # per_file | batched
+    direct_write: false              # write NEW files straight to their final name (faster
+                                     # on GPFS/Weka; a crash leaves a partial, re-copied
+                                     # next pass). Updates always use the atomic temp+rename.
+
+  metadata:
+    owner: true                      # uid/gid (needs root on the agents)
+    mode: true                       # permission bits
+    times: true                      # atime + mtime, ns precision
+    xattrs: true                     # all readable xattr namespaces
+    specials: true                   # device nodes, FIFOs, sockets (needs root)
+    acls:
+      posix: true
+      nfs4: true
+      untranslatable: warn           # warn | fail | skip — how to treat an untranslatable ACL
+
+  # Mount probe: at pass start each agent verifies its source and destination
+  # roots before any bulk work runs, gating the whole pass until all agents pass.
+  probe:
+    require_mount: true              # require each root to sit on a real mounted
+                                     # filesystem, so an unmounted volume's leftover
+                                     # stub directory parks the pass instead of syncing
+                                     # into the underlying rootfs. Set false only when a
+                                     # root legitimately lives on the host root filesystem.
+
+  verify:
+    mode: "on"                       # on | off — off skips the verify phase entirely
+    checksum:
+      sample_rate: 0.01              # deterministic fraction of copied files re-checksummed
+      on_mismatch: recopy            # recopy | fail
+
+  deletes:
+    mode: report                     # report | mirror — mirror deletes destination orphans
+                                     # and requires a second explicit gate at pass-trigger time
+
+  limits:
+    bandwidth_per_agent: 0           # 0 = unlimited; else bytes/s per agent
+    iops_per_agent: 0                # 0 = unlimited
+
+  # Rarely changed; defaults are sized for a small fleet of fast agents.
+  tuning:
+    shard_budget: 250000             # entries a walker processes before pushing subdirs back
+    dir_split_threshold: 50000       # single-directory size that triggers entry-list sharding
+    entrylist_batch: 4000            # names per entry-list shard (sets a huge dir's fan-out)
+    statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (1–4096)
+    mtime_slop_ns: 1000000           # 1ms slop for cross-filesystem timestamp granularity
+    spread_mode: auto                # auto | off | always — coordinator-side walk fan-out
+    spread_target_per_agent: 32      # walk shards per agent to aim for while spreading
+
+  # Optional email; inert unless the coordinator has an SMTP config (-smtp-config).
+  # Delete this block for no notifications.
+  notifications:
+    recipients:                      # required if either flag below is set
+      - ops@example.com
+    on_pass_complete: false          # email as each pass finishes (the convergence trace)
+    on_job_complete: false           # one summary email when the job reaches COMPLETED

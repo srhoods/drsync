@@ -52,6 +52,10 @@ bool wq_trypop(struct shard_item *out);    /* non-blocking; false = empty/down *
 int  wq_pop_timed(struct shard_item *out, int timeout_ms);
 int  wq_depth(void);
 void wq_shutdown(void);
+/* Drain: release every queued (unstarted) shard, handing each to `release`. */
+int  wq_release_all(void (*release)(struct shard_item *it));
+/* Terminal job: drop its queued shards, handing each to `dispose`. */
+int  wq_drop_job(uint64_t job_id, void (*dispose)(struct shard_item *it));
 
 /* ---- outbox (workers/control → socket, written by control thread) ---- */
 extern int g_outbox_eventfd;
@@ -86,6 +90,7 @@ struct lease_entry {
  * caller may hand it->rel_path to the work queue afterwards. */
 void lease_add(const struct shard_item *it);
 void lease_remove(uint64_t id);
+bool lease_job_held(uint64_t job_id);
 size_t lease_snapshot(uint64_t *dst, size_t cap);
 
 /* Worker thread: claim/release the lease this thread is processing. lease_start
@@ -113,6 +118,8 @@ struct opts_entry {
 };
 int  opts_store(const struct job_options *o);
 const struct opts_entry *opts_get(uint64_t job_id);
+/* Release a terminal job's cached options + root fds (CMD_CANCEL_JOB). */
+void opts_evict(uint64_t job_id);
 size_t opts_cached(struct cached_opts *dst, size_t cap);
 
 /* ---- pending shard splits (worker blocks until coordinator ack) ---- */

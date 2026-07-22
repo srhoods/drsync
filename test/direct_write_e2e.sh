@@ -68,6 +68,7 @@ metadata: { name: dw }
 spec:
   source: { path: $SRC }
   destination: { path: $DST }
+  probe: { require_mount: false }   # test roots are plain dirs, not mounts
   passes: { max: 2, converge_when: { delta_files_below: 1 } }
   copy: { fsync: off, direct_write: true }
   verify: { checksum: { sample_rate: 1.0 } }

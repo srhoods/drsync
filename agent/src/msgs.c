@@ -532,6 +532,7 @@ static bool dec_job_options(const uint8_t *p, size_t n, struct job_options *o)
             break;
         case 11: o->dry_run = pb_get_varint(&c) != 0; break;
         case 12: o->options_hash = pb_get_varint(&c); break;
+        case 13: o->require_mount = pb_get_varint(&c) != 0; break;
         default: pb_skip(&c, wt);
         }
     }

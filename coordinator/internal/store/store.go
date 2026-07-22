@@ -1093,13 +1093,20 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration, maxPerPa
 	return out, tx.Commit()
 }
 
-// leasedPerParent counts currently-leased shards by parent. Scans only the
-// LEASED set, which is bounded by fleet capacity rather than queue depth, so
-// this stays cheap however deep the queue gets.
+// leasedPerParent counts currently-leased ENTRY-LIST shards by parent. Scans
+// only the LEASED set, which is bounded by fleet capacity rather than queue
+// depth, so this stays cheap however deep the queue gets.
+//
+// The per-parent cap exists solely to stop one pathological directory's
+// entry-list fan-out (a contiguous run of hundreds of sibling shards, all
+// hammering the same directory) from filling the fleet's prefetch window and
+// starving the rest of the tree. Regular dir-walk shards that fan out into
+// sub-directory shards are NOT counted or capped: they read different
+// directories, so throttling them only slows the walk for no benefit.
 func leasedPerParent(tx *sql.Tx) (map[int64]int, error) {
 	rows, err := tx.Query(`SELECT parent_shard_id, COUNT(*) FROM shards
-		WHERE state = ? AND parent_shard_id IS NOT NULL
-		GROUP BY parent_shard_id`, string(model.ShardLeased))
+		WHERE state = ? AND kind = ? AND parent_shard_id IS NOT NULL
+		GROUP BY parent_shard_id`, string(model.ShardLeased), string(model.KindEntryList))
 	if err != nil {
 		return nil, err
 	}
@@ -1116,10 +1123,13 @@ func leasedPerParent(tx *sql.Tx) (map[int64]int, error) {
 	return out, rows.Err()
 }
 
-// parentExclusion renders a SQL fragment skipping parents already at the cap.
-// Inlined rather than parameterised because the caller appends it to a shared
-// select prefix whose placeholders are positional; the values are ints read
-// from our own table, so there is nothing to inject.
+// parentExclusion renders a SQL fragment skipping capped parents. Only
+// entry-list shards of a capped parent are skipped; shards of any other kind
+// (a dir-walk shard that happens to share a parent, other jobs' work) stay
+// eligible, so the cap never throttles regular walkers. Inlined rather than
+// parameterised because the caller appends it to a shared select prefix whose
+// placeholders are positional; the values are ints read from our own table
+// plus a fixed kind literal, so there is nothing to inject.
 func parentExclusion(leased map[int64]int, cap int) string {
 	if cap <= 0 || len(leased) == 0 {
 		return ""
@@ -1130,7 +1140,8 @@ func parentExclusion(leased map[int64]int, cap int) string {
 			continue
 		}
 		if b.Len() == 0 {
-			b.WriteString(`AND (s.parent_shard_id IS NULL OR s.parent_shard_id NOT IN (`)
+			b.WriteString(`AND (s.kind <> '` + string(model.KindEntryList) +
+				`' OR s.parent_shard_id IS NULL OR s.parent_shard_id NOT IN (`)
 		} else {
 			b.WriteByte(',')
 		}
@@ -1150,7 +1161,9 @@ func parentExclusion(leased map[int64]int, cap int) string {
 func trimPerParent(rows *[]*ShardRow, from int, counts map[int64]int, cap int) (dropped bool) {
 	kept := (*rows)[:from]
 	for _, r := range (*rows)[from:] {
-		if r.ParentShardID != 0 {
+		// Only entry-list fan-out is capped; dir-walk shards pass through
+		// uncapped so regular walkers are never throttled.
+		if r.Kind == model.KindEntryList && r.ParentShardID != 0 {
 			if counts[r.ParentShardID] >= cap {
 				dropped = true
 				continue
@@ -1259,6 +1272,14 @@ func (s *Store) CompleteShard(shardID, leaseID int64, result []byte) error {
 // RequeueShard returns a leased shard to the queue (transient failure).
 func (s *Store) RequeueShard(shardID, leaseID int64, errMsg string) error {
 	return s.shardTransition(shardID, leaseID, model.ShardQueued, nil, errMsg, true)
+}
+
+// ReleaseShard returns an unstarted shard a draining agent handed back to the
+// queue. Unlike RequeueShard it records no error — the shard never ran and did
+// not fail; it is simply reassigned to an active agent. Attempt is untouched
+// (it only advances on grant), so a released shard is not penalised.
+func (s *Store) ReleaseShard(shardID, leaseID int64) error {
+	return s.shardTransition(shardID, leaseID, model.ShardQueued, nil, "", true)
 }
 
 // ParkShard sidelines a shard for operator attention (permanent failure).

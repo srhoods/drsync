@@ -95,6 +95,38 @@ grep -qi "root\|mount\|source" <<<"$QUEUE_OUT" \
     || fail "parked probe error does not mention the mount problem: $QUEUE_OUT"
 echo "negative case OK: bad mount blocked at probe (pass held in PROBING, nothing copied)"
 
+# --- stub mount: a real directory that is not on a mounted filesystem ----------
+# probe.require_mount (default true) must park a root whose only covering mount
+# is "/" — the tell-tale of an unmounted volume's leftover stub. This only holds
+# when the work dir really lives on the root filesystem; if the test host put
+# $WORK on its own sub-mount there is nothing to detect, so skip the assertion.
+if [[ "$(stat -c '%m' "$WORK")" == "/" ]]; then
+    SRCSTUB="$WORK/src-stub"; mkdir -p "$SRCSTUB"; echo x > "$SRCSTUB/f.txt"
+    cat > "$WORK/stub.yaml" <<EOF
+apiVersion: drsync/v1
+kind: Job
+metadata:
+  name: probe-stub
+spec:
+  source: { path: $SRCSTUB }
+  destination: { path: $WORK/dst-stub }
+  passes: { max: 2 }
+EOF
+    "$DRSYNC" job submit "$WORK/stub.yaml" --start | grep -q "job probe-stub started" \
+        || fail "stub-mount job submit --start failed"
+    sleep 4
+    ST=$(jobstate probe-stub)
+    [[ "$ST" == '"state":"COMPLETED"' ]] && fail "stub-mount job reached COMPLETED — require_mount did not gate"
+    PSTATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/probe-stub/passes/1" | grep -o '"state":"[A-Z]*"' | head -1)
+    [[ "$PSTATE" == '"state":"PROBING"' ]] || fail "stub-mount pass not held in PROBING (got $PSTATE)"
+    QUEUE_OUT=$("$DRSYNC" queue 2>/dev/null || true)
+    grep -qi "mounted filesystem\|stub\|mount" <<<"$QUEUE_OUT" \
+        || fail "stub-mount parked error does not name the mount problem: $QUEUE_OUT"
+    echo "stub case OK: unmounted-stub root (covered only by /) blocked at probe"
+else
+    echo "stub case SKIPPED: \$WORK is on a sub-mount, no rootfs stub to detect"
+fi
+
 # --- positive: healthy job passes the probe and converges ---------------------
 SRC="$WORK/src" DST="$WORK/dst"
 mkdir -p "$SRC/sub"
@@ -107,6 +139,7 @@ metadata:
 spec:
   source: { path: $SRC }
   destination: { path: $DST }
+  probe: { require_mount: false }   # test roots are plain dirs, not real mounts
   passes: { max: 3, converge_when: { delta_files_below: 1 } }
   verify: { checksum: { sample_rate: 1.0 } }
 EOF

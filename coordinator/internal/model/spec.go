@@ -87,6 +87,14 @@ type JobSpec struct {
 			} `yaml:"acls"`
 			Specials *bool `yaml:"specials"`
 		} `yaml:"metadata"`
+		Probe struct {
+			// RequireMount gates the per-agent mount probe: when true (default)
+			// each root must sit on a real mounted filesystem, so an unmounted
+			// volume's leftover stub directory parks the pass instead of syncing
+			// into the underlying rootfs. Set false when a root legitimately
+			// lives on the host root filesystem (dev boxes, test fixtures).
+			RequireMount *bool `yaml:"require_mount"`
+		} `yaml:"probe"`
 		Verify struct {
 			Mode     string `yaml:"mode"` // on (default) | off — off skips the verify phase entirely
 			Checksum struct {
@@ -194,6 +202,7 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Metadata.ACLs.Untranslatable = "warn"
 	}
 	boolDefault(&sp.Metadata.Specials, true)
+	boolDefault(&sp.Probe.RequireMount, true)
 	if sp.Verify.Mode == "" {
 		sp.Verify.Mode = "on"
 	}
@@ -397,7 +406,8 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 			StatxBatch:        sp.Tuning.StatxBatch,
 			MtimeSlopNs:       sp.Tuning.MtimeSlopNS,
 		},
-		DryRun: dryRun,
+		DryRun:       dryRun,
+		RequireMount: *sp.Probe.RequireMount,
 	}
 	switch sp.Copy.ServerSideCopy {
 	case "auto":

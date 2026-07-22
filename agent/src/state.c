@@ -150,6 +150,64 @@ void wq_shutdown(void)
     pthread_mutex_unlock(&wq_mu);
 }
 
+/* Drop every queued shard belonging to job_id (a terminal job), handing each to
+ * dispose (which frees it and its lease). Unstarted shards only — one a worker
+ * already took is left to finish. Under wq_mu so no worker pops concurrently. */
+int wq_drop_job(uint64_t job_id, void (*dispose)(struct shard_item *it))
+{
+    /* Unlink matches under the lock into a private list, then dispose of them
+     * outside it — so wq_mu is never held across dispose and workers popping
+     * concurrently never see a half-spliced queue. */
+    struct wq_node *dropped = NULL;
+    pthread_mutex_lock(&wq_mu);
+    struct wq_node **pp = &wq_head;
+    wq_tail = NULL;
+    while (*pp) {
+        struct wq_node *node = *pp;
+        if (node->it.job_id == job_id) {
+            *pp = node->next;     /* unlink from the queue */
+            node->next = dropped; /* stash on the private dropped list */
+            dropped = node;
+            wq_len--;
+        } else {
+            wq_tail = node;       /* last survivor is the queue's new tail */
+            pp = &node->next;
+        }
+    }
+    pthread_mutex_unlock(&wq_mu);
+    int n = 0;
+    while (dropped) {
+        struct wq_node *next = dropped->next;
+        dispose(&dropped->it);
+        free(dropped);
+        dropped = next;
+        n++;
+    }
+    return n;
+}
+
+/* Pop every queued (not-yet-started) shard and hand each to release, which owns
+ * disposing of it (report it back + free). Runs under wq_mu so no worker can
+ * pop concurrently; a shard a worker already took is running and is left alone.
+ * Returns the number released. Used when the agent is told to drain. */
+int wq_release_all(void (*release)(struct shard_item *it))
+{
+    int n = 0;
+    pthread_mutex_lock(&wq_mu);
+    struct wq_node *node = wq_head;
+    wq_head = wq_tail = NULL;
+    wq_len = 0;
+    pthread_mutex_unlock(&wq_mu);
+    while (node) {
+        struct wq_node *next = node->next;
+        release(&node->it);
+        free(node);
+        node = next;
+        n++;
+    }
+    return n;
+}
+
 /* ---- outbox ---- */
 int g_outbox_eventfd = -1;
 static struct outmsg  *ob_head, *ob_tail;
@@ -249,6 +307,22 @@ void lease_remove(uint64_t id)
         }
     }
     pthread_mutex_unlock(&lease_mu);
+}
+
+/* True if any lease for this job is still held (a worker may be using the job's
+ * cached root fds). Guards opts_evict from closing fds out from under a shard. */
+bool lease_job_held(uint64_t job_id)
+{
+    bool held = false;
+    pthread_mutex_lock(&lease_mu);
+    for (size_t i = 0; i < n_used; i++) {
+        if (leases[i].lease_id && leases[i].job_id == job_id) {
+            held = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&lease_mu);
+    return held;
 }
 
 void lease_start(uint64_t id)
@@ -355,7 +429,13 @@ int opts_store(const struct job_options *o)
     /* Size the statx ring from this job's tuning knob (no-op if unset). */
     uring_set_depth(o->statx_batch);
     pthread_mutex_lock(&opts_mu);
+    size_t free_slot = MAX_JOBS; /* first slot freed by opts_evict, if any */
     for (size_t i = 0; i < n_opts; i++) {
+        if (opts_tab[i].o.job_id == 0) {
+            if (free_slot == MAX_JOBS)
+                free_slot = i;
+            continue;
+        }
         if (opts_tab[i].o.job_id == o->job_id) {
             if (opts_tab[i].o.options_hash != o->options_hash) {
                 /* Roots are immutable per design; only tunables change. */
@@ -371,10 +451,15 @@ int opts_store(const struct job_options *o)
             return 0;
         }
     }
-    if (n_opts == MAX_JOBS) {
-        pthread_mutex_unlock(&opts_mu);
-        LOGE("job options table full");
-        return -1;
+    /* Reuse a slot a completed/cancelled job vacated before growing the table. */
+    size_t slot = free_slot;
+    if (slot == MAX_JOBS) {
+        if (n_opts == MAX_JOBS) {
+            pthread_mutex_unlock(&opts_mu);
+            LOGE("job options table full");
+            return -1;
+        }
+        slot = n_opts;
     }
 
     int sfd = open(o->src_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -396,10 +481,11 @@ int opts_store(const struct job_options *o)
         LOGE("open dst root %s: %s", o->dst_root, strerror(errno));
         return -1;
     }
-    opts_tab[n_opts].o = *o;
-    opts_tab[n_opts].src_fd = sfd;
-    opts_tab[n_opts].dst_fd = dfd;
-    n_opts++;
+    opts_tab[slot].o = *o;
+    opts_tab[slot].src_fd = sfd;
+    opts_tab[slot].dst_fd = dfd;
+    if (slot == n_opts)
+        n_opts++;
     pthread_mutex_unlock(&opts_mu);
     LOGI("job %llu (%s): %s -> %s%s", (unsigned long long)o->job_id, o->job_name,
          o->src_root, o->dst_root, o->dry_run ? " [dry-run]" : "");
@@ -412,20 +498,57 @@ const struct opts_entry *opts_get(uint64_t job_id)
     for (size_t i = 0; i < n_opts; i++) {
         if (opts_tab[i].o.job_id == job_id) {
             pthread_mutex_unlock(&opts_mu);
-            return &opts_tab[i]; /* entries are never removed or moved */
+            /* Slots are freed in place (never moved) so this pointer stays valid
+             * until the job is evicted, which only happens once the job is
+             * terminal and holds no lease — no caller can be using it then. */
+            return &opts_tab[i];
         }
     }
     pthread_mutex_unlock(&opts_mu);
     return NULL;
 }
 
+/* Release a terminal job's cached options: close the source/destination root
+ * fds (the handles lsof shows pinning both mounts) and free the slot for reuse.
+ * Called on CMD_CANCEL_JOB, which the coordinator sends for both cancel and
+ * completion. Skips the close while a lease for the job is still held — a worker
+ * may be mid-shard using the fds — leaving the entry until process exit; the
+ * common completed-job case holds no lease and always releases. */
+void opts_evict(uint64_t job_id)
+{
+    if (lease_job_held(job_id)) {
+        LOGW("job %llu still has work in flight; deferring options release",
+             (unsigned long long)job_id);
+        return;
+    }
+    pthread_mutex_lock(&opts_mu);
+    for (size_t i = 0; i < n_opts; i++) {
+        if (opts_tab[i].o.job_id != job_id)
+            continue;
+        if (opts_tab[i].src_fd >= 0)
+            close(opts_tab[i].src_fd);
+        if (opts_tab[i].dst_fd >= 0)
+            close(opts_tab[i].dst_fd);
+        memset(&opts_tab[i], 0, sizeof opts_tab[i]); /* job_id 0 = free slot */
+        opts_tab[i].src_fd = opts_tab[i].dst_fd = -1;
+        pthread_mutex_unlock(&opts_mu);
+        LOGI("job %llu options released (root fds closed)",
+             (unsigned long long)job_id);
+        return;
+    }
+    pthread_mutex_unlock(&opts_mu);
+}
+
 size_t opts_cached(struct cached_opts *dst, size_t cap)
 {
     pthread_mutex_lock(&opts_mu);
-    size_t n = n_opts < cap ? n_opts : cap;
-    for (size_t i = 0; i < n; i++) {
-        dst[i].job_id = opts_tab[i].o.job_id;
-        dst[i].options_hash = opts_tab[i].o.options_hash;
+    size_t n = 0;
+    for (size_t i = 0; i < n_opts && n < cap; i++) {
+        if (opts_tab[i].o.job_id == 0) /* slot freed by opts_evict */
+            continue;
+        dst[n].job_id = opts_tab[i].o.job_id;
+        dst[n].options_hash = opts_tab[i].o.options_hash;
+        n++;
     }
     pthread_mutex_unlock(&opts_mu);
     return n;

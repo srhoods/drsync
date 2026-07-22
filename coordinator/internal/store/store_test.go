@@ -391,6 +391,38 @@ func TestPausedJobNotGranted(t *testing.T) {
 	}
 }
 
+// A draining agent hands back a shard it had queued but never started. It must
+// return to the queue with no error and no attempt penalty, and become grantable
+// to another agent — the same reassignment path a normal grant uses.
+func TestReleaseShardRequeuesWithoutPenalty(t *testing.T) {
+	s := openTest(t)
+	_, _, shardID := seed(t, s)
+	rows, err := s.LeaseShards("drainer", 4, time.Minute, 0)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("lease = %+v, err=%v", rows, err)
+	}
+	leaseID := rows[0].LeaseID
+	if rows[0].Attempt != 1 {
+		t.Fatalf("attempt after first grant = %d, want 1", rows[0].Attempt)
+	}
+	if err := s.ReleaseShard(shardID, leaseID); err != nil {
+		t.Fatalf("ReleaseShard: %v", err)
+	}
+	// A stale release (wrong lease) is rejected, like any stale transition.
+	if err := s.ReleaseShard(shardID, leaseID); !errors.Is(err, ErrLeaseMismatch) {
+		t.Fatalf("second release err = %v, want ErrLeaseMismatch", err)
+	}
+	// Released shard carries no error and is grantable again; attempt only ever
+	// advances on grant, so the next grant makes it 2 (the release did not bump).
+	rows, err = s.LeaseShards("other", 4, time.Minute, 0)
+	if err != nil || len(rows) != 1 || rows[0].ID != shardID {
+		t.Fatalf("re-grant after release = %+v, err=%v", rows, err)
+	}
+	if rows[0].Attempt != 2 {
+		t.Errorf("attempt after release+regrant = %d, want 2 (release must not penalise)", rows[0].Attempt)
+	}
+}
+
 func TestDisabledAgentNotGranted(t *testing.T) {
 	s := openTest(t)
 	_, _, shardID := seed(t, s)

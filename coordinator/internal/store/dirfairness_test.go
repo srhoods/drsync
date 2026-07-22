@@ -156,6 +156,53 @@ func TestLeaseShardsNoDuplicatesAcrossTiers(t *testing.T) {
 	}
 }
 
+// The per-parent cap targets entry-list fan-out only. A regular dir-walk shard
+// that fans out into sub-directory shards (all sharing a parent) reads a
+// different directory per shard, so capping them would throttle the walk for no
+// benefit. Grants must hand out a dir parent's children freely past the cap.
+func TestLeaseShardsDoesNotCapDirFanout(t *testing.T) {
+	s := openTest(t)
+	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	pass, err := s.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A dir shard that split into many sub-directory dir shards (all one parent).
+	parents, err := s.InsertShards(pass.ID, 0, []NewShard{{Kind: model.KindDir, RelPath: "top"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	top := parents[0]
+	if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+		string(model.ShardDone), top); err != nil {
+		t.Fatal(err)
+	}
+	children := make([]NewShard, 100)
+	for i := range children {
+		children[i] = NewShard{Kind: model.KindDir, RelPath: "top/sub"}
+	}
+	kids, err := s.InsertShards(pass.ID, top, children)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const cap = 10
+	rows, err := s.LeaseShards("a1", 40, time.Minute, cap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countFrom(rows, idSet(kids)); n <= cap {
+		t.Errorf("dir fan-out granted %d children under cap %d — regular walkers "+
+			"must not be throttled by the entry-list cap", n, cap)
+	}
+}
+
 // maxPerParent = 0 disables the cap: existing callers keep prior behaviour.
 func TestLeaseShardsCapDisabled(t *testing.T) {
 	s := openTest(t)

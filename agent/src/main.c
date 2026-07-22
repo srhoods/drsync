@@ -79,6 +79,44 @@ void process_item(struct shard_item *it)
     atomic_fetch_sub(&g_inflight, 1);
 }
 
+/* Hand a queued-but-unstarted shard back to the coordinator (RES_RELEASED) so
+ * an active agent can take it, then drop our lease and free it. Called only for
+ * shards that never began running, so no journal/result work is owed. */
+static void release_shard(struct shard_item *it)
+{
+    struct shard_counters c;
+    memset(&c, 0, sizeof c);
+    pb_buf b;
+    pb_init(&b);
+    enc_shard_result(&b, it->shard_id, it->lease_id, RES_RELEASED, &c, NULL);
+    out_push(FR_SHARD_RESULT, &b);
+    lease_remove(it->lease_id);
+    shard_item_free(it);
+}
+
+/* Drop a queued shard of a terminated job without reporting it: the job is gone,
+ * so the coordinator is not waiting on a result. Just release our lease + free. */
+static void discard_shard(struct shard_item *it)
+{
+    lease_remove(it->lease_id);
+    shard_item_free(it);
+}
+
+/* Coordinator drain state. When it flips on we hand back every shard still
+ * queued (unstarted) so the fleet can reassign it; shards already running are
+ * left to finish. maybe_request_work already halts new requests while draining. */
+static void set_drain(bool want)
+{
+    if (want && !g_drain) {
+        g_drain = true;
+        int n = wq_release_all(release_shard);
+        LOGI("draining: handed back %d queued shard(s), taking no new work", n);
+    } else if (!want && g_drain) {
+        g_drain = false;
+        LOGI("drain cleared: resuming work");
+    }
+}
+
 static void *worker_main(void *arg)
 {
     (void)arg;
@@ -241,10 +279,8 @@ static int dispatch(uint16_t type, const uint8_t *p, size_t n)
             return -1;
         if (a.pause != g_pause)
             LOGI("coordinator set pause=%d", a.pause);
-        if (a.drain && !g_drain)
-            LOGI("coordinator requested drain");
         g_pause = a.pause;
-        g_drain = g_drain || a.drain;
+        set_drain(a.drain); /* authoritative: lets a re-enable resume the agent */
         return 0;
     }
     case FR_WORK_GRANT: {
@@ -258,6 +294,12 @@ static int dispatch(uint16_t type, const uint8_t *p, size_t n)
         for (size_t i = 0; i < g->n_options; i++)
             opts_store(&g->options[i]);
         for (size_t i = 0; i < g->n_items; i++) {
+            /* A grant can race the drain signal: if we are draining, hand the
+             * shard straight back rather than queueing work we will not run. */
+            if (g_drain) {
+                release_shard(&g->items[i]);
+                continue;
+            }
             lease_add(&g->items[i]); /* copies rel_path; wq_push takes the original */
             wq_push(&g->items[i]); /* takes rel_path ownership */
         }
@@ -295,7 +337,18 @@ static int dispatch(uint16_t type, const uint8_t *p, size_t n)
         switch (cmd) {
         case CMD_PAUSE:  g_pause = true;  break;
         case CMD_RESUME: g_pause = false; break;
-        case CMD_DRAIN:  g_drain = true;  break;
+        case CMD_DRAIN:  set_drain(true); break;
+        case CMD_CANCEL_JOB: {
+            /* Terminal job (cancelled or completed): drop its queued shards,
+             * then release its cached options + root fds so we stop pinning the
+             * source/destination mounts. */
+            int dropped = wq_drop_job(job_id, discard_shard);
+            opts_evict(job_id);
+            if (dropped)
+                LOGI("job %llu ended: dropped %d queued shard(s)",
+                     (unsigned long long)job_id, dropped);
+            break;
+        }
         case CMD_SHUTDOWN:
             LOGI("shutdown requested by coordinator");
             g_want_exit = true;

@@ -78,6 +78,7 @@ metadata:
 spec:
   source: { path: $SRC }
   destination: { path: $DST }
+  probe: { require_mount: false }   # test roots are plain dirs, not mounts
   filters:
     - exclude: "**/.snapshot/**"
     - exclude: "**/*.tmp"

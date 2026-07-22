@@ -282,6 +282,11 @@ message JobOptions {
   // Hash of all fields above (coordinator-computed). Agents cache options by
   // this hash; WorkGrant omits JobOptions when the agent already holds it.
   uint64 options_hash         = 12;
+  // When set, the mount probe requires each root to sit on a real mounted
+  // filesystem (a non-"/" entry in /proc/self/mountinfo covers it), catching a
+  // stub directory left behind by an unmounted volume before bulk work runs.
+  // Default true at submit; opt out per job with probe.require_mount: false.
+  bool require_mount          = 13;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +463,8 @@ enum ResultStatus {
   RESULT_TRANSIENT   = 3;  // re-queue with backoff
   RESULT_MOUNT_SICK  = 4;  // agent-local mount problem → re-queue elsewhere
   RESULT_SRC_CHANGED = 5;  // chunk gen mismatch; re-diffed next pass
+  RESULT_RELEASED    = 6;  // draining agent handing back an unstarted shard →
+                           // re-queue for an active agent (not a failure)
 }
 
 message ShardCounters {

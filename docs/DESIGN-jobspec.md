@@ -78,6 +78,13 @@ spec:
     hardlinks: report                # fixed: report-only (D3); field reserved
     specials: true                   # device nodes, FIFOs, sockets (needs root)
 
+  probe:
+    require_mount: true              # gate pass start on each root being a live mount:
+                                     # the agent checks /proc/self/mountinfo for a non-"/"
+                                     # mount covering the root, so an unmounted volume's
+                                     # stub directory parks the pass. false to allow a root
+                                     # on the host root filesystem (dev/test).
+
   verify:
     mode: on                         # on (default) | off — off skips the verify phase
     metadata: all                    # every entry re-checked after copy pass

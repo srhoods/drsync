@@ -112,6 +112,7 @@ metadata:
 spec:
   source: { path: $SRC }
   destination: { path: $DST }
+  probe: { require_mount: false }   # test roots are plain dirs, not mounts
   passes: { max: 4, converge_when: { delta_files_below: 1 } }
 EOF
     "$DRSYNC" job submit "$WORK/$name.yaml" --set spec.tuning.shard_budget=4 --start \

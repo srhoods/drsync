@@ -52,12 +52,12 @@ Direction key: `A→C` agent to coordinator, `C→A` coordinator to agent.
 | 6 | `WorkGrant` | C→A | 0..N work items, each a `Shard`, `EntryListShard`, `ChunkTask`, `DirFixBatch`, `VerifyBatch`, `DeleteBatch`, or `ProbeTask` (a mount-probe pinned to this agent, gating pass start); each carries a lease (id, TTL) |
 | 7 | `ShardSplit` | A→C | new shards discovered mid-walk (subdirectories pushed back, or entry-list batches from a huge directory); coordinator persists + queues them, acks with assigned shard ids |
 | 8 | `ShardSplitAck` | C→A | ids assigned; until received, the agent must not report the parent shard complete (no lost subtrees) |
-| 9 | `ShardResult` | A→C | terminal state of a leased shard: counters (entries walked, tasks emitted/completed, bytes copied), orphan count, error summary, nlink>1 stats, wall/IO timings |
+| 9 | `ShardResult` | A→C | terminal state of a leased shard: counters (entries walked, tasks emitted/completed, bytes copied), orphan count, error summary, nlink>1 stats, wall/IO timings. Status `RESULT_RELEASED` means a draining agent is handing a shard back **unstarted** (not a failure) so the coordinator re-queues it for an active agent |
 | 10 | `TaskResult` | A→C | terminal state for coordinator-tracked tasks (chunk copies, dirfix batches, verify batches); batched |
 | 11 | `JournalBatch` | A→C | stream of per-file journal records (see coordinator doc §5); zstd-compressed batches, ≤ 4 MiB; coordinator acks with a high-water sequence number for flow control |
 | 12 | `JournalAck` | C→A | durable high-water sequence (sent only after the coordinator fsyncs the batch — see coordinator doc §5); agent may release its send buffer |
 | 13 | `StatsReport` | A→C | 1 Hz counters: files/bytes scanned/copied/verified, IOPS, latency histograms per mount, error counts by class |
-| 14 | `Control` | C→A | pause / resume / drain (finish leases, take no new work) / cancel-job / shutdown / log-level |
+| 14 | `Control` | C→A | pause / resume / drain (hand back queued shards, finish running ones, take no new work) / cancel-job (also sent when a job **completes**: the agent drops the job's queued shards and closes its cached source/destination root fds so it stops pinning both mounts) / shutdown / log-level. Drain is also delivered as the `HeartbeatAck` flag; the coordinator sends the `Control` form on disable so it takes effect at once |
 | 15 | `Error` | both | protocol-level fault before connection teardown |
 
 ### 3.1 Work item payloads (inside `WorkGrant`)

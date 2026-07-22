@@ -41,6 +41,13 @@ type Server struct {
 	// reported, whether the agent is new enough to report it at all, and whether
 	// it is connected. Injected by agentsrv.
 	AgentInflight func(id string) (items []*drsyncpb.InflightItem, at time.Time, reports, connected bool)
+	// SetAgentDrain tells a live agent to start/stop draining (hand back queued
+	// shards, take no new work). Returns false if the agent is not connected.
+	// Injected by agentsrv.
+	SetAgentDrain func(id string, drain bool) bool
+	// NotifyJobDone tells connected agents a job reached a terminal state so they
+	// release its cached options and root fds. Injected by agentsrv.
+	NotifyJobDone func(jobID int64)
 	// DropJournal removes a purged job's on-disk journal segments; injected in
 	// main so the API can reclaim disk on `job purge`.
 	DropJournal func(jobID int64) error
@@ -418,7 +425,10 @@ func (s *Server) jobAction(action string) http.HandlerFunc {
 		case "cancel":
 			var job *store.Job
 			if job, err = s.st.GetJob(name); err == nil {
-				err = s.st.SetJobState(job.ID, model.JobCancelled)
+				if err = s.st.SetJobState(job.ID, model.JobCancelled); err == nil && s.NotifyJobDone != nil {
+					// Tell agents to release the job's cached options + root fds.
+					s.NotifyJobDone(job.ID)
+				}
 			}
 		}
 		if errors.Is(err, sql.ErrNoRows) {
@@ -555,7 +565,9 @@ func (s *Server) getAgentInflight(w http.ResponseWriter, r *http.Request) {
 }
 
 // setAgentEnabled toggles an agent's scheduling flag. Disabled agents stay
-// connected and finish in-flight leases but receive no new shard grants.
+// connected and finish their running leases but receive no new grants, and are
+// told to drain: they hand back any shards still queued (unstarted) on them so
+// active agents can pick that work up immediately rather than after it drains.
 func (s *Server) setAgentEnabled(enabled bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -567,6 +579,11 @@ func (s *Server) setAgentEnabled(enabled bool) http.HandlerFunc {
 		if err != nil {
 			httpErr(w, http.StatusInternalServerError, "%v", err)
 			return
+		}
+		// Disabling drains the node; enabling clears the drain so it takes work
+		// again. Best-effort: an offline agent has nothing queued to hand back.
+		if s.SetAgentDrain != nil {
+			s.SetAgentDrain(id, !enabled)
 		}
 		action := "disable"
 		if enabled {
