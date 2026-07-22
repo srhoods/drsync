@@ -71,8 +71,12 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
 - `PROBING` gates the pass: one `ProbeTask` shard is pinned (`target_agent`) to each
   schedulable agent, and the root walk shard is withheld until every probe reports OK.
   Each agent verifies **its own** source and destination roots are present directories,
-  so a missing or misordered mount on any host is caught before bulk work runs — not
-  just on whichever agent grabbed the root shard. A failed probe parks (like any shard),
+  and (when `probe.require_mount` is set, the default) that each sits on a real mounted
+  filesystem — the agent checks `/proc/self/mountinfo` for a non-`/` mount covering the
+  root, so an unmounted volume's leftover stub directory is caught rather than silently
+  synced into the underlying rootfs. A missing/misordered mount or a stub on any host is
+  thus caught before bulk work runs — not just on whichever agent grabbed the root shard.
+  A failed probe parks (like any shard),
   and the parked-shard guard holds the pass until the operator fixes the mount and
   retries. Probes pinned to an agent that departs after seeding are pruned so the phase
   is not stalled. An empty fleet skips probing (nobody to probe or grant work to).
@@ -130,10 +134,14 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
 
 - **Credit-based pull** (protocol doc §3): agents advertise capacity; the scheduler
   grants up to `parallel_shards_per_agent` outstanding shards each.
-- **Queue ordering:** FIFO within a pass, with two twists:
-  1. **Chunk tasks outrank dir shards** — a huge file's chunks should saturate the
+- **Queue ordering:** FIFO within a pass, with a few twists, by shard-kind priority
+  (higher granted first: probe 20 > delete 15 > chunk 10 > everything else 0):
+  1. **Probe tasks outrank all** — they gate pass start (`PROBING`).
+  2. **Delete (orphan-removal) tasks outrank chunk and walk work** — a mirror-mode
+     delete pass reclaims destination space promptly once seeded.
+  3. **Chunk tasks outrank dir shards** — a huge file's chunks should saturate the
      fleet rather than trickle while walkers churn.
-  2. **Anti-affinity for retries** — a re-queued shard is preferentially granted to a
+  4. **Anti-affinity for retries** — a re-queued shard is preferentially granted to a
      *different* agent than the one whose lease expired (dodges host-local mount issues).
 - **Fairness across jobs:** weighted round-robin by job priority (spec field, default
   equal). Multiple concurrent jobs are first-class.
@@ -192,6 +200,17 @@ scale and phases with a large task backlog (verify) are untouched. The cap is
 never below 1 and never applies to a single-agent fleet: work must not sit
 QUEUED because nobody is permitted to take it — the same "never strand"
 property the anti-affinity tier-2 fallback protects above.
+
+There is a second, narrower cap keyed on a shard's **parent**: a single
+pathological directory fans out into a contiguous run of hundreds of entry-list
+sibling shards, and granted in id order that run would fill the fleet's whole
+prefetch window and starve the rest of the tree. `LeaseShards` therefore prefers
+other work once one parent already holds `spread_target_per_agent × agents`
+leases. This cap applies **only to entry-list shards** — the shards that hammer
+one directory. Regular dir-walk shards that fan out into sub-directory shards
+read a different directory each, so they are never counted or capped; throttling
+them would only slow the walk. Like the fair-share cap it is a preference, not a
+quota: if a saturated parent is all that is left, its shards are granted anyway.
 
 ### 4.3 Cross-fleet chunk fan-out
 

@@ -36,6 +36,7 @@ enum {
     RES_TRANSIENT = 3,
     RES_MOUNT_SICK = 4,
     RES_SRC_CHANGED = 5,
+    RES_RELEASED = 6, /* draining agent handing back an unstarted shard */
 };
 
 /* AclOptions.Untranslatable */
@@ -142,6 +143,9 @@ struct job_options {
     uint32_t statx_batch; /* target statx in flight per walker ⇒ io_uring ring depth */
     int64_t  mtime_slop_ns;
     bool     dry_run;
+    /* probe: require each root to be a live mounted filesystem (proto field 13).
+     * Absent field decodes to false (old coordinator ⇒ check disabled). */
+    bool     require_mount;
     uint64_t options_hash;
 };
 

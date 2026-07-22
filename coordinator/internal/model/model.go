@@ -48,10 +48,15 @@ const (
 
 // Scheduling priorities (higher = granted first). Chunk tasks outrank walk
 // shards so a huge file's chunks saturate the fleet (DESIGN-coordinator §4).
+// Delete (orphan-removal) shards outrank chunk work so a mirror-mode delete
+// pass reclaims destination space promptly; the mount probe still outranks
+// everything, gating pass start.
 func (k ShardKind) Priority() int {
 	switch k {
 	case KindChunk:
 		return 10
+	case KindDelete:
+		return 15
 	case KindProbe:
 		return 20
 	default:

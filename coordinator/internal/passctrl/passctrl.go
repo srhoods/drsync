@@ -35,6 +35,18 @@ type Controller struct {
 	st          *store.Store
 	journalRoot string
 	notifier    *notify.Sender // nil when email is disabled (no SMTP config)
+	// NotifyJobDone tells connected agents a job reached a terminal state so they
+	// release its cached options and root directory fds. Injected by main; nil in
+	// tests. See agentsrv.Server.NotifyJobDone.
+	NotifyJobDone func(jobID int64)
+}
+
+// jobTerminal fires the agent notification for a job that just reached a
+// terminal state (best-effort; nil hook in tests is a no-op).
+func (c *Controller) jobTerminal(jobID int64) {
+	if c.NotifyJobDone != nil {
+		c.NotifyJobDone(jobID)
+	}
 }
 
 func New(st *store.Store, journalRoot string) *Controller {
@@ -282,6 +294,7 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetJobState(job.ID, model.JobCompleted); err != nil {
 			return err
 		}
+		c.jobTerminal(job.ID)
 		c.notifyPassComplete(job, pass, true, true, false)
 		c.notifyJobComplete(job)
 		return nil
@@ -315,7 +328,11 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) (jobDone, 
 	if converged || done.PassNo >= spec.Spec.Passes.Max {
 		slog.Info("job converged", "job", job.Name, "passes", done.PassNo,
 			"last_delta_files", done.FilesCopied, "last_delta_bytes", done.BytesCopied)
-		return true, converged, c.st.SetJobState(job.ID, model.JobCompleted)
+		err := c.st.SetJobState(job.ID, model.JobCompleted)
+		if err == nil {
+			c.jobTerminal(job.ID)
+		}
+		return true, converged, err
 	}
 	if spec.Spec.Passes.Schedule == "manual" {
 		slog.Info("awaiting manual pass trigger", "job", job.Name, "next_pass", done.PassNo+1)

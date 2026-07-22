@@ -83,6 +83,7 @@ metadata: { name: abrt }
 spec:
   source: { path: $SRC }
   destination: { path: $DST }
+  probe: { require_mount: false }   # test roots are plain dirs, not mounts
   passes: { max: 1 }
   copy: { server_side_copy: off, chunk_threshold: 1MiB, chunk_size: 2MiB }
   verify: { mode: off }

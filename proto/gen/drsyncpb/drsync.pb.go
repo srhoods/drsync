@@ -201,6 +201,7 @@ const (
 	ResultStatus_RESULT_TRANSIENT   ResultStatus = 3 // re-queue with backoff
 	ResultStatus_RESULT_MOUNT_SICK  ResultStatus = 4 // agent-local mount problem → re-queue elsewhere
 	ResultStatus_RESULT_SRC_CHANGED ResultStatus = 5 // chunk gen mismatch; re-diffed next pass
+	ResultStatus_RESULT_RELEASED    ResultStatus = 6 // draining agent handing back an unstarted shard →
 )
 
 // Enum value maps for ResultStatus.
@@ -212,6 +213,7 @@ var (
 		3: "RESULT_TRANSIENT",
 		4: "RESULT_MOUNT_SICK",
 		5: "RESULT_SRC_CHANGED",
+		6: "RESULT_RELEASED",
 	}
 	ResultStatus_value = map[string]int32{
 		"RESULT_UNSPECIFIED": 0,
@@ -220,6 +222,7 @@ var (
 		"RESULT_TRANSIENT":   3,
 		"RESULT_MOUNT_SICK":  4,
 		"RESULT_SRC_CHANGED": 5,
+		"RESULT_RELEASED":    6,
 	}
 )
 
@@ -2016,7 +2019,12 @@ type JobOptions struct {
 	DryRun   bool                   `protobuf:"varint,11,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
 	// Hash of all fields above (coordinator-computed). Agents cache options by
 	// this hash; WorkGrant omits JobOptions when the agent already holds it.
-	OptionsHash   uint64 `protobuf:"varint,12,opt,name=options_hash,json=optionsHash,proto3" json:"options_hash,omitempty"`
+	OptionsHash uint64 `protobuf:"varint,12,opt,name=options_hash,json=optionsHash,proto3" json:"options_hash,omitempty"`
+	// When set, the mount probe requires each root to sit on a real mounted
+	// filesystem (a non-"/" entry in /proc/self/mountinfo covers it), catching a
+	// stub directory left behind by an unmounted volume before bulk work runs.
+	// Default true at submit; opt out per job with probe.require_mount: false.
+	RequireMount  bool `protobuf:"varint,13,opt,name=require_mount,json=requireMount,proto3" json:"require_mount,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2133,6 +2141,13 @@ func (x *JobOptions) GetOptionsHash() uint64 {
 		return x.OptionsHash
 	}
 	return 0
+}
+
+func (x *JobOptions) GetRequireMount() bool {
+	if x != nil {
+		return x.RequireMount
+	}
+	return false
 }
 
 type WorkRequest struct {
@@ -4547,7 +4562,7 @@ const file_drsync_proto_rawDesc = "" +
 	"statxBatch\x12\"\n" +
 	"\rmtime_slop_ns\x18\x04 \x01(\x03R\vmtimeSlopNs\x12\"\n" +
 	"\rop_deadline_s\x18\x05 \x01(\rR\vopDeadlineS\x12'\n" +
-	"\x0fentrylist_batch\x18\x06 \x01(\rR\x0eentrylistBatch\"\xda\x03\n" +
+	"\x0fentrylist_batch\x18\x06 \x01(\rR\x0eentrylistBatch\"\xff\x03\n" +
 	"\n" +
 	"JobOptions\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x19\n" +
@@ -4562,7 +4577,8 @@ const file_drsync_proto_rawDesc = "" +
 	"\x06tuning\x18\n" +
 	" \x01(\v2\x18.drsync.v1.TuningOptionsR\x06tuning\x12\x17\n" +
 	"\adry_run\x18\v \x01(\bR\x06dryRun\x12!\n" +
-	"\foptions_hash\x18\f \x01(\x04R\voptionsHash\"\xde\x01\n" +
+	"\foptions_hash\x18\f \x01(\x04R\voptionsHash\x12#\n" +
+	"\rrequire_mount\x18\r \x01(\bR\frequireMount\"\xde\x01\n" +
 	"\vWorkRequest\x12#\n" +
 	"\rshard_credits\x18\x01 \x01(\rR\fshardCredits\x12!\n" +
 	"\ftask_credits\x18\x02 \x01(\rR\vtaskCredits\x12<\n" +
@@ -4793,14 +4809,15 @@ const file_drsync_proto_rawDesc = "" +
 	"\x0eENTRY_BLOCKDEV\x10\x05\x12\x0e\n" +
 	"\n" +
 	"ENTRY_FIFO\x10\x06\x12\x10\n" +
-	"\fENTRY_SOCKET\x10\a*\x8c\x01\n" +
+	"\fENTRY_SOCKET\x10\a*\xa1\x01\n" +
 	"\fResultStatus\x12\x16\n" +
 	"\x12RESULT_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tRESULT_OK\x10\x01\x12\x10\n" +
 	"\fRESULT_ERROR\x10\x02\x12\x14\n" +
 	"\x10RESULT_TRANSIENT\x10\x03\x12\x15\n" +
 	"\x11RESULT_MOUNT_SICK\x10\x04\x12\x16\n" +
-	"\x12RESULT_SRC_CHANGED\x10\x05B\x1bZ\x19drsync/proto/gen/drsyncpbb\x06proto3"
+	"\x12RESULT_SRC_CHANGED\x10\x05\x12\x13\n" +
+	"\x0fRESULT_RELEASED\x10\x06B\x1bZ\x19drsync/proto/gen/drsyncpbb\x06proto3"
 
 var (
 	file_drsync_proto_rawDescOnce sync.Once

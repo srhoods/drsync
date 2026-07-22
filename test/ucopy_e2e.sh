@@ -73,6 +73,7 @@ metadata:
 spec:
   source: { path: $SRC }
   destination: { path: $DST }
+  probe: { require_mount: false }   # test roots are plain dirs, not mounts
   copy:
     server_side_copy: off      # force the byte-copy fallback (exercises ucopy)
   passes:

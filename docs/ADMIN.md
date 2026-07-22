@@ -138,6 +138,14 @@ spec:
     acls:  { posix: true, nfs4: true, untranslatable: warn }  # warn | fail | skip
     specials: true                # device nodes, FIFOs, sockets
 
+  probe:
+    require_mount: true           # each agent must see both roots on a real mounted
+                                  #   filesystem before the pass starts; an unmounted
+                                  #   volume's leftover stub directory (covered only by
+                                  #   "/") parks the pass instead of syncing into rootfs.
+                                  #   Set false only when a root legitimately lives on
+                                  #   the host root filesystem (dev boxes, test fixtures).
+
   verify:
     mode: on                      # on (default) | off — "off" skips the verify phase entirely
     checksum:
@@ -203,7 +211,7 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 |---------|--------------|
 | `drsync agent list` | Connected agents, liveness, and scheduling status (`SCHED` = `enabled`/`DISABLED`). `PROTO` is the agent's protocol minor; `(old)` marks one behind the coordinator, which still works but reports less telemetry. |
 | `drsync agent inflight <id>` | What the agent is working on right now — shard, kind, path, running vs queued, time held, entries walked so far. The first thing to run when a job slows down; see §6b. |
-| `drsync agent disable <id>` | Stop granting new shards to an agent. It stays connected and finishes its in-flight leases; nothing new is scheduled onto it. Survives agent reconnects. |
+| `drsync agent disable <id>` | Drain an agent: stop granting it new shards **and** have it hand back any shards still queued (not yet started) on it, so active agents pick that work up immediately. It stays connected and finishes the shards it is already running, then releases each finished job's cached options and root directory fds. Survives agent reconnects. |
 | `drsync agent enable <id>` | Re-admit a disabled agent to scheduling. |
 | `drsync report <name> [--json]` | Migration/cutover summary: per-pass delta, the convergence curve, fidelity exceptions. The per-pass table ends with a **TOTAL** footer row summing the additive columns (duration, delta-files, delta-bytes, verify, errors; orphans is a per-scan census so it is dashed). Your go/no-go artifact. |
 | `drsync queue` | Shard queue depth by state, including **parked** shards. |
@@ -382,20 +390,26 @@ a reboot, kernel patch, or to shift its NIC/mount load elsewhere — disable it
 rather than killing it:
 
 ```bash
-drsync agent disable agent-07     # no new shards granted to agent-07
+drsync agent disable agent-07     # no new shards granted; queued work handed back
 drsync agent list                 # SCHED shows DISABLED; CONNECTED still true
-# ... agent-07 finishes the leases it already holds, then sits idle ...
+# ... agent-07 finishes only the shards it is already RUNNING, then sits idle ...
 # do the maintenance, then:
 drsync agent enable agent-07      # re-admit it to scheduling
 ```
 
-A disabled agent keeps its connection and renews its in-flight leases by
-heartbeat, so work already leased to it completes normally — nothing is
-force-requeued. Only *new* grants stop. The disabled flag is stored on the
-coordinator and **persists across agent restarts/reconnects**, so a bounce
-during the maintenance window won't silently re-admit the node. Contrast with
-killing the agent: that strands its leases until the TTL expires and they
-requeue elsewhere (a `pause` on the *job* stops grants to the whole fleet, not
+A disabled agent keeps its connection and renews the leases it is still running
+by heartbeat, so work already **started** on it completes normally. Work merely
+**queued** on it (leased but not yet picked up) is handed straight back to the
+coordinator and re-queued for the active agents — so draining shifts pending
+work off the node promptly instead of waiting for it to grind through its whole
+prefetch buffer. When each job it worked on reaches a terminal state the agent
+also closes that job's source/destination root directory fds, so it stops
+showing up in `lsof` pinning those mounts. Only *new* grants stop; the disabled
+flag is stored on the coordinator and **persists across agent restarts/
+reconnects**, so a bounce during the maintenance window won't silently re-admit
+the node. Contrast with killing the agent: that strands its leases until the TTL
+expires and they requeue elsewhere (a `pause` on the *job* stops grants to the
+whole fleet, not
 one node).
 
 ---

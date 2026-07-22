@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -76,8 +77,11 @@ type agentConn struct {
 	out        chan sendFrame // steady-state frames handed to the writer goroutine
 	stop       chan struct{}  // closed on teardown to stop the writer
 	done       chan struct{}  // closed when the writer has exited
-	drain      bool
-	pause      bool
+	// drain is set from the API goroutine when an agent is disabled, and read on
+	// the read-loop goroutine (heartbeat-ack, work-request), so it is atomic. A
+	// draining agent is told to hand back its queued shards and is granted none.
+	drain atomic.Bool
+	pause bool
 
 	// Journal ack watermarks. onJournalBatch persists a batch and raises
 	// jrnPending; the flusher fsyncs and only then acks up to jrnAcked. Gating
@@ -375,12 +379,56 @@ func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
 	}
 	s.met.AgentRSS.WithLabelValues(ac.id).Set(float64(hb.RssBytes))
 	return ac.send(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, &drsyncpb.HeartbeatAck{
-		Seq: hb.Seq, Pause: ac.pause, Drain: ac.drain,
+		Seq: hb.Seq, Pause: ac.pause, Drain: ac.drain.Load(),
 	})
 }
 
+// SetDrain tells a live agent whether to drain. On drain the agent stops asking
+// for work and hands back the shards still queued (unstarted) on it; running
+// shards are left to finish. Returns false if the agent is not connected.
+func (s *Server) SetDrain(agentID string, drain bool) bool {
+	s.mu.Lock()
+	ac := s.agents[agentID]
+	s.mu.Unlock()
+	if ac == nil {
+		return false
+	}
+	ac.drain.Store(drain)
+	// Deliver it now rather than waiting for the next heartbeat-ack (up to a
+	// heartbeat interval away), so a drained agent hands its queued shards back
+	// promptly. The heartbeat-ack still carries the authoritative flag, which is
+	// what clears the drain on re-enable.
+	if drain {
+		_ = ac.send(drsyncpb.FrameType_FRAME_CONTROL, &drsyncpb.Control{
+			Command: drsyncpb.Control_CMD_DRAIN,
+		})
+	}
+	return true
+}
+
+// NotifyJobDone tells every connected agent a job has reached a terminal state,
+// so each can release that job's cached options and the source/destination root
+// directory fds it holds. Without this the agent keeps those fds open until it
+// restarts, and lsof shows it pinning both mounts long after the job finished.
+// Reuses CMD_CANCEL_JOB: to an agent, "cancelled" and "completed" mean the same
+// — stop and forget this job. Best-effort, like every C→A control frame.
+func (s *Server) NotifyJobDone(jobID int64) {
+	s.mu.Lock()
+	acs := make([]*agentConn, 0, len(s.agents))
+	for _, ac := range s.agents {
+		acs = append(acs, ac)
+	}
+	s.mu.Unlock()
+	for _, ac := range acs {
+		_ = ac.send(drsyncpb.FrameType_FRAME_CONTROL, &drsyncpb.Control{
+			Command: drsyncpb.Control_CMD_CANCEL_JOB,
+			JobId:   uint64(jobID),
+		})
+	}
+}
+
 func (s *Server) onWorkRequest(ac *agentConn, req *drsyncpb.WorkRequest) error {
-	if ac.drain || ac.pause {
+	if ac.drain.Load() || ac.pause {
 		return ac.send(drsyncpb.FrameType_FRAME_WORK_GRANT, &drsyncpb.WorkGrant{})
 	}
 	grant, err := s.sched.Grant(ac.id, req)
@@ -547,6 +595,10 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 		}
 	case drsyncpb.ResultStatus_RESULT_TRANSIENT, drsyncpb.ResultStatus_RESULT_MOUNT_SICK:
 		err = s.st.RequeueShard(shardID, leaseID, r.Error)
+	case drsyncpb.ResultStatus_RESULT_RELEASED:
+		// A draining agent handed back a shard it had queued but never started.
+		// Return it to the queue with no error so an active agent picks it up.
+		err = s.st.ReleaseShard(shardID, leaseID)
 	default:
 		err = s.st.ParkShard(shardID, leaseID, r.Error)
 		s.met.ShardsParked.Inc()

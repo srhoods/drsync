@@ -138,6 +138,9 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpCon
 	apiSrv := api.New(st, pc, met, bus, journalRoot, apiToken)
 	apiSrv.ConnectedAgents = asrv.ConnectedAgents
 	apiSrv.AgentInflight = asrv.Inflight
+	apiSrv.SetAgentDrain = asrv.SetDrain
+	apiSrv.NotifyJobDone = asrv.NotifyJobDone
+	pc.NotifyJobDone = asrv.NotifyJobDone
 	apiSrv.DropJournal = jw.DropJob
 	apiSrv.Info = api.CoordinatorInfo{
 		FleetEpoch: fmt.Sprintf("%016x", fleetEpoch),

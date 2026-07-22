@@ -120,6 +120,7 @@ metadata:
 spec:
   source: { path: $SRC }
   destination: { path: $dst }
+  probe: { require_mount: false }   # test roots are plain dirs, not mounts
   passes:
     max: 2
     converge_when:
