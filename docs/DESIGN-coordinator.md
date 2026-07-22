@@ -17,7 +17,12 @@ before compression, ~30–60 GB with zstd).
 > (`internal/events`) rather than per-transition hooks: one producer, always
 > consistent with what the REST views report. WebSocket auth accepts the
 > bearer token as a `?token=` query parameter (browser clients cannot set
-> headers). Not yet: OIDC/roles, coordinator HA (§8), the event-driven pass
+> headers), or the session cookie for a same-origin browser client.
+> **Auth (2026-07-22):** interactive login (local host accounts or Active
+> Directory, session-cookie based, `/etc/drsync/auth.yaml`) and HTTPS for this
+> listener (`/etc/drsync/certs.yaml`) have landed — see §6 and
+> `docs/ADMIN.md` §8. Not yet: role-based access (every authenticated caller
+> is equivalent) or OIDC/SSO, coordinator HA (§8), the event-driven pass
 > controller (state machine still ticks at 2 s).
 
 ---
@@ -299,11 +304,23 @@ GET    /api/v1/queue                   shard queue depth, parked shards
 GET    /metrics                        Prometheus
 GET    /api/v1/events                  WebSocket: job/pass/shard state changes,
                                        1 Hz aggregated stats frames, error events
+POST   /api/v1/login                   WebUI login (username/password) → session cookie
+POST   /api/v1/logout                  clear the session cookie
+GET    /api/v1/whoami                  current session identity + whether login is configured
 ```
 
-- Auth: bearer tokens (static file to start; OIDC when the WebUI lands). Mutating
-  endpoints require a token with `operator` role; delete-pass additionally requires the
-  in-body confirmation string.
+- Auth: a bearer token (`-api-token`), and/or interactive login backed by
+  local host accounts or Active Directory (`/etc/drsync/auth.yaml`, gated by a
+  username/group allowlist) that issues a signed, `HttpOnly`/`SameSite=Lax`
+  session cookie — either credential is accepted on every protected endpoint.
+  See `docs/ADMIN.md` §8. There is no role distinction yet (every
+  authenticated caller can do everything an authenticated caller can do);
+  delete-pass's protection is the in-body confirmation string, not a
+  privilege tier. `login`/`logout`/`whoami` are themselves unauthenticated
+  (you can't require a session to obtain one); `whoami` never 401s.
+- The listener is plain HTTP unless `/etc/drsync/certs.yaml` configures a
+  cert/key pair, in which case it serves HTTPS and the session cookie is
+  marked `Secure`.
 - The WebSocket event stream is designed for the phase-3 WebUI but is useful
   immediately (`drsync job status --watch` consumes it).
 

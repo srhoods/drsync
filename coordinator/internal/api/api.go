@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"drsync/coordinator/internal/agentsrv"
+	"drsync/coordinator/internal/authn"
 	"drsync/coordinator/internal/events"
 	"drsync/coordinator/internal/metrics"
 	"drsync/coordinator/internal/model"
@@ -35,6 +36,20 @@ type Server struct {
 	bus         *events.Bus
 	journalRoot string
 	token       string // empty = no auth (dev only)
+
+	// Interactive login (WebUI). authenticator and authConfig are nil when
+	// /etc/drsync/auth.yaml is absent — the API then falls back to
+	// token-only auth, matching prior behaviour. sessions is always set
+	// (session secret is generated even if login is never used) so
+	// handleWhoAmI can cheaply check a cookie either way.
+	authenticator authn.Authenticator
+	authConfig    *authn.Config
+	sessions      *authn.SessionManager
+	loginLimiter  *loginLimiter
+	// httpsEnabled marks the session cookie Secure when the HTTP listener is
+	// serving TLS, so it never gets sent in the clear over a fallback http://
+	// deployment that later regains a TLS listener on a different host.
+	httpsEnabled bool
 	// ConnectedAgents is injected by agentsrv for the fleet view.
 	ConnectedAgents func() []string
 	// AgentInflight returns an agent's last-reported in-flight work, when it was
@@ -69,7 +84,24 @@ type CoordinatorInfo struct {
 func New(st *store.Store, pc *passctrl.Controller, met *metrics.Metrics,
 	bus *events.Bus, journalRoot, token string) *Server {
 	return &Server{st: st, pc: pc, met: met, bus: bus, journalRoot: journalRoot,
-		token: token, ConnectedAgents: func() []string { return nil }}
+		token: token, loginLimiter: newLoginLimiter(),
+		ConnectedAgents: func() []string { return nil }}
+}
+
+// SetAuth wires interactive login (WebUI username/password → session
+// cookie). cfg and auther are nil when /etc/drsync/auth.yaml is absent, in
+// which case the API stays token-only. sessions is required whenever cfg is
+// non-nil (built from a secret persisted in the coordinator's data-dir).
+func (s *Server) SetAuth(cfg *authn.Config, auther authn.Authenticator, sessions *authn.SessionManager) {
+	s.authConfig = cfg
+	s.authenticator = auther
+	s.sessions = sessions
+}
+
+// SetHTTPSEnabled marks whether the HTTP listener is serving TLS, so the
+// session cookie's Secure flag can be set correctly.
+func (s *Server) SetHTTPSEnabled(enabled bool) {
+	s.httpsEnabled = enabled
 }
 
 func (s *Server) Handler() http.Handler {
@@ -79,10 +111,18 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.met.Registry, promhttp.HandlerOpts{}))
 
-	// Operations console (served unauthenticated so the page can load and then
-	// prompt for a token; the data and action endpoints below still enforce auth).
+	// Operations console (served unauthenticated so the page can load and
+	// render its own login screen or token prompt; the data and action
+	// endpoints below still enforce auth).
 	mux.HandleFunc("GET /{$}", s.serveUI)
 	mux.HandleFunc("GET /ui", s.serveUI)
+
+	// Login/logout/whoami are unauthenticated by construction (you can't
+	// require a session to obtain a session); handleLogin does its own
+	// credential check and rate limiting.
+	mux.HandleFunc("POST /api/v1/login", s.handleLogin)
+	mux.HandleFunc("POST /api/v1/logout", s.handleLogout)
+	mux.HandleFunc("GET /api/v1/whoami", s.handleWhoAmI)
 
 	mux.HandleFunc("POST /api/v1/jobs", s.auth(s.submitJob))
 	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
@@ -126,9 +166,12 @@ func (s *Server) serveUI(w http.ResponseWriter, r *http.Request) {
 
 // cors adds permissive CORS headers so the console works both same-origin (the
 // coordinator serves it) and standalone (opened from a file against a remote
-// coordinator). Auth is by bearer token in the Authorization header — no cookies
-// — so a wildcard origin carries no credential-leak risk. Preflights are
-// answered here before the method-specific routes would 405 on OPTIONS.
+// coordinator). Access-Control-Allow-Credentials is deliberately never set, so
+// a wildcard origin cannot read any cross-origin response made with cookies
+// attached; the session cookie itself is SameSite=Lax, so browsers won't
+// attach it to a cross-site request in the first place (CSRF protection for
+// the state-changing POST/DELETE routes). Preflights are answered here before
+// the method-specific routes would 405 on OPTIONS.
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -142,23 +185,46 @@ func cors(next http.Handler) http.Handler {
 	})
 }
 
+// auth accepts either credential the API supports: the static bearer token
+// (CLI/scripts, and the WebUI's token-entry fallback) or a signed session
+// cookie (WebUI login). If neither a token nor auth.yaml is configured, the
+// request passes through unauthenticated (dev mode, unchanged from before).
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.token != "" {
-			got := r.Header.Get("Authorization")
-			if got == "" && r.URL.Query().Get("token") != "" {
-				// Browser WebSocket clients cannot set headers; accept the
-				// token as a query parameter on an equal footing.
-				got = "Bearer " + r.URL.Query().Get("token")
-			}
-			want := "Bearer " + s.token
-			if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-				httpErr(w, http.StatusUnauthorized, "invalid or missing bearer token")
-				return
-			}
+		if s.token == "" && s.authenticator == nil {
+			next(w, r)
+			return
 		}
-		next(w, r)
+		if s.token != "" && s.validBearerToken(r) {
+			next(w, r)
+			return
+		}
+		if s.sessions != nil && s.validSessionCookie(r) {
+			next(w, r)
+			return
+		}
+		httpErr(w, http.StatusUnauthorized, "invalid or missing credentials")
 	}
+}
+
+func (s *Server) validBearerToken(r *http.Request) bool {
+	got := r.Header.Get("Authorization")
+	if got == "" && r.URL.Query().Get("token") != "" {
+		// Browser WebSocket clients cannot set headers; accept the token as
+		// a query parameter on an equal footing.
+		got = "Bearer " + r.URL.Query().Get("token")
+	}
+	want := "Bearer " + s.token
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func (s *Server) validSessionCookie(r *http.Request) bool {
+	c, err := r.Cookie(authn.CookieName)
+	if err != nil {
+		return false
+	}
+	_, err = s.sessions.Verify(c.Value)
+	return err == nil
 }
 
 func httpErr(w http.ResponseWriter, code int, format string, args ...any) {

@@ -1,0 +1,23 @@
+# drsync coordinator HTTP(S) listener certificate configuration.
+#
+# Install to /etc/drsync/certs.yaml (or point -certs-config elsewhere). Read
+# once at coordinator startup — restart drsyncd after changing it. When the
+# default path (/etc/drsync/certs.yaml) is absent, the REST API / WebUI
+# listener (-listen-http) simply serves plain http://; a path passed
+# explicitly must exist and validate.
+#
+# This is unrelated to the agent<->coordinator mTLS material (`drsync ca`,
+# -tls-cert/-tls-key/-tls-ca on drsyncd) — that secures the agent protocol
+# port (-listen-agent). This file secures the port browsers and the CLI talk
+# to (-listen-http).
+#
+# Both fields are required together. For a quick self-signed pair (dev/test
+# only — browsers and the CLI will warn about it unless explicitly trusted):
+#
+#   drsync cert generate-self-signed --cn coordinator.example.com \
+#     --dns coordinator.example.com --ip 10.0.0.5 --out /etc/drsync
+#
+# For production, use a certificate issued by your organization's CA.
+
+cert_file: /etc/drsync/server.crt
+key_file: /etc/drsync/server.key

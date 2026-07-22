@@ -227,6 +227,7 @@ export DRSYNC_TOKEN=<api-token>                       # or --token T
 |---------|--------------|
 | `drsync ca init [--dir D] [--cn NAME] [--days N]` | Create the fleet CA (`ca.crt`/`ca.key`). |
 | `drsync ca issue --type server\|agent --cn NAME [--dir D] [--dns H]... [--ip A]... [--out BASE] [--days N]` | Issue a leaf cert signed by the CA (serverAuth for the coordinator, clientAuth for an agent). |
+| `drsync cert generate-self-signed [--cn NAME] [--dns H]... [--ip A]... [--out DIR] [--days N]` | Write a self-signed `server.crt`/`server.key` for the coordinator's **HTTP(S)** listener (unrelated to `drsync ca`'s agent mTLS). Dev/test only — see §9. |
 
 ---
 
@@ -551,7 +552,87 @@ anything you need first (`drsync report <name> --json`, `drsync journal cat
 
 ---
 
-## 8. Quick reference card
+## 8. Authentication & TLS
+
+The coordinator supports two independent, stackable auth mechanisms on its
+REST/WebUI listener (`-listen-http`), plus TLS for that same listener. None of
+this affects the agent protocol port (`-listen-agent`), which keeps its own
+mTLS story (`drsync ca`, §3 "Certificates").
+
+**Bearer token** (`-api-token TOKEN`) — unchanged from before: every request
+needs `Authorization: Bearer TOKEN` (or `?token=` for the WebSocket). Good for
+scripts/CI and for the CLI (`DRSYNC_TOKEN`/`--token`).
+
+**Interactive login** (`/etc/drsync/auth.yaml`, absent by default = disabled) —
+adds a WebUI login screen backed by either the coordinator host's own accounts
+or Active Directory, gated by an allowlist of usernames/groups:
+
+```yaml
+# /etc/drsync/auth.yaml
+mode: local            # or: ad
+allow:
+  users: [alice, bob]
+  groups: [drsync-admins]
+```
+
+- `mode: local` checks the submitted password against `/etc/shadow` (SHA-512/
+  SHA-256/MD5 crypt — modern `passwd`/`useradd` output). The `drsyncd` process
+  needs read access to `/etc/shadow` (run as root, or add its service account
+  to the `shadow` group), and group membership comes from the host's normal
+  NSS lookups (`/etc/group`, `getgrouplist`).
+- `mode: ad` binds to Active Directory over LDAP: a service account
+  (`ldap.bind_dn`/`bind_password`) searches for the submitted username's DN
+  and `memberOf` groups, then the user's own password is verified with a
+  second bind as that DN. Use `ldaps://` (or `starttls: true`) — plaintext
+  LDAP sends the user's password unencrypted. See
+  [`auth.yaml.example`](auth.yaml.example) for the full `ldap:` block.
+- **The allow list is mandatory and fail-closed**: `auth.yaml` with no
+  `allow.users`/`allow.groups` is a config error at startup, not "let everyone
+  in" — a successful authentication against local accounts or AD does not by
+  itself grant access.
+- A successful login sets an `HttpOnly`, `SameSite=Lax` session cookie
+  (`session_ttl_minutes`, default 480 = 8h); `POST /api/v1/logout` clears it.
+  Sessions are stateless (HMAC-signed, secret persisted in `-data-dir`), so
+  they survive a coordinator restart but cannot be revoked individually before
+  expiry — logout only tells the browser to stop sending the cookie. Repeated
+  failed logins from one source IP are throttled (5 failures → 30 s lockout).
+- The REST API accepts **either** a valid session cookie or the bearer token
+  on every protected endpoint — the WebUI uses whichever is configured, the
+  CLI keeps using the token.
+- An absent `/etc/drsync/auth.yaml` (the default) disables interactive login
+  entirely; the WebUI falls back to its token-entry popover, matching prior
+  behaviour exactly.
+
+**HTTP(S) listener TLS** (`/etc/drsync/certs.yaml`, absent by default =
+plain `http://`):
+
+```yaml
+# /etc/drsync/certs.yaml
+cert_file: /etc/drsync/server.crt
+key_file: /etc/drsync/server.key
+```
+
+- Both fields are required together; a half-configured file (only one of the
+  two) is a startup error rather than a silent fallback to plaintext.
+- When configured, `-listen-http` serves `https://` and the session cookie is
+  marked `Secure`. When absent, it serves plain `http://` (a warning is
+  logged) — the previous, unchanged default.
+- For a quick self-signed pair (dev/test — browsers and the CLI will warn
+  unless you explicitly trust it):
+  ```bash
+  drsync cert generate-self-signed --cn coord.example.com \
+    --dns coord.example.com --ip 10.0.0.10 --out /etc/drsync
+  ```
+  For production, install a cert issued by your organization's CA instead.
+- This is separate from the agent protocol's mTLS (`-tls-cert`/`-tls-key`/
+  `-tls-ca` on `-listen-agent`, minted by `drsync ca`) — the two listeners are
+  configured independently and one can be TLS-enabled while the other isn't.
+
+Restart `drsyncd` after editing either file — both are read once at startup.
+
+---
+
+## 9. Quick reference card
 
 ```bash
 # connection
@@ -575,8 +656,11 @@ drsync agent list ; drsync queue ; drsync report <name>
 drsync errors <name> --class EACCES ; drsync events
 drsync journal cat <name> --pass all --summary   # per-type record census (color-coded)
 
-# certificates
+# certificates (agent mTLS)
 drsync ca init --cn drsync-ca
 drsync ca issue --type server --cn coord --dns coord --ip 10.0.0.10
 drsync ca issue --type agent  --cn agent-01
+
+# HTTP(S) listener cert (WebUI/API; dev/test — see §8)
+drsync cert generate-self-signed --cn coord --dns coord --ip 10.0.0.10 --out /etc/drsync
 ```

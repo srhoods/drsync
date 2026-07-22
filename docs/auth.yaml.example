@@ -1,0 +1,64 @@
+# drsync coordinator interactive login configuration.
+#
+# Install to /etc/drsync/auth.yaml (or point -auth-config elsewhere). Read
+# once at coordinator startup — restart drsyncd after changing it. When the
+# default path (/etc/drsync/auth.yaml) is absent, interactive login (the
+# WebUI login screen) is simply disabled and the API stays token-only
+# (-api-token); a path passed explicitly must exist and validate.
+#
+# This file may contain an LDAP bind password: chmod 600 and own it by the
+# drsyncd user.
+#
+# Access is gated by allow.users / allow.groups below — a successful
+# authentication alone does not grant access. At least one must be set
+# (fail-closed: an empty allow list is a configuration error, not "allow
+# everyone").
+
+# mode selects how a submitted username/password is verified:
+#   local -> the coordinator host's own accounts, via /etc/shadow.
+#            The drsyncd process needs read access to /etc/shadow (run as
+#            root, or add the service account to the "shadow" group).
+#   ad    -> Active Directory, via an LDAP simple bind (see the ldap: block).
+mode: local
+
+allow:
+  # Exact usernames (as returned by the authenticator) that may sign in.
+  users:
+    - alice
+    - bob
+  # Group names. For mode: local this is the host's own groups (as reported
+  # by getgrouplist/NSS). For mode: ad this is the CN of each AD group the
+  # user's memberOf attribute lists (e.g. "drsync-admins", not the full DN).
+  groups:
+    - drsync-admins
+
+# How long an issued browser session stays valid before requiring another
+# login. Optional; defaults to 480 (8 hours).
+session_ttl_minutes: 480
+
+# ---------------------------------------------------------------------------
+# ldap: only used when mode: ad. Uncomment and fill in for Active Directory.
+# ---------------------------------------------------------------------------
+# ldap:
+#   # LDAP server URL. Use ldaps:// (implicit TLS, typically port 636) where
+#   # possible; ldap:// + starttls: true is the alternative.
+#   url: ldaps://dc1.example.com:636
+#   starttls: false
+#   insecure_skip_verify: false        # true only for local/dev directories
+#
+#   # Service account used to search for the submitted username's DN and
+#   # group memberships before verifying the user's own password.
+#   bind_dn: "CN=drsync-svc,OU=Service Accounts,DC=example,DC=com"
+#   bind_password: "change-me"
+#
+#   # Search base for user/group lookups.
+#   base_dn: "DC=example,DC=com"
+#
+#   # Filter used to find the user entry; %s is replaced with the submitted
+#   # username. Defaults to "(sAMAccountName=%s)" (AD's logon-name attribute).
+#   user_filter: "(sAMAccountName=%s)"
+#
+#   # User-entry attribute read for group membership (AD populates this with
+#   # each group's full DN; drsync reduces it to the CN for allow.groups).
+#   # Defaults to "memberOf".
+#   group_attribute: memberOf

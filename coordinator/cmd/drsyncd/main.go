@@ -20,6 +20,8 @@ import (
 
 	"drsync/coordinator/internal/agentsrv"
 	"drsync/coordinator/internal/api"
+	"drsync/coordinator/internal/authn"
+	"drsync/coordinator/internal/certs"
 	"drsync/coordinator/internal/events"
 	"drsync/coordinator/internal/journal"
 	"drsync/coordinator/internal/metrics"
@@ -32,6 +34,20 @@ import (
 // defaultSMTPConfig is the conventional location for SMTP server settings.
 // When it is absent, email notifications are simply disabled.
 const defaultSMTPConfig = "/etc/drsync/smtp.yaml"
+
+// defaultAuthConfig is the conventional location for WebUI/API interactive
+// login settings (local host accounts or Active Directory). When it is
+// absent, interactive login is disabled and the API stays token-only.
+const defaultAuthConfig = "/etc/drsync/auth.yaml"
+
+// defaultCertsConfig is the conventional location for the coordinator's
+// HTTP(S) listener TLS certificate. When it is absent, the REST/WebUI
+// listener serves plain http://.
+const defaultCertsConfig = "/etc/drsync/certs.yaml"
+
+// sessionSecretFile is the persisted HMAC secret backing session cookies,
+// stored alongside the state DB so sessions survive a coordinator restart.
+const sessionSecretFile = "session.key"
 
 // journalFlushInterval bounds how often persisted journal batches are fsynced
 // and acked. Small enough that the ack latency it adds to shard completion is
@@ -56,7 +72,9 @@ func main() {
 		logLevel  = flag.String("log-level", "info", "debug|info|warn|error")
 		minMinor  = flag.Uint("min-agent-minor", 0,
 			"refuse agents below this protocol minor (0 = accept all compatible agents)")
-		smtpConfig = flag.String("smtp-config", defaultSMTPConfig, "SMTP config for email notifications (absent default = disabled)")
+		smtpConfig  = flag.String("smtp-config", defaultSMTPConfig, "SMTP config for email notifications (absent default = disabled)")
+		authConfig  = flag.String("auth-config", defaultAuthConfig, "WebUI/API login config: local host accounts or Active Directory (absent default = interactive login disabled)")
+		certsConfig = flag.String("certs-config", defaultCertsConfig, "HTTP(S) listener TLS certificate config (absent default = plain http://)")
 	)
 	flag.Parse()
 
@@ -75,14 +93,14 @@ func main() {
 	}
 
 	if err := run(*agentAddr, *httpAddr, *dataDir, *apiToken,
-		*tlsCert, *tlsKey, *tlsCA, *smtpConfig, *leaseTTL, *hbEvery,
-		uint32(*minMinor)); err != nil {
+		*tlsCert, *tlsKey, *tlsCA, *smtpConfig, *authConfig, *certsConfig,
+		*leaseTTL, *hbEvery, uint32(*minMinor)); err != nil {
 		slog.Error("drsyncd exiting", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpConfig string,
+func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpConfig, authConfig, certsConfig string,
 	leaseTTL, hbEvery time.Duration, minAgentMinor uint32) error {
 
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
@@ -150,6 +168,49 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpCon
 	}
 	poller.ConnectedAgents = asrv.ConnectedAgents
 
+	// Interactive login (WebUI). An absent default config disables it
+	// silently, staying token-only; an explicitly-configured path that is
+	// missing or invalid is a hard error.
+	authCfg, err := authn.LoadConfig(authConfig, authConfig == defaultAuthConfig)
+	if err != nil {
+		return fmt.Errorf("auth config: %w", err)
+	}
+	if authCfg != nil {
+		auther, err := authn.New(authCfg)
+		if err != nil {
+			return fmt.Errorf("auth config: %w", err)
+		}
+		sessions, err := authn.NewSessionManager(filepath.Join(dataDir, sessionSecretFile),
+			time.Duration(authCfg.SessionTTLMinutes)*time.Minute)
+		if err != nil {
+			return fmt.Errorf("session manager: %w", err)
+		}
+		apiSrv.SetAuth(authCfg, auther, sessions)
+		slog.Info("interactive login enabled", "mode", authCfg.Mode, "config", authConfig)
+	} else {
+		slog.Info("interactive login disabled (no auth config)", "config", authConfig)
+	}
+
+	// HTTP(S) listener TLS. An absent default config falls back to plain
+	// http://; an explicitly-configured path that is missing or invalid is a
+	// hard error — a half-configured cert must not silently downgrade a
+	// deployment that asked for TLS.
+	httpTLSCfg, err := certs.LoadConfig(certsConfig)
+	if err != nil {
+		return fmt.Errorf("certs config: %w", err)
+	}
+	httpTLSConf, err := httpTLSCfg.TLSConfig()
+	if err != nil {
+		return fmt.Errorf("certs config: %w", err)
+	}
+	apiSrv.SetHTTPSEnabled(httpTLSConf != nil)
+	if httpTLSConf != nil {
+		slog.Info("http listener TLS enabled", "config", certsConfig)
+	} else {
+		slog.Warn("http listener serving plain http:// (no certs config); "+
+			"set up "+certsConfig+" for production use", "config", certsConfig)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -174,9 +235,22 @@ func run(agentAddr, httpAddr, dataDir, apiToken, tlsCert, tlsKey, tlsCA, smtpCon
 	}()
 
 	httpSrv := &http.Server{Addr: httpAddr, Handler: apiSrv.Handler()}
+	if httpTLSConf != nil {
+		httpSrv.TLSConfig = httpTLSConf
+	}
 	go func() {
-		slog.Info("http listener up", "addr", httpAddr, "auth", apiToken != "")
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Info("http listener up", "addr", httpAddr, "https", httpTLSConf != nil,
+			"token_auth", apiToken != "", "login_auth", authCfg != nil)
+		var err error
+		if httpTLSConf != nil {
+			// Cert/key already loaded into httpTLSConf; ListenAndServeTLS
+			// re-reads from disk unless passed empty paths, which reuses
+			// what's already in http.Server.TLSConfig.Certificates.
+			err = httpSrv.ListenAndServeTLS("", "")
+		} else {
+			err = httpSrv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			slog.Error("http listener failed", "err", err)
 			stop()
 		}

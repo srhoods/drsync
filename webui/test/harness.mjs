@@ -39,7 +39,12 @@ function route(path) {
   return { json: {} };
 }
 
-export async function boot() {
+// boot accepts optional overrides so tests that need non-default coordinator
+// behaviour (e.g. interactive login: GET /api/v1/whoami and POST
+// /api/v1/login) don't have to fork the whole harness. routeOverrides is
+// checked before the default route() table; postHandler, if given, replaces
+// the default "always 200 {ok:true}" POST stub.
+export async function boot({ routeOverrides, postHandler } = {}) {
   const html = readFileSync(CONSOLE_HTML, "utf8");
   const virtualConsole = new VirtualConsole();
   const scriptErrors = [];
@@ -56,10 +61,17 @@ export async function boot() {
         const path = String(url).replace(/^https?:\/\/[^/]+/, "");
         if (opts && opts.method === "POST") {
           requests.post.push({ path, body: opts.body });
+          if (postHandler) {
+            const r = await postHandler(path, opts);
+            if (r) {
+              const status = r.status ?? 200;
+              return { ok: status < 400, status, json: async () => r.json ?? {} };
+            }
+          }
           return { ok: true, status: 200, json: async () => ({ ok: true }) };
         }
         requests.get.push(path);
-        const r = route(path);
+        const r = (routeOverrides && routeOverrides(path)) ?? route(path);
         const status = r.status ?? 200;
         return {
           ok: status < 400,

@@ -125,6 +125,56 @@
   .cfg-msg.ok { color: var(--good); } .cfg-msg.err { color: var(--crit); }
   .cfg-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
+  /* ---- login screen ---- */
+  .login-screen {
+    position: fixed; inset: 0; z-index: 100; display: flex;
+    align-items: center; justify-content: center;
+    background:
+      radial-gradient(circle at 15% 8%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 42%),
+      radial-gradient(circle at 85% 92%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 42%),
+      var(--bg);
+  }
+  .login-screen[hidden] { display: none; }
+  .login-card {
+    width: 360px; max-width: calc(100vw - 32px); background: var(--panel);
+    border: 1px solid var(--line-2); border-radius: 14px; box-shadow: var(--shadow);
+    padding: 30px 28px 26px;
+  }
+  .login-brand { display: flex; align-items: baseline; gap: 9px; justify-content: center; margin-bottom: 4px; }
+  .login-brand .logo { font-family: var(--mono); font-weight: 700; font-size: 22px; color: var(--ink); }
+  .login-brand .logo .flow { color: var(--accent); }
+  .login-tag {
+    text-align: center; font-family: var(--mono); font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: 24px;
+  }
+  .login-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .login-row span { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+  .login-row input {
+    font-family: var(--ui); font-size: 14px; padding: 10px 11px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--ink);
+  }
+  .login-row input:focus { outline: none; border-color: var(--accent); }
+  .login-submit {
+    width: 100%; margin-top: 6px; font-family: var(--ui); font-size: 14px; font-weight: 600;
+    color: #fff; background: var(--accent); border: none; border-radius: 8px;
+    padding: 11px; cursor: pointer;
+  }
+  .login-submit:hover { background: var(--accent-2); }
+  .login-submit:disabled { opacity: .6; cursor: default; }
+  .login-msg { font-family: var(--mono); font-size: 12px; min-height: 16px; margin-top: 12px; text-align: center; }
+  .login-msg.err { color: var(--crit); }
+  .login-msg.ok { color: var(--good); }
+  .login-alt {
+    margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line);
+    text-align: center; font-family: var(--mono); font-size: 11px;
+  }
+  .login-alt a { color: var(--muted); cursor: pointer; text-decoration: underline; }
+  .login-alt a:hover { color: var(--ink-2); }
+  .user-chip {
+    font-family: var(--mono); font-size: 12px; color: var(--ink-2); display: inline-flex;
+    align-items: center; gap: 6px;
+  }
+
   /* ---- KPI strip ---- */
   .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin: 20px 0; }
   .kpi {
@@ -465,10 +515,28 @@
     <span class="spacer"></span>
     <span class="live"><span class="dot" id="conn-dot"></span> <span id="hz">connecting…</span></span>
     <span class="clock mono" id="clock">--:--:--</span>
+    <span class="user-chip" id="user-chip" hidden>👤 <span id="user-name"></span></span>
+    <button class="tbtn" id="logout" aria-label="Log out" hidden>logout</button>
     <button class="tbtn" id="settings" aria-label="Connection settings">⚙ connection</button>
     <button class="tbtn" id="theme" aria-label="Toggle color theme"><span id="theme-i">◐</span> theme</button>
   </div>
 </header>
+
+<div id="login-screen" class="login-screen" hidden role="dialog" aria-label="Sign in" aria-modal="true">
+  <div class="login-card">
+    <div class="login-brand"><span class="logo">dr<span class="flow">sync</span></span></div>
+    <div class="login-tag">cluster console</div>
+    <form id="login-form" autocomplete="on">
+      <label class="login-row"><span>username</span>
+        <input id="login-user" name="username" autocomplete="username" autofocus></label>
+      <label class="login-row"><span>password</span>
+        <input id="login-pass" name="password" type="password" autocomplete="current-password"></label>
+      <button type="submit" class="login-submit" id="login-submit">sign in</button>
+    </form>
+    <div class="login-msg" id="login-msg"></div>
+    <div class="login-alt"><a id="login-use-token">use an API token instead</a></div>
+  </div>
+</div>
 
 <div id="cfg-pop" class="cfg-pop" hidden role="dialog" aria-label="Connection settings">
   <div class="cfg-title">coordinator connection</div>
@@ -759,10 +827,15 @@
     if (s < 60) return s + "s"; const m = Math.floor(s / 60); return m < 60 ? m + "m" : Math.floor(m / 60) + "h"; };
 
   // ---------- API helpers ----------
+  // credentials: "same-origin" makes the session cookie ride along when the
+  // coordinator serves this console itself (the common case); a
+  // standalone/cross-origin console falls back to the bearer token, since a
+  // cross-origin cookie would need Access-Control-Allow-Credentials (which
+  // the coordinator deliberately never sets — see api.go's cors()).
   async function req(path, asText) {
     const h = {}; if (cfg.token) h.Authorization = "Bearer " + cfg.token;
-    const res = await fetch(cfg.base + path, { headers: h, cache: "no-store" });
-    if (res.status === 401) { openCfg("this coordinator requires an API token"); throw new Error("401"); }
+    const res = await fetch(cfg.base + path, { headers: h, cache: "no-store", credentials: "same-origin" });
+    if (res.status === 401) { onUnauthorized(); throw new Error("401"); }
     if (!res.ok) throw new Error(path + " → HTTP " + res.status);
     return asText ? res.text() : res.json();
   }
@@ -777,7 +850,7 @@
     const h = { "Content-Type": "application/json" };
     if (cfg.token) h.Authorization = "Bearer " + cfg.token;
     const res = await fetch(cfg.base + path, {
-      method: "POST", headers: h, cache: "no-store",
+      method: "POST", headers: h, cache: "no-store", credentials: "same-origin",
       body: body === undefined ? null : JSON.stringify(body),
     });
     let data = null;
@@ -1710,9 +1783,99 @@
     }
   });
 
+  // ---------- login screen ----------
+  // Interactive login (session cookie) is one of two auth paths the API
+  // accepts — the other is the bearer token via the connection popover
+  // above. GET /api/v1/whoami (always unauthenticated) tells us which one
+  // applies here: login_configured is false when the coordinator has no
+  // auth.yaml, in which case a 401 always means "set a token", never "log
+  // in" (there is nothing to log into).
+  const loginScreen = $("#login-screen"), loginForm = $("#login-form"),
+    loginUser = $("#login-user"), loginPass = $("#login-pass"),
+    loginMsg = $("#login-msg"), loginSubmit = $("#login-submit"),
+    userChip = $("#user-chip"), userName = $("#user-name"), logoutBtn = $("#logout");
+  let loginConfigured = false;
+
+  function showLogin(msg) {
+    loginScreen.hidden = false;
+    loginMsg.textContent = msg || ""; loginMsg.className = "login-msg" + (msg ? " err" : "");
+    loginUser.focus();
+  }
+  function hideLogin() { loginScreen.hidden = true; }
+  function setUserChip(username) {
+    if (username) {
+      userName.textContent = username; userChip.hidden = false; logoutBtn.hidden = false;
+    } else {
+      userChip.hidden = true; logoutBtn.hidden = true;
+    }
+  }
+
+  // onUnauthorized runs on any 401 from the API: hand off to the login
+  // screen when interactive login is available, otherwise fall back to the
+  // token popover (unchanged prior behaviour for token-only deployments).
+  function onUnauthorized() {
+    if (loginConfigured) { setUserChip(""); showLogin("session expired — please sign in again"); }
+    else openCfg("this coordinator requires an API token");
+  }
+
+  loginForm.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    loginSubmit.disabled = true;
+    loginMsg.textContent = "signing in…"; loginMsg.className = "login-msg";
+    try {
+      const res = await fetch(cfg.base + "/api/v1/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        credentials: "same-origin", cache: "no-store",
+        body: JSON.stringify({ username: loginUser.value, password: loginPass.value }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+      loginPass.value = "";
+      hideLogin(); setUserChip(data.username);
+      samples = []; S.info = null; renderHeader();
+      startConsole();
+    } catch (e) {
+      loginMsg.textContent = String(e.message); loginMsg.className = "login-msg err";
+    } finally {
+      loginSubmit.disabled = false;
+    }
+  });
+  $("#login-use-token").addEventListener("click", () => { hideLogin(); openCfg(""); });
+  logoutBtn.addEventListener("click", async () => {
+    try { await post("/api/v1/logout"); } catch (_) {}
+    setUserChip(""); showLogin("");
+  });
+
   // ---------- init ----------
+  // startConsole wires up the live feed; called once, either immediately (an
+  // established session, a bearer token, or open dev mode) or after a
+  // successful interactive login.
+  let consoleStarted = false;
+  function startConsole() {
+    if (consoleStarted) return;
+    consoleStarted = true;
+    connectWS(); pollAll(); setInterval(pollAll, POLL_MS);
+  }
+
   renderFeed(); buildFilters(); setConn("", "connecting…"); renderHeader();
-  connectWS(); pollAll(); setInterval(pollAll, POLL_MS);
+  (async () => {
+    // whoami never 401s, so this alone decides the startup screen: an
+    // established session shows the console immediately; a coordinator with
+    // login configured but no session shows the login screen (never the raw
+    // console flashing 401s); anything else (token-only or open dev mode)
+    // goes straight to the console as before.
+    try {
+      const who = await api("/api/v1/whoami");
+      loginConfigured = !!who.login_configured;
+      if (who.username) {
+        setUserChip(who.username);
+      } else if (loginConfigured && !cfg.token) {
+        showLogin("");
+        return;
+      }
+    } catch (_) { /* whoami unreachable — fall through to normal connect/401 handling */ }
+    startConsole();
+  })();
 })();
 </script>
 </body>
