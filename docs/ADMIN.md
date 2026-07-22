@@ -561,7 +561,9 @@ mTLS story (`drsync ca`, §3 "Certificates").
 
 **Bearer token** (`-api-token TOKEN`) — unchanged from before: every request
 needs `Authorization: Bearer TOKEN` (or `?token=` for the WebSocket). Good for
-scripts/CI and for the CLI (`DRSYNC_TOKEN`/`--token`).
+scripts/CI and for the CLI (`DRSYNC_TOKEN`/`--token`). The WebUI does **not**
+offer a way to enter or store this token — it authenticates only via
+interactive login below, never a bearer token typed into the browser.
 
 **Interactive login** (`/etc/drsync/auth.yaml`, absent by default = disabled) —
 adds a WebUI login screen backed by either the coordinator host's own accounts
@@ -597,11 +599,16 @@ allow:
   expiry — logout only tells the browser to stop sending the cookie. Repeated
   failed logins from one source IP are throttled (5 failures → 30 s lockout).
 - The REST API accepts **either** a valid session cookie or the bearer token
-  on every protected endpoint — the WebUI uses whichever is configured, the
-  CLI keeps using the token.
+  on every protected endpoint — the WebUI always uses the session cookie (it
+  has no token entry), the CLI keeps using the token.
+- The WebUI always connects to the coordinator that served it (the host in
+  the browser's address bar) — there is no coordinator-URL override to point
+  it elsewhere.
 - An absent `/etc/drsync/auth.yaml` (the default) disables interactive login
-  entirely; the WebUI falls back to its token-entry popover, matching prior
-  behaviour exactly.
+  entirely; the WebUI then connects straight through with no login screen
+  (open dev mode, matching prior behaviour) — the coordinator's REST API
+  itself may still be open or bearer-token-gated per `-api-token`, but that
+  token has no UI to enter it in.
 
 **HTTP(S) listener TLS** (`/etc/drsync/certs.yaml`, absent by default =
 plain `http://`):

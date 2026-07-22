@@ -1,9 +1,11 @@
 // Behavioural tests for the interactive login screen (webui/console.html).
 //
 // The console must never show live data before an authenticated session
-// exists when the coordinator has login configured, and must never trap a
-// token-only or open-dev-mode deployment behind a login screen it can't
-// satisfy. These pin both directions.
+// exists when the coordinator has login configured, and must never trap an
+// open-dev-mode deployment (no auth.yaml at all) behind a login screen it
+// can't satisfy. There is no coordinator-URL override or API-token entry in
+// the WebUI — session-cookie login is the only credential path it offers.
+// These pin both directions.
 //
 // Run: make webui-test   (or: npm --prefix webui/test test)
 
@@ -25,8 +27,8 @@ function routeWithWhoAmI(who) {
   };
 }
 
-let dom1, dom2, dom3, dom4;
-after(() => { for (const d of [dom1, dom2, dom3, dom4]) d?.dom.window.close(); });
+let dom1, dom2, dom3, dom4, dom5;
+after(() => { for (const d of [dom1, dom2, dom3, dom4, dom5]) d?.dom.window.close(); });
 
 test("login screen appears when login is configured and no session exists", async () => {
   const c = await boot({ routeOverrides: routeWithWhoAmI({ username: "", login_configured: true }) });
@@ -46,7 +48,7 @@ test("login screen is skipped when a session is already established", async () =
   assert.equal(c.$("#logout").hidden, false);
 });
 
-test("login screen is skipped entirely when login is not configured (token-only/dev mode)", async () => {
+test("login screen is skipped entirely when login is not configured (open dev mode)", async () => {
   const c = await boot({ routeOverrides: routeWithWhoAmI({ username: "", login_configured: false }) });
   dom3 = c;
   await c.tick(300);
@@ -84,4 +86,13 @@ test("submitting the login form posts credentials and reveals the console on suc
   assert.equal(c.text("#user-name"), "alice");
   const loginPost = requests.post.find(r => r.path === "/api/v1/login");
   assert.ok(loginPost, "expected a POST to /api/v1/login");
+});
+
+test("there is no coordinator-URL/API-token override anywhere in the page", async () => {
+  const c = await boot({ routeOverrides: routeWithWhoAmI({ username: "alice", login_configured: true }) });
+  dom5 = c;
+  await c.tick(300);
+  for (const sel of ["#settings", "#cfg-pop", "#cfg-base", "#cfg-token", "#login-use-token"]) {
+    assert.equal(c.$(sel), null, `${sel} should not exist — no connection override is offered`);
+  }
 });

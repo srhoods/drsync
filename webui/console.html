@@ -113,17 +113,6 @@
   #conn-dot.ok { background: var(--good); animation: pulse 2.4s ease-out infinite; }
   #conn-dot.err { background: var(--crit); animation: none; }
   @media (prefers-reduced-motion: reduce) { #conn-dot.ok { animation: none; } }
-  .tbtn.primary { background: color-mix(in srgb, var(--accent) 16%, var(--panel-2)); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); color: var(--accent); }
-  .cfg-pop { position: fixed; top: 54px; right: 22px; z-index: 60; width: 340px; background: var(--panel); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow); padding: 15px; display: flex; flex-direction: column; gap: 11px; }
-  .cfg-pop[hidden] { display: none; }
-  .cfg-title { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
-  .cfg-row { display: flex; flex-direction: column; gap: 5px; }
-  .cfg-row span { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
-  .cfg-row input { font-family: var(--mono); font-size: 12px; padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); }
-  .cfg-row input:focus { outline: none; border-color: var(--accent); }
-  .cfg-msg { font-family: var(--mono); font-size: 11px; min-height: 15px; }
-  .cfg-msg.ok { color: var(--good); } .cfg-msg.err { color: var(--crit); }
-  .cfg-actions { display: flex; gap: 8px; justify-content: flex-end; }
 
   /* ---- login screen ---- */
   .login-screen {
@@ -164,12 +153,6 @@
   .login-msg { font-family: var(--mono); font-size: 12px; min-height: 16px; margin-top: 12px; text-align: center; }
   .login-msg.err { color: var(--crit); }
   .login-msg.ok { color: var(--good); }
-  .login-alt {
-    margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line);
-    text-align: center; font-family: var(--mono); font-size: 11px;
-  }
-  .login-alt a { color: var(--muted); cursor: pointer; text-decoration: underline; }
-  .login-alt a:hover { color: var(--ink-2); }
   .user-chip {
     font-family: var(--mono); font-size: 12px; color: var(--ink-2); display: inline-flex;
     align-items: center; gap: 6px;
@@ -517,7 +500,6 @@
     <span class="clock mono" id="clock">--:--:--</span>
     <span class="user-chip" id="user-chip" hidden>👤 <span id="user-name"></span></span>
     <button class="tbtn" id="logout" aria-label="Log out" hidden>logout</button>
-    <button class="tbtn" id="settings" aria-label="Connection settings">⚙ connection</button>
     <button class="tbtn" id="theme" aria-label="Toggle color theme"><span id="theme-i">◐</span> theme</button>
   </div>
 </header>
@@ -534,16 +516,7 @@
       <button type="submit" class="login-submit" id="login-submit">sign in</button>
     </form>
     <div class="login-msg" id="login-msg"></div>
-    <div class="login-alt"><a id="login-use-token">use an API token instead</a></div>
   </div>
-</div>
-
-<div id="cfg-pop" class="cfg-pop" hidden role="dialog" aria-label="Connection settings">
-  <div class="cfg-title">coordinator connection</div>
-  <label class="cfg-row"><span>coordinator URL</span><input id="cfg-base" placeholder="(same origin)" autocomplete="off" spellcheck="false"></label>
-  <label class="cfg-row"><span>API token</span><input id="cfg-token" type="password" placeholder="bearer token, if the coordinator sets one" autocomplete="off"></label>
-  <div class="cfg-msg" id="cfg-msg"></div>
-  <div class="cfg-actions"><button id="cfg-save" class="tbtn primary">save &amp; connect</button><button id="cfg-close" class="tbtn">close</button></div>
 </div>
 
 <div class="wrap">
@@ -766,11 +739,12 @@
   const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
   const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 
-  // ---------- config / auth (persisted) ----------
-  const cfg = {
-    base: localStorage.getItem("drsync.base") || "",   // "" = same origin
-    token: localStorage.getItem("drsync.token") || "",
-  };
+  // The console always talks to the coordinator that served it — the host the
+  // operator reached the portal through — via session-cookie auth. There is
+  // no user-configurable coordinator URL or API token: both were a dev-era
+  // escape hatch that also let anyone who could reach the page point it at an
+  // arbitrary coordinator, which is not a choice a signed-in operator should
+  // have.
 
   // ---------- escaping ----------
   // Every dynamic value reaches the DOM through innerHTML, and much of it is
@@ -827,14 +801,11 @@
     if (s < 60) return s + "s"; const m = Math.floor(s / 60); return m < 60 ? m + "m" : Math.floor(m / 60) + "h"; };
 
   // ---------- API helpers ----------
-  // credentials: "same-origin" makes the session cookie ride along when the
-  // coordinator serves this console itself (the common case); a
-  // standalone/cross-origin console falls back to the bearer token, since a
-  // cross-origin cookie would need Access-Control-Allow-Credentials (which
-  // the coordinator deliberately never sets — see api.go's cors()).
+  // Every request is relative (same origin the console was served from) and
+  // carries credentials: "same-origin" so the session cookie rides along —
+  // there is no coordinator-URL override and no bearer token to attach.
   async function req(path, asText) {
-    const h = {}; if (cfg.token) h.Authorization = "Bearer " + cfg.token;
-    const res = await fetch(cfg.base + path, { headers: h, cache: "no-store", credentials: "same-origin" });
+    const res = await fetch(path, { cache: "no-store", credentials: "same-origin" });
     if (res.status === 401) { onUnauthorized(); throw new Error("401"); }
     if (!res.ok) throw new Error(path + " → HTTP " + res.status);
     return asText ? res.text() : res.json();
@@ -847,10 +818,9 @@
   // shard that already moved on); surface that text verbatim rather than a
   // generic failure, because it is written to be read by an operator.
   async function post(path, body) {
-    const h = { "Content-Type": "application/json" };
-    if (cfg.token) h.Authorization = "Bearer " + cfg.token;
-    const res = await fetch(cfg.base + path, {
-      method: "POST", headers: h, cache: "no-store", credentials: "same-origin",
+    const res = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      cache: "no-store", credentials: "same-origin",
       body: body === undefined ? null : JSON.stringify(body),
     });
     let data = null;
@@ -1104,7 +1074,7 @@
   }
 
   // ---------- header (real coordinator identity) ----------
-  function coordHost() { try { return new URL(cfg.base || location.origin).host; } catch (_) { return cfg.base || location.host; } }
+  function coordHost() { return location.host; }
   function renderHeader() {
     $("#hdr-coord").textContent = coordHost();
     const i = S.info, ep = $("#hdr-epoch");
@@ -1740,9 +1710,11 @@
   }
   let ws = null, wsTimer = null;
   function wsURL() {
-    const u = new URL("/api/v1/events", cfg.base || location.origin);
+    // Same-origin WebSocket handshakes carry the session cookie automatically
+    // (no explicit credentials option exists for WebSocket — the browser
+    // just does it), so nothing else needs attaching here.
+    const u = new URL("/api/v1/events", location.origin);
     u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    if (cfg.token) u.searchParams.set("token", cfg.token);
     return u.toString();
   }
   // Exactly one live socket: tear down any prior one (with its handlers
@@ -1759,37 +1731,13 @@
     sock.onerror = () => { try { sock.close(); } catch (_) {} };
   }
 
-  // ---------- connection settings popover ----------
-  const pop = $("#cfg-pop"), cfgBase = $("#cfg-base"), cfgToken = $("#cfg-token"), cfgMsg = $("#cfg-msg");
-  function openCfg(msg) {
-    cfgBase.value = cfg.base; cfgToken.value = cfg.token;
-    cfgMsg.textContent = msg || ""; cfgMsg.className = "cfg-msg" + (msg ? " err" : "");
-    pop.hidden = false; cfgBase.focus();
-  }
-  $("#settings").addEventListener("click", () => { if (pop.hidden) openCfg(""); else pop.hidden = true; });
-  $("#cfg-close").addEventListener("click", () => { pop.hidden = true; });
-  $("#cfg-save").addEventListener("click", async () => {
-    cfg.base = cfgBase.value.trim().replace(/\/+$/, ""); cfg.token = cfgToken.value.trim();
-    localStorage.setItem("drsync.base", cfg.base); localStorage.setItem("drsync.token", cfg.token);
-    cfgMsg.textContent = "connecting…"; cfgMsg.className = "cfg-msg"; samples = []; S.info = null; renderHeader();
-    try {
-      await api("/api/v1/jobs");
-      cfgMsg.textContent = "connected"; cfgMsg.className = "cfg-msg ok";
-      connectWS(); pollAll();
-      setTimeout(() => { pop.hidden = true; }, 700);
-    } catch (e) {
-      cfgMsg.textContent = String(e.message) === "401" ? "unauthorized — check the token" : "cannot reach coordinator";
-      cfgMsg.className = "cfg-msg err";
-    }
-  });
-
   // ---------- login screen ----------
-  // Interactive login (session cookie) is one of two auth paths the API
-  // accepts — the other is the bearer token via the connection popover
-  // above. GET /api/v1/whoami (always unauthenticated) tells us which one
-  // applies here: login_configured is false when the coordinator has no
-  // auth.yaml, in which case a 401 always means "set a token", never "log
-  // in" (there is nothing to log into).
+  // Interactive login (session cookie) is the only auth path the WebUI
+  // offers — there is no coordinator-URL override and no bearer-token entry.
+  // GET /api/v1/whoami (always unauthenticated) tells us whether login is
+  // configured on this coordinator at all: if not, there's nothing to sign
+  // into and the console proceeds straight through (dev mode / a coordinator
+  // with no auth configured at all).
   const loginScreen = $("#login-screen"), loginForm = $("#login-form"),
     loginUser = $("#login-user"), loginPass = $("#login-pass"),
     loginMsg = $("#login-msg"), loginSubmit = $("#login-submit"),
@@ -1810,12 +1758,14 @@
     }
   }
 
-  // onUnauthorized runs on any 401 from the API: hand off to the login
-  // screen when interactive login is available, otherwise fall back to the
-  // token popover (unchanged prior behaviour for token-only deployments).
+  // onUnauthorized runs on any 401 from the API: send the operator back to
+  // the login screen. If login isn't configured at all, a 401 means the
+  // coordinator's auth setup changed out from under an open session — reload
+  // is the only sane recovery, since there is no credential UI to offer.
   function onUnauthorized() {
-    if (loginConfigured) { setUserChip(""); showLogin("session expired — please sign in again"); }
-    else openCfg("this coordinator requires an API token");
+    setUserChip("");
+    if (loginConfigured) showLogin("session expired — please sign in again");
+    else location.reload();
   }
 
   loginForm.addEventListener("submit", async ev => {
@@ -1823,7 +1773,7 @@
     loginSubmit.disabled = true;
     loginMsg.textContent = "signing in…"; loginMsg.className = "login-msg";
     try {
-      const res = await fetch(cfg.base + "/api/v1/login", {
+      const res = await fetch("/api/v1/login", {
         method: "POST", headers: { "Content-Type": "application/json" },
         credentials: "same-origin", cache: "no-store",
         body: JSON.stringify({ username: loginUser.value, password: loginPass.value }),
@@ -1840,7 +1790,6 @@
       loginSubmit.disabled = false;
     }
   });
-  $("#login-use-token").addEventListener("click", () => { hideLogin(); openCfg(""); });
   logoutBtn.addEventListener("click", async () => {
     try { await post("/api/v1/logout"); } catch (_) {}
     setUserChip(""); showLogin("");
@@ -1848,8 +1797,8 @@
 
   // ---------- init ----------
   // startConsole wires up the live feed; called once, either immediately (an
-  // established session, a bearer token, or open dev mode) or after a
-  // successful interactive login.
+  // established session, or a coordinator with no login configured) or after
+  // a successful interactive login.
   let consoleStarted = false;
   function startConsole() {
     if (consoleStarted) return;
@@ -1862,14 +1811,14 @@
     // whoami never 401s, so this alone decides the startup screen: an
     // established session shows the console immediately; a coordinator with
     // login configured but no session shows the login screen (never the raw
-    // console flashing 401s); anything else (token-only or open dev mode)
-    // goes straight to the console as before.
+    // console flashing 401s); a coordinator with no login configured at all
+    // goes straight to the console.
     try {
       const who = await api("/api/v1/whoami");
       loginConfigured = !!who.login_configured;
       if (who.username) {
         setUserChip(who.username);
-      } else if (loginConfigured && !cfg.token) {
+      } else if (loginConfigured) {
         showLogin("");
         return;
       }

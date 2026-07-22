@@ -313,7 +313,9 @@ GET    /api/v1/whoami                  current session identity + whether login 
   local host accounts or Active Directory (`/etc/drsync/auth.yaml`, gated by a
   username/group allowlist) that issues a signed, `HttpOnly`/`SameSite=Lax`
   session cookie — either credential is accepted on every protected endpoint.
-  See `docs/ADMIN.md` §8. There is no role distinction yet (every
+  The WebUI itself only ever uses the session cookie (no coordinator-URL
+  override, no token entry in the page); the bearer token remains a
+  CLI/script credential. See `docs/ADMIN.md` §8. There is no role distinction yet (every
   authenticated caller can do everything an authenticated caller can do);
   delete-pass's protection is the in-body confirmation string, not a
   privilege tier. `login`/`logout`/`whoami` are themselves unauthenticated
