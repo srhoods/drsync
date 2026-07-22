@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,10 +25,13 @@ import (
 // MaxShardAttempts parks a shard after this many lease grants (poison guard).
 const MaxShardAttempts = 5
 
-// maxLeaseRounds bounds the per-directory fairness loop in LeaseShards. Each
-// round either fills the grant or pushes another parent to its cap, so this is
-// a safety bound rather than an expected limit.
-const maxLeaseRounds = 8
+// maxEntrylistPerAgent caps how many entry-list shards a single agent may hold
+// leased at once. Each entry-list shard statx-hammers one pathological
+// directory, so running many on one node destroys that node's storage
+// throughput; beyond this the fleet-wide entry-list backlog waits in the queue
+// until the agent finishes some (or another agent has a free slot). Other shard
+// kinds (dir, chunk, verify, delete, dirfix, probe) are never capped.
+const maxEntrylistPerAgent = 4
 
 var ErrLeaseMismatch = errors.New("lease mismatch or shard not leased")
 
@@ -932,10 +934,14 @@ func (s *Store) AbortChunkGroup(shardID, leaseID, passID int64, relPath string) 
 // hundreds of thousands of verify shards pegs a core under the store lock).
 // Both queries below walk shards_sched (state, priority DESC, id) in order and
 // stop at LIMIT.
-// maxPerParent caps how many shards of one parent may be leased fleet-wide
-// before other work is preferred; 0 disables the cap. It is a preference, not
-// a quota — see tier 3.
-func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration, maxPerParent int) ([]*ShardRow, error) {
+//
+// Entry-list shards carry one extra rule: a hard per-agent cap
+// (maxEntrylistPerAgent). An agent already holding that many entry-list leases
+// is granted no more — the rest wait QUEUED for it to finish some or for an
+// agent with a free slot. This is a real quota, not a preference: an entry-list
+// backlog with every agent at the cap deliberately sits in the queue rather
+// than pile more storage-punishing work onto any one node.
+func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*ShardRow, error) {
 	if max <= 0 {
 		return nil, nil
 	}
@@ -958,6 +964,25 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration, maxPerPa
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	// How many entry-list shards this agent already holds → how many more it may
+	// take this grant. At the cap, exclude entry-list from the query entirely so
+	// the grant fills with other work instead of coming back short.
+	var heldEL int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM shards
+		WHERE state = ? AND lease_agent = ? AND kind = ?`,
+		string(model.ShardLeased), agentID, string(model.KindEntryList)).Scan(&heldEL); err != nil {
+		return nil, err
+	}
+	elBudget := maxEntrylistPerAgent - heldEL
+	if elBudget < 0 {
+		elBudget = 0
+	}
+	notEntrylist := `AND s.kind <> '` + string(model.KindEntryList) + `' `
+	elExcl := ""
+	if elBudget == 0 {
+		elExcl = notEntrylist
+	}
 
 	// A targeted shard (target_agent set) is leasable only by that agent; an
 	// untargeted one (NULL) by anyone. Probe shards use this so each agent
@@ -996,87 +1021,49 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration, maxPerPa
 		return rows.Err()
 	}
 
-	// Shards are granted in id order, and one pathological directory's
-	// entry-list slices occupy a single contiguous run of ids. Uncapped, that
-	// run fills the fleet's whole prefetch window and the rest of the tree —
-	// including the rest of the same job — stops progressing until it drains.
-	//
-	// counts tracks leases per parent: what the fleet already holds, plus what
-	// this grant is adding. Parents at the cap are excluded from the query, so
-	// each round reaches further down the queue for work belonging to other
-	// directories. Built from the LEASED set, bounded by fleet capacity rather
-	// than queue depth, so it stays a small scan however deep the queue is.
-	counts := map[int64]int{}
-	if maxPerParent > 0 {
-		counts, err = leasedPerParent(tx)
-		if err != nil {
-			return nil, err
-		}
+	// Tier 1: fresh work — shards this agent did NOT last hold.
+	if err = scan(selCols+elExcl+`AND NOT (s.attempt > 0 AND s.lease_agent = ?)
+		ORDER BY s.priority DESC, s.id LIMIT ?`,
+		string(model.ShardQueued), string(model.JobRunning), agentID, agentID, max); err != nil {
+		return nil, err
 	}
-
-	// take runs both tiers under the current exclusion and trims whatever would
-	// push a parent past the cap. Returns whether the exclusion grew, which is
-	// the signal that another round can reach work the last one could not see.
-	take := func() (grew bool, err error) {
-		excl := parentExclusion(counts, maxPerParent)
-		n0 := len(out)
-		// Tier 1: fresh work — shards this agent did NOT last hold.
-		if err = scan(selCols+excl+`AND NOT (s.attempt > 0 AND s.lease_agent = ?)
+	// Tier 2: only if fresh work didn't fill the grant, fall back to shards this
+	// agent last held (disjoint from tier 1, so no dedup needed).
+	if len(out) < max {
+		if err = scan(selCols+elExcl+`AND s.attempt > 0 AND s.lease_agent = ?
 			ORDER BY s.priority DESC, s.id LIMIT ?`,
 			string(model.ShardQueued), string(model.JobRunning), agentID, agentID,
 			max-len(out)); err != nil {
-			return false, err
+			return nil, err
 		}
-		// Tier 2: only if fresh work didn't fill the grant, fall back to shards
-		// this agent last held (disjoint from tier 1, so no dedup needed).
-		if len(out) < max {
-			if err = scan(selCols+excl+`AND s.attempt > 0 AND s.lease_agent = ?
-				ORDER BY s.priority DESC, s.id LIMIT ?`,
-				string(model.ShardQueued), string(model.JobRunning), agentID, agentID,
-				max-len(out)); err != nil {
-				return false, err
+	}
+
+	// Enforce the entry-list budget: keep at most elBudget entry-list shards from
+	// the selection, dropping the rest so they stay QUEUED. Other kinds pass
+	// through untouched. (When elBudget == 0 the query already excluded
+	// entry-list, so this is a no-op safety net.)
+	budget := elBudget
+	kept := out[:0]
+	trimmed := false
+	for _, r := range out {
+		if r.Kind == model.KindEntryList {
+			if budget <= 0 {
+				trimmed = true
+				continue
 			}
+			budget--
 		}
-		if maxPerParent <= 0 {
-			return false, nil
-		}
-		return trimPerParent(&out, n0, counts, maxPerParent), nil
+		kept = append(kept, r)
 	}
+	out = kept
 
-	// Each round either fills the grant or pushes another parent to the cap,
-	// so this converges; the bound is belt-and-braces against a pathological
-	// fan-out shape.
-	rounds := 1 // no cap: one pass is the whole selection
-	if maxPerParent > 0 {
-		rounds = maxLeaseRounds
-	}
-	for round := 0; round < rounds; round++ {
-		before := len(out)
-		grew, err := take()
-		if err != nil {
+	// If the entry-list cap left the grant short, backfill with non-entry-list
+	// work deeper in the queue that the capped selection didn't reach, so an
+	// entry-list backlog at the queue head doesn't starve an agent of other work.
+	if trimmed && len(out) < max {
+		if err = scan(selCols+notEntrylist+`ORDER BY s.priority DESC, s.id LIMIT ?`,
+			string(model.ShardQueued), string(model.JobRunning), agentID, max-len(out)); err != nil {
 			return nil, err
-		}
-		if len(out) >= max {
-			break
-		}
-		// No new rows and no newly saturated parent: nothing else is reachable
-		// under the cap.
-		if len(out) == before && !grew {
-			break
-		}
-	}
-
-	// The cap is a preference, not a quota. If the only work left belongs to a
-	// saturated parent — a huge directory that is all that remains of the job —
-	// grant it anyway rather than idle the fleet. This is the same never-strand
-	// property tier 2 protects.
-	if len(out) < max && maxPerParent > 0 {
-		if err := scan(selCols+`ORDER BY s.priority DESC, s.id LIMIT ?`,
-			string(model.ShardQueued), string(model.JobRunning), agentID, max); err != nil {
-			return nil, err
-		}
-		if len(out) > max {
-			out = out[:max]
 		}
 	}
 
@@ -1091,89 +1078,6 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration, maxPerPa
 		r.Attempt++
 	}
 	return out, tx.Commit()
-}
-
-// leasedPerParent counts currently-leased ENTRY-LIST shards by parent. Scans
-// only the LEASED set, which is bounded by fleet capacity rather than queue
-// depth, so this stays cheap however deep the queue gets.
-//
-// The per-parent cap exists solely to stop one pathological directory's
-// entry-list fan-out (a contiguous run of hundreds of sibling shards, all
-// hammering the same directory) from filling the fleet's prefetch window and
-// starving the rest of the tree. Regular dir-walk shards that fan out into
-// sub-directory shards are NOT counted or capped: they read different
-// directories, so throttling them only slows the walk for no benefit.
-func leasedPerParent(tx *sql.Tx) (map[int64]int, error) {
-	rows, err := tx.Query(`SELECT parent_shard_id, COUNT(*) FROM shards
-		WHERE state = ? AND kind = ? AND parent_shard_id IS NOT NULL
-		GROUP BY parent_shard_id`, string(model.ShardLeased), string(model.KindEntryList))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[int64]int{}
-	for rows.Next() {
-		var id int64
-		var n int
-		if err := rows.Scan(&id, &n); err != nil {
-			return nil, err
-		}
-		out[id] = n
-	}
-	return out, rows.Err()
-}
-
-// parentExclusion renders a SQL fragment skipping capped parents. Only
-// entry-list shards of a capped parent are skipped; shards of any other kind
-// (a dir-walk shard that happens to share a parent, other jobs' work) stay
-// eligible, so the cap never throttles regular walkers. Inlined rather than
-// parameterised because the caller appends it to a shared select prefix whose
-// placeholders are positional; the values are ints read from our own table
-// plus a fixed kind literal, so there is nothing to inject.
-func parentExclusion(leased map[int64]int, cap int) string {
-	if cap <= 0 || len(leased) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	for id, n := range leased {
-		if n < cap {
-			continue
-		}
-		if b.Len() == 0 {
-			b.WriteString(`AND (s.kind <> '` + string(model.KindEntryList) +
-				`' OR s.parent_shard_id IS NULL OR s.parent_shard_id NOT IN (`)
-		} else {
-			b.WriteByte(',')
-		}
-		b.WriteString(strconv.FormatInt(id, 10))
-	}
-	if b.Len() == 0 {
-		return ""
-	}
-	b.WriteString(`)) `)
-	return b.String()
-}
-
-// trimPerParent drops rows appended at or after `from` that would push their
-// parent past the cap, and folds the survivors into counts. Reports whether
-// anything was dropped: that means the parent is now at the cap, so the next
-// round's exclusion reaches past it to other directories' work.
-func trimPerParent(rows *[]*ShardRow, from int, counts map[int64]int, cap int) (dropped bool) {
-	kept := (*rows)[:from]
-	for _, r := range (*rows)[from:] {
-		// Only entry-list fan-out is capped; dir-walk shards pass through
-		// uncapped so regular walkers are never throttled.
-		if r.Kind == model.KindEntryList && r.ParentShardID != 0 {
-			if counts[r.ParentShardID] >= cap {
-				dropped = true
-				continue
-			}
-			counts[r.ParentShardID]++
-		}
-		kept = append(kept, r)
-	}
-	*rows = kept
-	return dropped
 }
 
 // RenewLeasesByID extends only the leases the agent reports still holding in

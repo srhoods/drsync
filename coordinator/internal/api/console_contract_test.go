@@ -306,7 +306,7 @@ func parkOneShard(t *testing.T, srv *Server) (int64, int64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leased, err := srv.st.LeaseShards("agent-a", 1, time.Minute, 0)
+	leased, err := srv.st.LeaseShards("agent-a", 1, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -40,7 +40,7 @@ func TestSeedPassProbesConnectedAgents(t *testing.T) {
 		t.Fatalf("queued probes = %d, want 2 (one per agent)", counts[model.ShardQueued])
 	}
 	// No root walk shard until the probes pass.
-	rows, err := c.st.LeaseShards("a1", 8, time.Minute, 0)
+	rows, err := c.st.LeaseShards("a1", 8, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestProbeGateTransitionsToScanning(t *testing.T) {
 	job, _ := c.st.GetJob("t1")
 
 	// Agent leases and completes its probe OK.
-	rows, err := c.st.LeaseShards("a1", 8, time.Minute, 0)
+	rows, err := c.st.LeaseShards("a1", 8, time.Minute)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("probe lease = %+v err=%v", rows, err)
 	}
@@ -84,7 +84,7 @@ func TestProbeGateTransitionsToScanning(t *testing.T) {
 		t.Fatalf("pass state = %s, want SCANNING", pass.State)
 	}
 	// The withheld root walk shard is now queued and grantable.
-	rows, err = c.st.LeaseShards("a1", 8, time.Minute, 0)
+	rows, err = c.st.LeaseShards("a1", 8, time.Minute)
 	if err != nil || len(rows) != 1 || rows[0].Kind != model.KindDir || rows[0].RelPath != "" {
 		t.Fatalf("post-gate lease = %+v err=%v, want the root dir shard", rows, err)
 	}
