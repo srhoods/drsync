@@ -245,6 +245,7 @@
   .abtn.go { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 34%, var(--line)); }
   .abtn.go:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); border-color: var(--accent); }
   .abtn.busy { opacity: .6; cursor: progress; }
+  .abtn[hidden] { display: none; }
 
   /* ---- toasts: outcome of every write action ---- */
   .toasts { position: fixed; right: 18px; bottom: 18px; z-index: 80; display: flex; flex-direction: column; gap: 8px; max-width: 420px; }
@@ -270,6 +271,21 @@
   .modal input { font-family: var(--mono); font-size: 12px; padding: 8px 10px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); }
   .modal input:focus { outline: none; border-color: var(--accent); }
   .modal .macts { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* ---- job dialog: submit / resubmit / view settings ---- */
+  .jmodal { width: 720px; max-width: 100%; max-height: calc(100vh - 64px); background: var(--panel); border: 1px solid var(--line-2); border-radius: 13px; box-shadow: var(--shadow); padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+  .jmodal h3 { font-size: 14px; }
+  .jmodal .jm-sub { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); margin-top: -6px; }
+  .jmodal textarea {
+    flex: 1 1 auto; min-height: 360px; resize: vertical; font-family: var(--mono); font-size: 12px;
+    line-height: 1.5; padding: 12px 13px; border-radius: 9px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--ink); tab-size: 2; white-space: pre; overflow: auto;
+  }
+  .jmodal textarea:focus { outline: none; border-color: var(--accent); }
+  .jmodal textarea[readonly] { color: var(--ink-2); background: var(--panel-2); }
+  .jmodal .jm-err { font-family: var(--mono); font-size: 11.5px; color: var(--crit); white-space: pre-wrap; min-height: 0; }
+  .jmodal .jm-acts { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+  .jmodal .jm-acts .spacer { flex: 1 1 auto; }
 
   /* ---- errors view ---- */
   .ebrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -510,7 +526,7 @@
     <div class="login-tag">cluster console</div>
     <form id="login-form" autocomplete="on">
       <label class="login-row"><span>username</span>
-        <input id="login-user" name="username" autocomplete="username" autofocus></label>
+        <input id="login-user" name="username" autocomplete="username"></label>
       <label class="login-row"><span>password</span>
         <input id="login-pass" name="password" type="password" autocomplete="current-password"></label>
       <button type="submit" class="login-submit" id="login-submit">sign in</button>
@@ -565,6 +581,11 @@
         <h2>Jobs</h2><span class="eyebrow">migration lifecycle</span>
         <span class="spacer" style="flex:1"></span>
         <span class="eyebrow" id="job-hint">select a job for detail</span>
+        <button class="abtn go" id="job-new">＋ new job</button>
+      </div>
+      <div class="filters">
+        <div class="fgroup"><span class="fl">show</span><div class="chips" id="job-filters"></div></div>
+        <span class="fcount" id="job-fcount"></span>
       </div>
       <div class="body" id="joblist"></div>
       <div class="detail" id="detail"></div>
@@ -728,6 +749,26 @@
     <div class="macts">
       <button class="abtn" id="modal-cancel">cancel</button>
       <button class="abtn danger" id="modal-ok">confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Job dialog: submit a new job, resubmit an existing one with previous
+     settings pre-filled, or view (read-only) the YAML a job was submitted
+     with. One dialog, three modes — the layout and buttons are the same,
+     only which buttons are enabled and whether the textarea is editable
+     differ. -->
+<div class="modal-bg" id="jmodal-bg" hidden role="dialog" aria-modal="true" aria-labelledby="jmodal-title">
+  <div class="jmodal">
+    <h3 id="jmodal-title">New job</h3>
+    <div class="jm-sub" id="jmodal-sub"></div>
+    <textarea id="jmodal-yaml" spellcheck="false" autocomplete="off"></textarea>
+    <div class="jm-err" id="jmodal-err"></div>
+    <div class="jm-acts">
+      <span class="spacer"></span>
+      <button class="abtn" id="jmodal-cancel">cancel</button>
+      <button class="abtn" id="jmodal-submit">submit</button>
+      <button class="abtn go" id="jmodal-submit-start">submit and start job</button>
     </div>
   </div>
 </div>
@@ -902,6 +943,9 @@
   const stOrd   = { QUEUED:0, LEASED:1, DONE:2, PARKED:3 };
   const kindLabel = k => k === "entrylist" ? "entry-list" : k;
 
+  // ---------- job template (embedded verbatim from ../template.yaml) ----------
+  const JOB_TEMPLATE = "# drsync job template \u2014 copy this, edit source/destination, and submit with:\n#     drsync job submit template.yaml --start\n#\n# Every value below is the shipped default unless noted, so a minimal job only\n# needs apiVersion, kind, metadata.name and the two paths \u2014 the rest can be\n# deleted to inherit defaults. Sizes accept KiB/MiB/GiB/TiB suffixes (binary);\n# plain integers are bytes or counts. Only the fields shown here are recognised;\n# unknown keys are rejected at submit time. Full reference: docs/DESIGN-jobspec.md\n# and docs/ADMIN.md.\n\napiVersion: drsync/v1\nkind: Job\n\nmetadata:\n  name: example-sync                 # REQUIRED, unique; also the journal directory name\n  description: \"example drsync job\"   # optional, free text\n\nspec:\n  # REQUIRED. Absolute paths, identical on every agent host, and disjoint from\n  # each other. These are the roots on the source and destination mounts.\n  source:\n    path: /mnt/src/data\n  destination:\n    path: /mnt/dst/data\n\n  # Optional include/exclude rules, evaluated in order \u2014 first match wins; no\n  # match keeps the entry (implicit `include: \"**\"`). Globs: ? and * stop at /,\n  # ** crosses /. Max 64 rules, each pattern <= 255 bytes. Delete this block to\n  # copy everything.\n  filters:\n    - exclude: \"**/.snapshot/**\"     # snapshot dirs of either filesystem\n    - exclude: \"**/*.tmp\"\n\n  passes:\n    max: 10                          # hard ceiling; convergence usually stops sooner\n    schedule: continuous             # continuous | manual (operator triggers each pass)\n    converge_when:                   # stop once a pass's delta is under EITHER (OR-combined)\n      delta_files_below: 0           # 0 = only the zero-delta fixpoint stops the job\n      delta_bytes_below: 0           # e.g. 50GiB to stop while a small delta remains\n\n  copy:\n    chunk_threshold: 1GiB            # files >= this are eligible to split into chunk tasks\n    chunk_size: 1GiB                 # bytes per chunk; a file > this fans out across agents\n    buffer_size: 1MiB                # copy buffer unit\n    preserve_sparse: true            # SEEK_HOLE/DATA, with zero-detect fallback\n    server_side_copy: auto           # auto | off | require (copy_file_range / reflink)\n    temp_naming: \".drsync.tmp.\"      # prefix for in-progress destination names\n    fsync: per_file                  # per_file | batched\n    direct_write: false              # write NEW files straight to their final name (faster\n                                     # on GPFS/Weka; a crash leaves a partial, re-copied\n                                     # next pass). Updates always use the atomic temp+rename.\n\n  metadata:\n    owner: true                      # uid/gid (needs root on the agents)\n    mode: true                       # permission bits\n    times: true                      # atime + mtime, ns precision\n    xattrs: true                     # all readable xattr namespaces\n    specials: true                   # device nodes, FIFOs, sockets (needs root)\n    acls:\n      posix: true\n      nfs4: true\n      untranslatable: warn           # warn | fail | skip \u2014 how to treat an untranslatable ACL\n\n  # Mount probe: at pass start each agent verifies its source and destination\n  # roots before any bulk work runs, gating the whole pass until all agents pass.\n  probe:\n    require_mount: true              # require each root to sit on a real mounted\n                                     # filesystem, so an unmounted volume's leftover\n                                     # stub directory parks the pass instead of syncing\n                                     # into the underlying rootfs. Set false only when a\n                                     # root legitimately lives on the host root filesystem.\n\n  verify:\n    mode: \"on\"                       # on | off \u2014 off skips the verify phase entirely\n    checksum:\n      sample_rate: 0.01              # deterministic fraction of copied files re-checksummed\n      on_mismatch: recopy            # recopy | fail\n\n  deletes:\n    mode: report                     # report | mirror \u2014 mirror deletes destination orphans\n                                     # and requires a second explicit gate at pass-trigger time\n\n  limits:\n    bandwidth_per_agent: 0           # 0 = unlimited; else bytes/s per agent\n    iops_per_agent: 0                # 0 = unlimited\n\n  # Rarely changed; defaults are sized for a small fleet of fast agents.\n  tuning:\n    shard_budget: 250000             # entries a walker processes before pushing subdirs back\n    dir_split_threshold: 50000       # single-directory size that triggers entry-list sharding\n    entrylist_batch: 4000            # names per entry-list shard (sets a huge dir's fan-out)\n    statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (1\u20134096)\n    mtime_slop_ns: 1000000           # 1ms slop for cross-filesystem timestamp granularity\n    spread_mode: auto                # auto | off | always \u2014 coordinator-side walk fan-out\n    spread_target_per_agent: 32      # walk shards per agent to aim for while spreading\n\n  # Optional email; inert unless the coordinator has an SMTP config (-smtp-config).\n  # Delete this block for no notifications.\n  notifications:\n    recipients:                      # required if either flag below is set\n      - ops@example.com\n    on_pass_complete: false          # email as each pass finishes (the convergence trace)\n    on_job_complete: false           # one summary email when the job reaches COMPLETED\n                                      #   (per-pass table includes each pass's duration)\n    # Parked-shard alerts are NOT a flag here: as soon as any shard hits its\n    # retry ceiling, `recipients` above gets an email automatically (batched\n    # per job per check), independent of the two flags \u2014 see DESIGN-jobspec.md \u00a71.2.\n";
+
   // ---------- live state ----------
   const S = { jobs:[], queue:{depth:[],parked:[]}, agents:[], rates:{}, glob:{},
               sum:{scan:0,files:0,bytes:0}, selected:null, report:null, info:null,
@@ -1063,6 +1107,23 @@
     }
   }
 
+  // ---------- drain status (Draining vs Drained) ----------
+  // A disabled agent is "draining" only as long as it still holds leased
+  // work — the whole point of draining is to let that finish rather than
+  // abandon it. It becomes "drained" once its in-flight list is empty. This
+  // isn't carried as a field anywhere the roster endpoint returns; the only
+  // place it's knowable is the per-agent /inflight snapshot, which (per the
+  // README's fan-out rule) is fetched only for the one expanded row, never
+  // for the whole fleet. So the distinction is only shown for whichever
+  // disabled agent is currently expanded — collapsed disabled rows fall back
+  // to the plain "drained" label they always had, rather than adding a new
+  // request per disabled agent on every poll to resolve it for all of them.
+  function expandedDrainCount() {
+    const d = S.inflight;
+    if (!d || d.error || d.supported === false) return null;
+    return (d.inflight || []).length;
+  }
+
   // ---------- render: everything ----------
   function renderAll() {
     renderHeader(); renderKPIs(); renderJobs(); renderDetail(); renderFleet(); renderRail();
@@ -1105,10 +1166,36 @@
     $("#k-park").closest(".kpi").classList.toggle("alert", parked > 0);
   }
 
+  // ---------- job list filter ----------
+  // Ready = not yet started; Running = actively progressing, including a
+  // paused job (still non-terminal, just not granting work right now);
+  // Finished = terminal, whichever way it got there.
+  const JOB_FILTER_BUCKET = {
+    CREATED: "ready", READY: "ready",
+    RUNNING: "running", PAUSED: "running",
+    COMPLETED: "finished", CANCELLED: "finished", FAILED: "finished",
+  };
+  let jobFilter = "all";
+  function buildJobFilters() {
+    const chipDef = (v, label) => `<button class="chip ${jobFilter === v ? "on" : ""}" data-jf="${v}">${label}</button>`;
+    $("#job-filters").innerHTML =
+      chipDef("all", "all") + chipDef("ready", "ready") + chipDef("running", "running") + chipDef("finished", "finished");
+  }
+  $("#job-filters").addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    jobFilter = b.dataset.jf; buildJobFilters(); renderJobs();
+  });
+
   const joblist = $("#joblist");
   function renderJobs() {
-    if (!S.jobs.length) { joblist.innerHTML = `<div class="jmeta" style="padding:16px">no jobs registered</div>`; return; }
-    joblist.innerHTML = S.jobs.map(j => {
+    const jobs = jobFilter === "all" ? S.jobs : S.jobs.filter(j => JOB_FILTER_BUCKET[j.state] === jobFilter);
+    const fc = $("#job-fcount");
+    fc.textContent = jobFilter === "all" ? "" : `${jobs.length} of ${S.jobs.length}`;
+    if (!jobs.length) {
+      joblist.innerHTML = `<div class="jmeta" style="padding:16px">${S.jobs.length ? "no jobs match this filter" : "no jobs registered"}</div>`;
+      return;
+    }
+    joblist.innerHTML = jobs.map(j => {
       const sev = j.state === "RUNNING" ? "run" : j.state === "COMPLETED" ? "done"
         : j.state === "PAUSED" ? "pause" : (j.state === "FAILED" || j.state === "CANCELLED") ? "attn" : "";
       const prog = jobProgress(j);
@@ -1147,8 +1234,11 @@
   // Which controls a job offers is a function of its lifecycle state, so the
   // console never presents a transition the coordinator would refuse: READY
   // starts, RUNNING pauses/cancels, PAUSED resumes, terminal states offer only
-  // the report download.
-  function jobActions(state) {
+  // the report download (plus resubmit, and an orphan-cleanup nudge if the
+  // job finished with orphans still on disk). "view settings" is offered for
+  // every job — it's read-only, so no state restricts it.
+  const RESUBMITTABLE = { COMPLETED: true, CANCELLED: true, FAILED: true };
+  function jobActions(state, orphansRemaining) {
     const b = [];
     if (state === "READY" || state === "CREATED") b.push(`<button class="abtn go" data-ja="start">▶ start</button>`);
     if (state === "RUNNING") b.push(`<button class="abtn" data-ja="pause">⏸ pause</button>`);
@@ -1158,6 +1248,11 @@
       b.push(`<button class="abtn danger" data-ja="delpass">⌫ delete pass</button>`);
       b.push(`<button class="abtn danger" data-ja="cancel">✕ cancel</button>`);
     }
+    if (state === "COMPLETED" && +orphansRemaining > 0) {
+      b.push(`<button class="abtn danger" data-ja="orphans">⌫ clean up ${countFmt(orphansRemaining)} orphan${orphansRemaining === 1 ? "" : "s"}</button>`);
+    }
+    if (RESUBMITTABLE[state]) b.push(`<button class="abtn go" data-ja="resubmit">↻ resubmit</button>`);
+    b.push(`<button class="abtn" data-ja="viewspec">⚙ settings</button>`);
     b.push(`<button class="abtn" data-ja="report">⤓ report</button>`);
     return b.join("");
   }
@@ -1173,6 +1268,116 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
 
+  // ---------- job dialog: new job / resubmit / view settings ----------
+  // One dialog serves three modes because the shape is identical — a YAML
+  // textarea plus (for submit modes) Submit / Submit and start job / Cancel.
+  // Only what's editable and which buttons show changes.
+  const jm = {
+    bg: $("#jmodal-bg"), title: $("#jmodal-title"), sub: $("#jmodal-sub"),
+    yaml: $("#jmodal-yaml"), err: $("#jmodal-err"),
+    cancel: $("#jmodal-cancel"), submit: $("#jmodal-submit"), submitStart: $("#jmodal-submit-start"),
+  };
+  function openJobModal({ title, sub, yaml, readonly }) {
+    jm.title.textContent = title;
+    jm.sub.textContent = sub || "";
+    jm.yaml.value = yaml;
+    jm.yaml.readOnly = !!readonly;
+    jm.err.textContent = "";
+    jm.submit.hidden = !!readonly;
+    jm.submitStart.hidden = !!readonly;
+    jm.cancel.textContent = readonly ? "close" : "cancel";
+    jm.bg.hidden = false;
+    (readonly ? jm.cancel : jm.yaml).focus();
+  }
+  function closeJobModal() { jm.bg.hidden = true; }
+  jm.cancel.addEventListener("click", closeJobModal);
+  jm.bg.addEventListener("click", e => { if (e.target === jm.bg) closeJobModal(); });
+  addEventListener("keydown", e => { if (e.key === "Escape" && !jm.bg.hidden) closeJobModal(); });
+
+  // Bumps a trailing "-N" counter on a job name (or appends "-2" if there
+  // isn't one yet), so resubmitting "migrate" offers "migrate-2", then
+  // "migrate-3" — avoiding an immediate name collision with the job just
+  // finished/cancelled, which the coordinator would otherwise 409 on.
+  function incrementJobName(name) {
+    const m = /^(.*)-(\d+)$/.exec(name);
+    return m ? `${m[1]}-${+m[2] + 1}` : `${name}-2`;
+  }
+
+  // Rewrites metadata.name in a YAML spec via string replacement (not a full
+  // YAML parse — the console has no YAML library loaded, and a targeted
+  // regex on the one well-known key is enough for a value template.yaml and
+  // every real spec always emits in the same "metadata:\n  name: x" shape).
+  function withJobName(yaml, name) {
+    return yaml.replace(/^(\s*name:\s*).*$/m, (_, pre) => pre + name);
+  }
+
+  async function submitJobModal(alsoStart) {
+    const body = jm.yaml.value;
+    const btn = alsoStart ? jm.submitStart : jm.submit;
+    jm.submit.disabled = jm.submitStart.disabled = true;
+    jm.err.textContent = "";
+    try {
+      const res = await fetch("/api/v1/jobs", {
+        method: "POST", headers: { "Content-Type": "application/x-yaml" },
+        cache: "no-store", credentials: "same-origin", body,
+      });
+      let data = null;
+      try { data = await res.json(); } catch (_) {}
+      if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+      if (alsoStart) {
+        await post("/api/v1/jobs/" + encodeURIComponent(data.name) + "/start");
+      }
+      closeJobModal();
+      toast(`job ${data.name} submitted${alsoStart ? " and started" : ""}`, "ok");
+      S.selected = data.name;
+      await pollAll();
+    } catch (e) {
+      jm.err.textContent = String(e.message);
+    } finally {
+      jm.submit.disabled = jm.submitStart.disabled = false;
+    }
+  }
+  jm.submit.addEventListener("click", () => submitJobModal(false));
+  jm.submitStart.addEventListener("click", () => submitJobModal(true));
+
+  $("#job-new").addEventListener("click", () => {
+    openJobModal({
+      title: "New job",
+      sub: "Pre-filled from the shipped template — edit source, destination and anything else, then submit.",
+      yaml: JOB_TEMPLATE,
+    });
+  });
+
+  async function openResubmit(name) {
+    let yaml;
+    try {
+      yaml = await apiText("/api/v1/jobs/" + encodeURIComponent(name) + "/spec");
+    } catch (e) {
+      toast(`could not load settings for ${name}: ${e.message}`, "err");
+      return;
+    }
+    openJobModal({
+      title: `Resubmit ${name}`,
+      sub: `Pre-filled from ${name}'s settings, with an incremented job name — edit as needed, then submit.`,
+      yaml: withJobName(yaml, incrementJobName(name)),
+    });
+  }
+
+  async function openViewSpec(name) {
+    let yaml;
+    try {
+      yaml = await apiText("/api/v1/jobs/" + encodeURIComponent(name) + "/spec");
+    } catch (e) {
+      toast(`could not load settings for ${name}: ${e.message}`, "err");
+      return;
+    }
+    openJobModal({
+      title: `Settings — ${name}`,
+      sub: "The YAML this job was submitted with (read-only).",
+      yaml, readonly: true,
+    });
+  }
+
   $("#detail").addEventListener("click", async e => {
     const btn = e.target.closest("button[data-ja]"); if (!btn) return;
     const name = S.selected; if (!name) return;
@@ -1183,6 +1388,8 @@
       case "resume": return act(btn, u + "/resume", undefined, `resumed ${name}`);
       case "report": return downloadReport(name);
       case "pass":   return act(btn, u + "/passes", { delete: false }, `triggered a pass on ${name}`);
+      case "resubmit": return openResubmit(name);
+      case "viewspec": return openViewSpec(name);
       case "cancel": {
         const ok = await confirmAction({
           title: "Cancel job",
@@ -1198,6 +1405,15 @@
           okLabel: "run delete pass", echo: name,
         });
         // The API gates this a second time on confirm === job name; send it.
+        return ok && act(btn, u + "/passes", { delete: true, confirm: name },
+          `delete pass triggered on ${name}`);
+      }
+      case "orphans": {
+        const ok = await confirmAction({
+          title: "Clean up orphans",
+          text: `Run a delete pass on <b>${esc(name)}</b> to remove the destination files its last scan found with no matching source entry. This is irreversible.`,
+          okLabel: "run delete pass", echo: name,
+        });
         return ok && act(btn, u + "/passes", { delete: true, confirm: name },
           `delete pass triggered on ${name}`);
       }
@@ -1234,7 +1450,7 @@
         <span class="jn">${esc(r.job)}</span>
         <span class="pill ${jobPill[st] || "mut"}">${esc(st.toLowerCase())}</span>
         <span class="jmeta">${r.converged ? "converged" : (latest.state ? "pass " + latest.pass_no + " · " + esc((latest.state || "").toLowerCase()) : "")}${r.dry_run ? " · dry-run" : ""}</span>
-        <div class="acts">${jobActions(st)}</div>
+        <div class="acts">${jobActions(st, r.orphans_remaining)}</div>
       </div>
       <div class="dgrid">${stat}</div>
       <div class="sect-l">convergence — Δfiles per pass (fixpoint = 0)</div>
@@ -1254,9 +1470,15 @@
     let hbsum = 0, hbn = 0;
     fleet.innerHTML = S.agents.map(a => {
       const r = S.rates[a.id] || { scan:0, files:0, bytes:0, rss:0 };
-      const off = !a.connected, drained = a.connected && !a.enabled;
-      const stcls = off ? "off" : drained ? "warn" : "";
-      const sttxt = off ? "offline" : drained ? "drained" : "connected";
+      const off = !a.connected, disabled = a.connected && !a.enabled;
+      // Draining vs Drained is only resolvable for the expanded row (see
+      // expandedDrainCount): a collapsed disabled row keeps the plain
+      // "drained" label rather than a per-poll fetch to resolve it for every
+      // disabled agent at once.
+      const inflightN = (disabled && S.expandedAgent === a.id) ? expandedDrainCount() : undefined;
+      const draining = disabled && inflightN !== 0 && inflightN !== undefined;
+      const stcls = off ? "off" : disabled ? "warn" : "";
+      const sttxt = off ? "offline" : draining ? "draining" : disabled ? "drained" : "connected";
       const pct = bwmax ? r.bytes / bwmax * 100 : 0;
       const [bv, bu] = rate(r.bytes);
       if (a.connected && a.last_heartbeat_ms) { hbsum += Date.now() - a.last_heartbeat_ms; hbn++; }
@@ -1269,7 +1491,7 @@
       // while its detail is open, the panel has to remain collapsible, and
       // "no longer connected" is itself the answer to what it is working on.
       const open = S.expandedAgent === a.id;
-      return `<tr class="agrow ${off || drained ? "drained" : ""} ${open ? "open" : ""}" data-exp="${esc(a.id)}">
+      return `<tr class="agrow ${off || disabled ? "drained" : ""} ${open ? "open" : ""}" data-exp="${esc(a.id)}">
         <td><div class="ag"><span class="id"><span class="chev">▶</span> ${esc(a.id)}</span><span class="host">${esc(a.hostname || "")} · <span class="st-dot ${stcls}">${sttxt}</span></span></div></td>
         <td>${off ? "—" : countFmt(r.scan)}</td>
         <td>${off ? "—" : countFmt(r.files)}</td>
@@ -1305,6 +1527,7 @@
     if (!items.length) {
       return `<div class="infl">${head}<div class="infl-note">holding no work — idle</div></div>`;
     }
+    const slots = slotBars(items);
     const rows = items.map((it, i) => {
       // running_ms is 0 while an item sits in the agent's own work queue; in
       // that state held_ms is the meaningful number.
@@ -1322,7 +1545,33 @@
         <span class="it">${esc(label)} <b>${esc(dur)}</b>${prog}</span>
       </div>`;
     }).join("");
-    return `<div class="infl">${head}<div class="ifl">${rows}</div></div>`;
+    return `<div class="infl">${head}${slots}<div class="ifl">${rows}</div></div>`;
+  }
+
+  // Walker vs copy slot utilization, approximated from in-flight shard kinds
+  // (chunk shards are copy work; dir/entrylist/dirfix/verify/delete/probe are
+  // walker-ish work). This is a proxy, not a true reading: the agent's copy
+  // and walker thread pools can steal work from each other, so a shard's kind
+  // doesn't map 1:1 onto which pool executed it, and neither the agent's
+  // configured pool sizes nor its queue depth are on the wire today (the
+  // heartbeat carries shard_queue_depth/copy_queue_depth, but the coordinator
+  // doesn't read them yet) — so there is no true denominator to show a
+  // percentage against. Bars here are running-count-of-max, purely relative,
+  // and labelled as an approximation rather than a real utilization figure.
+  function slotBars(items) {
+    const running = items.filter(it => it.running);
+    let walkers = 0, copies = 0;
+    for (const it of running) { if (it.kind === "chunk") copies++; else walkers++; }
+    const max = Math.max(walkers, copies, 1);
+    const bar = (n, label) => `<div class="krow" style="grid-template-columns:70px 1fr 34px">
+      <span class="kn">${label}</span>
+      <span class="kb"><i style="width:${n / max * 100}%"></i></span>
+      <span class="kc">${n}</span>
+    </div>`;
+    return `<div class="infl-note" style="margin:2px 0 6px">
+        slot activity (approx. — by shard kind, not a true pool reading)
+      </div>
+      <div class="kbar" style="margin-bottom:10px">${bar(walkers, "walker")}${bar(copies, "copy")}</div>`;
   }
 
   fleet.addEventListener("click", async e => {
@@ -1806,7 +2055,7 @@
     connectWS(); pollAll(); setInterval(pollAll, POLL_MS);
   }
 
-  renderFeed(); buildFilters(); setConn("", "connecting…"); renderHeader();
+  renderFeed(); buildFilters(); buildJobFilters(); setConn("", "connecting…"); renderHeader();
   (async () => {
     // whoami never 401s, so this alone decides the startup screen: an
     // established session shows the console immediately; a coordinator with
