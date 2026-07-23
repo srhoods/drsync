@@ -4,7 +4,7 @@
 # once at coordinator startup — restart drsyncd after changing it. When the
 # default path (/etc/drsync/auth.yaml) is absent, interactive login is
 # disabled and the WebUI connects straight through with no login screen
-# (open dev mode) — the WebUI has no token-entry UI, so -api-token gates
+# (open dev mode) — the WebUI has no token-entry UI, so -api-token-file gates
 # only the CLI/scripts in that case, not the browser console. A path passed
 # explicitly must exist and validate.
 #

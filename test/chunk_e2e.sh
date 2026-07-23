@@ -31,6 +31,12 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 export DRSYNC_SERVER="$API" DRSYNC_TOKEN=chunktok
+
+# The coordinator reads its bearer token from a file (never a raw CLI
+# value); the file must be 0600 or drsyncd refuses to start.
+API_TOKEN_FILE="$WORK/api-token"
+echo -n chunktok >"$API_TOKEN_FILE"
+chmod 600 "$API_TOKEN_FILE"
 DRSYNC="$ROOT/bin/drsync"
 
 # --- build -------------------------------------------------------------------
@@ -53,7 +59,7 @@ H_MODE=$(stat -c '%a' "$SRC/huge.bin"); H_MTIME=$(stat -c '%Y' "$SRC/huge.bin")
 
 # --- coordinator + 3-agent fleet ---------------------------------------------
 "$ROOT/bin/drsyncd" -data-dir "$WORK/coord" -listen-agent 127.0.0.1:$CP \
-    -listen-http 127.0.0.1:$HP -api-token chunktok -log-level warn \
+    -listen-http 127.0.0.1:$HP -api-token-file "$API_TOKEN_FILE" -log-level warn \
     >"$WORK/coord.log" 2>&1 &
 CPID=$!
 wait_coordinator "$API" "$AUTH" || exit 1

@@ -148,7 +148,7 @@ This is separate from §4's agent mTLS — it secures the **REST API / WebUI**
 listener (`-listen-http`), the port browsers and the CLI talk to.
 
 **Login** (`/etc/drsync/auth.yaml`, absent = disabled, falls back to
-`-api-token` only): authenticate WebUI users against the coordinator host's
+`-api-token-file` only): authenticate WebUI users against the coordinator host's
 own accounts or Active Directory, gated by an allowlist.
 
 ```bash
@@ -184,11 +184,13 @@ Both files are read once at `drsyncd` startup — restart after editing either.
 ### Coordinator
 
 ```bash
+openssl rand -hex 32 > /etc/drsync/api-token && chmod 600 /etc/drsync/api-token
+
 drsyncd \
   -data-dir /var/lib/drsync \
   -listen-agent 0.0.0.0:7440 \
   -listen-http  0.0.0.0:7441 \
-  -api-token "$(cat /etc/drsync/api-token)" \
+  -api-token-file /etc/drsync/api-token \
   -tls-cert /etc/drsync/coord.example.com.crt \
   -tls-key  /etc/drsync/coord.example.com.key \
   -tls-ca   /etc/drsync/ca.crt \
@@ -203,7 +205,7 @@ drsyncd \
 | `-data-dir` | `/var/lib/drsync` | SQLite state store **and** journal segments. Put it on a persistent, reasonably fast local disk. |
 | `-listen-agent` | `:7440` | Agent protocol listener. |
 | `-listen-http` | `:7441` | REST API, `/metrics`, `/healthz`, WebSocket. |
-| `-api-token` | *(empty)* | Bearer token for the REST API. Empty = no auth (dev only). |
+| `-api-token-file` | `/etc/drsync/api-token` | File holding the bearer token for the REST API. Must be **mode 0600** — group- or world-readable is a startup error (`chmod 600` it). The **default path is optional**: if absent, the API runs without token auth (dev only, or interactive login alone). A path given explicitly must exist, be 0600, and contain a non-empty token (surrounding whitespace is trimmed). There is no flag to pass the token as a raw string — see the note below. |
 | `-tls-cert`/`-tls-key`/`-tls-ca` | *(empty)* | **Agent protocol** (`-listen-agent`) server cert/key and the CA bundle used to verify agent client certs. All three or none. |
 | `-auth-config` | `/etc/drsync/auth.yaml` | WebUI/API interactive login (local host accounts or Active Directory) — see `docs/ADMIN.md` §8. The **default path is optional**: if absent, interactive login is disabled and the API stays token-only. A path given explicitly must exist and validate. |
 | `-certs-config` | `/etc/drsync/certs.yaml` | TLS cert/key for the **REST/WebUI listener** (`-listen-http`) — unrelated to `-tls-cert` above. The **default path is optional**: if absent, `-listen-http` serves plain `http://`. A path given explicitly must exist and validate. |
@@ -211,6 +213,18 @@ drsyncd \
 | `-lease-ttl` | `30s` | Shard lease TTL; a dead agent's work is requeued after this. |
 | `-heartbeat-interval` | `5s` | Expected agent heartbeat cadence. |
 | `-log-level` | `info` | `debug`\|`info`\|`warn`\|`error`. |
+
+**Why a file, not a flag value.** The bearer token is read from a file, never
+accepted as a raw `-api-token` string: a command-line argument is visible to
+any local user via `ps`/`/proc`, often ends up committed verbatim in a
+systemd unit file or shell history, and gets logged by process-launch
+auditing. A file readable only by the coordinator avoids all of that.
+`loadAPIToken` (in `coordinator/cmd/drsyncd/main.go`) enforces this at
+startup: it stats the file, refuses to proceed if the mode has any group or
+world bit set (`mode & 0077 != 0`), then reads and trims it. Root still
+bypasses the OS-level permission check when *reading* the file (as always),
+but the check itself catches the actual risk — a token file left world- or
+group-readable for other *local, non-root* accounts to read.
 
 ### 5.1 Email notifications (optional)
 
@@ -292,7 +306,7 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/drsyncd -data-dir /var/lib/drsync \
   -listen-agent 0.0.0.0:7440 -listen-http 0.0.0.0:7441 \
-  -api-token %S/drsync/api-token \
+  -api-token-file /etc/drsync/api-token \
   -tls-cert /etc/drsync/coord.crt -tls-key /etc/drsync/coord.key -tls-ca /etc/drsync/ca.crt
 Restart=always
 RestartSec=2
@@ -300,6 +314,16 @@ StateDirectory=drsync
 
 [Install]
 WantedBy=multi-user.target
+```
+
+`-api-token-file` takes a path to a **file containing** the token, not the
+token itself — `/etc/drsync/api-token` must exist, be owned by whatever user
+runs `drsyncd`, and be mode `0600` (see §5's note above). Generate and secure
+it once:
+
+```bash
+openssl rand -hex 32 > /etc/drsync/api-token
+chmod 600 /etc/drsync/api-token
 ```
 
 `/etc/systemd/system/drsync-agent.service` (each agent host):

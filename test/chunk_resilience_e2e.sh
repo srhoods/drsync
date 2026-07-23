@@ -46,6 +46,12 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 export DRSYNC_SERVER="$API" DRSYNC_TOKEN=restok
+
+# The coordinator reads its bearer token from a file (never a raw CLI
+# value); the file must be 0600 or drsyncd refuses to start.
+API_TOKEN_FILE="$WORK/api-token"
+echo -n restok >"$API_TOKEN_FILE"
+chmod 600 "$API_TOKEN_FILE"
 DRSYNC="$ROOT/bin/drsync"
 
 make -C "$ROOT/agent" -s
@@ -61,7 +67,7 @@ HUGE_SUM=$(sha256sum "$SRC/big.bin" | cut -d' ' -f1)
 
 # Short lease TTL so a dead agent's chunks re-queue within the test's patience.
 "$ROOT/bin/drsyncd" -data-dir "$WORK/coord" -listen-agent 127.0.0.1:$CP \
-    -listen-http 127.0.0.1:$HP -api-token restok -lease-ttl 3s \
+    -listen-http 127.0.0.1:$HP -api-token-file "$API_TOKEN_FILE" -lease-ttl 3s \
     -heartbeat-interval 1s -log-level warn >"$WORK/coord.log" 2>&1 &
 CPID=$!
 wait_coordinator "$API" "$AUTH" || exit 1
