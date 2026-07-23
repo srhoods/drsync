@@ -30,6 +30,10 @@ const JOBS = [
     pass_state: "SCANNING", entries_walked: 10, files_copied: 0,
     bytes_copied: 0, errors: 0, created_at_ms: Date.now() - 9e5,
     updated_at_ms: Date.now() - 8e5 },
+  { name: "ready-job", state: "READY", dry_run: false, pass_count: 0, pass_no: 0,
+    pass_state: "", entries_walked: 0, files_copied: 0,
+    bytes_copied: 0, errors: 0, created_at_ms: Date.now() - 1e4,
+    updated_at_ms: Date.now() - 1e4 },
 ];
 
 const REPORT_WITH_ORPHANS = {
@@ -40,11 +44,16 @@ const CANCELLED_REPORT = {
   ...F.REPORT, job: "cancelled-job", state: "CANCELLED", converged: false,
   orphans_remaining: 0, passes: [],
 };
+const READY_REPORT = {
+  ...F.REPORT, job: "ready-job", state: "READY", converged: false,
+  orphans_remaining: 0, passes: [],
+};
 
 function route(path) {
   if (path === "/api/v1/jobs/finished-job/spec") return { text: SPEC_YAML };
   if (path === "/api/v1/jobs/finished-job/report") return { json: REPORT_WITH_ORPHANS };
   if (path === "/api/v1/jobs/cancelled-job/report") return { json: CANCELLED_REPORT };
+  if (path === "/api/v1/jobs/ready-job/report") return { json: READY_REPORT };
   if (path.includes("/report")) return { json: F.REPORT };
   if (path === "/api/v1/jobs" || path.startsWith("/api/v1/jobs?")) return { json: JOBS };
   if (path.startsWith("/api/v1/queue")) return { json: F.QUEUE };
@@ -229,4 +238,71 @@ test("triggering orphan cleanup requires confirmation, then posts the delete-pas
   const body = JSON.parse(passPost.body);
   assert.equal(body.delete, true);
   assert.equal(body.confirm, "finished-job");
+});
+
+// --------------------------------------------------------------------------
+// Cancel a job that hasn't started yet
+// --------------------------------------------------------------------------
+
+test("a Ready job offers cancel (the endpoint has no state gate server-side)", async () => {
+  const row = c.$$("#joblist .jrow").find(r => r.dataset.job === "ready-job");
+  row.click();
+  await c.tick(300);
+  const btn = c.$$("#detail button[data-ja='cancel']")[0];
+  assert.ok(btn, "cancel button missing for a Ready job");
+});
+
+test("cancelling a Ready job confirms, then posts the cancel endpoint", async () => {
+  const row = c.$$("#joblist .jrow").find(r => r.dataset.job === "ready-job");
+  row.click();
+  await c.tick(300);
+  const btn = c.$$("#detail button[data-ja='cancel']")[0];
+  btn.click();
+  await c.tick(150);
+  assert.equal(c.$("#modal").hidden, false, "confirmation dialog should appear");
+  // The Ready-job cancel dialog needs no typed echo (unlike delete-pass/purge).
+  assert.equal(c.$("#modal-ok").disabled, false);
+  c.$("#modal-ok").click();
+  await c.tick(300);
+  const cancelPost = requests.post.find(r => r.path === "/api/v1/jobs/ready-job/cancel");
+  assert.ok(cancelPost, "expected a POST to the cancel endpoint");
+});
+
+// --------------------------------------------------------------------------
+// Purge
+// --------------------------------------------------------------------------
+
+test("purge is offered for Completed and Cancelled jobs", async () => {
+  for (const name of ["finished-job", "cancelled-job"]) {
+    const row = c.$$("#joblist .jrow").find(r => r.dataset.job === name);
+    row.click();
+    await c.tick(300);
+    assert.equal(c.$$("#detail button[data-ja='purge']").length, 1, `purge missing for ${name}`);
+  }
+});
+
+test("purge is not offered for Ready, Running or Paused jobs", async () => {
+  for (const name of ["ready-job", "alpha", F.XSS]) {
+    const row = c.$$("#joblist .jrow").find(r => r.dataset.job === name);
+    row.click();
+    await c.tick(300);
+    assert.equal(c.$$("#detail button[data-ja='purge']").length, 0, `purge wrongly offered for ${name}`);
+  }
+});
+
+test("purging a job requires echoing its name, then sends DELETE /api/v1/jobs/{name}", async () => {
+  const row = c.$$("#joblist .jrow").find(r => r.dataset.job === "cancelled-job");
+  row.click();
+  await c.tick(300);
+  const btn = c.$$("#detail button[data-ja='purge']")[0];
+  btn.click();
+  await c.tick(150);
+  assert.equal(c.$("#modal").hidden, false, "confirmation dialog should appear");
+  assert.equal(c.$("#modal-ok").disabled, true, "purge should require typing the job name");
+  c.$("#modal-input").value = "cancelled-job";
+  c.$("#modal-input").dispatchEvent(new c.window.Event("input", { bubbles: true }));
+  c.$("#modal-ok").click();
+  await c.tick(300);
+  const del = requests.post.find(r => r.path === "/api/v1/jobs/cancelled-job" && r.method === "DELETE");
+  assert.ok(del, "expected a DELETE to /api/v1/jobs/cancelled-job");
 });

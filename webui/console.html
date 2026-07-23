@@ -858,9 +858,10 @@
   // with a 4xx (a job in the wrong state, a destination conflict, a parked
   // shard that already moved on); surface that text verbatim rather than a
   // generic failure, because it is written to be read by an operator.
-  async function post(path, body) {
+  async function post(path, body) { return write("POST", path, body); }
+  async function write(method, path, body) {
     const res = await fetch(path, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method, headers: { "Content-Type": "application/json" },
       cache: "no-store", credentials: "same-origin",
       body: body === undefined ? null : JSON.stringify(body),
     });
@@ -916,10 +917,10 @@
 
   // Runs one write action: disables the button, reports the outcome, and
   // refreshes so the UI reflects the new state without waiting for the poll.
-  async function act(btn, path, body, okMsg) {
+  async function act(btn, path, body, okMsg, method) {
     if (btn) { btn.disabled = true; btn.classList.add("busy"); }
     try {
-      await post(path, body);
+      await write(method || "POST", path, body);
       toast(okMsg, "ok");
       await pollAll();
     } catch (e) {
@@ -1233,14 +1234,23 @@
   // ---------- job actions ----------
   // Which controls a job offers is a function of its lifecycle state, so the
   // console never presents a transition the coordinator would refuse: READY
-  // starts, RUNNING pauses/cancels, PAUSED resumes, terminal states offer only
-  // the report download (plus resubmit, and an orphan-cleanup nudge if the
+  // starts or cancels (the cancel endpoint has no state gate server-side —
+  // abandoning a job that never ran is exactly what it's for), RUNNING
+  // pauses/cancels, PAUSED resumes/cancels, terminal states offer only the
+  // report download (plus resubmit, purge, and an orphan-cleanup nudge if the
   // job finished with orphans still on disk). "view settings" is offered for
   // every job — it's read-only, so no state restricts it.
   const RESUBMITTABLE = { COMPLETED: true, CANCELLED: true, FAILED: true };
+  // Purge is only ever offered for a job the coordinator considers terminal
+  // (store.TerminalJobState: COMPLETED/CANCELLED/FAILED) — a Ready job must
+  // be cancelled first, which is why Ready also gets a cancel button above.
+  const PURGEABLE = { COMPLETED: true, CANCELLED: true, FAILED: true };
   function jobActions(state, orphansRemaining) {
     const b = [];
-    if (state === "READY" || state === "CREATED") b.push(`<button class="abtn go" data-ja="start">▶ start</button>`);
+    if (state === "READY" || state === "CREATED") {
+      b.push(`<button class="abtn go" data-ja="start">▶ start</button>`);
+      b.push(`<button class="abtn danger" data-ja="cancel">✕ cancel</button>`);
+    }
     if (state === "RUNNING") b.push(`<button class="abtn" data-ja="pause">⏸ pause</button>`);
     if (state === "PAUSED") b.push(`<button class="abtn go" data-ja="resume">▶ resume</button>`);
     if (state === "RUNNING" || state === "PAUSED") {
@@ -1254,6 +1264,7 @@
     if (RESUBMITTABLE[state]) b.push(`<button class="abtn go" data-ja="resubmit">↻ resubmit</button>`);
     b.push(`<button class="abtn" data-ja="viewspec">⚙ settings</button>`);
     b.push(`<button class="abtn" data-ja="report">⤓ report</button>`);
+    if (PURGEABLE[state]) b.push(`<button class="abtn danger" data-ja="purge">🗑 purge</button>`);
     return b.join("");
   }
 
@@ -1391,12 +1402,30 @@
       case "resubmit": return openResubmit(name);
       case "viewspec": return openViewSpec(name);
       case "cancel": {
+        // A Ready job never granted any work, so there's nothing to drain —
+        // the RUNNING/PAUSED wording would be misleading here.
+        const notStarted = (S.report && S.report.state) === "READY" || (S.report && S.report.state) === "CREATED";
         const ok = await confirmAction({
           title: "Cancel job",
-          text: `Cancel <b>${esc(name)}</b>? In-flight leases drain, no new work is granted, and the job cannot be resumed — only re-submitted.`,
+          text: notStarted
+            ? `Cancel <b>${esc(name)}</b> before it starts? The job cannot be resumed — only re-submitted.`
+            : `Cancel <b>${esc(name)}</b>? In-flight leases drain, no new work is granted, and the job cannot be resumed — only re-submitted.`,
           okLabel: "cancel job",
         });
         return ok && act(btn, u + "/cancel", undefined, `cancelled ${name}`);
+      }
+      case "purge": {
+        const ok = await confirmAction({
+          title: "Purge job",
+          text: `Permanently remove <b>${esc(name)}</b> and its journal? This cannot be undone, and the name becomes free for a new job.`,
+          okLabel: "purge job", echo: name,
+        });
+        if (!ok) return;
+        // Deselect before the refresh that follows a successful purge, so
+        // pollAll doesn't try to re-fetch a report for a job that's gone —
+        // it'll fall back to whatever job is next (or none).
+        if (S.selected === name) S.selected = null;
+        return act(btn, u, undefined, `purged ${name}`, "DELETE");
       }
       case "delpass": {
         const ok = await confirmAction({

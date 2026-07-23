@@ -51,11 +51,13 @@ populate after the second poll.
   with the shipped job template, editable, with Submit / Submit and start job
   / Cancel; a selected-job detail with the **convergence curve** (Δfiles per
   pass → zero-delta fixpoint), the per-pass ledger incl. the TOTAL row, and
-  the job's lifecycle controls — plus **settings** (view the YAML a job was
-  submitted with, read-only, any state), **resubmit** (Completed / Cancelled /
-  Failed jobs only — reopens the same dialog pre-filled with that job's
-  settings and an incremented job name) and, for a Completed job whose last
-  scan still has orphans on disk, a **clean up N orphans** action (the
+  the job's lifecycle controls (Ready can now cancel, not just start — see
+  Operator actions) — plus **settings** (view the YAML a job was submitted
+  with, read-only, any state), **resubmit** (Completed / Cancelled / Failed
+  jobs only — reopens the same dialog pre-filled with that job's settings and
+  an incremented job name), **purge** (Completed / Cancelled / Failed only —
+  permanently removes the job and its journal) and, for a Completed job whose
+  last scan still has orphans on disk, a **clean up N orphans** action (the
   existing delete-pass endpoint, confirm-gated the same way); a live
   aggregate-throughput timeline; the **Fleet** table (per-agent scan/s,
   files/s, throughput, RSS, heartbeat, drain state and drain/resume control) —
@@ -88,6 +90,7 @@ offers the transitions the job's current state permits.
 | view job settings | `GET /api/v1/jobs/{name}/spec` (read-only) |
 | start / pause / resume / cancel | `POST /api/v1/jobs/{name}/{action}` |
 | trigger pass, trigger delete pass, clean up orphans | `POST /api/v1/jobs/{name}/passes` |
+| purge (Completed / Cancelled / Failed only) | `DELETE /api/v1/jobs/{name}` |
 | drain / resume an agent | `POST /api/v1/agents/{id}/{disable,enable}` |
 | retry / drop a parked shard | `POST /api/v1/parked/{id}/{retry,drop}` |
 | retry / drop all parked of a job | `POST /api/v1/jobs/{name}/parked/{retry,drop}` |
@@ -99,11 +102,22 @@ Completed job whenever its report's `orphans_remaining` is non-zero — the
 underlying action was already there for running jobs, this only exposes it
 for the terminal case operators actually hit it in.
 
-Destructive actions open a confirm dialog. The two that lose data
-irrecoverably — the **delete pass** and **drop parked shards** — additionally
-require typing the job name, mirroring the API's own `confirm` gate. Failures
-are surfaced verbatim from the API's `{"error": …}` body, because those
-messages are written to be read by an operator.
+**Cancel is offered on a Ready job, not just Running/Paused.** The cancel
+endpoint has no state gate on the coordinator side — it always just sets the
+job to CANCELLED — so cancelling a job that never started is already a valid
+call, this only makes the button reachable for that state too. It's also the
+only way to make a Ready job purgeable: **purge** targets `DELETE
+/api/v1/jobs/{name}`, which the coordinator only permits once a job is
+terminal (Completed/Cancelled/Failed — `store.TerminalJobState`), so a Ready
+job must be cancelled first.
+
+Destructive actions open a confirm dialog. The ones that lose data
+irrecoverably — **delete pass**, **drop parked shards**, and **purge** —
+additionally require typing the job name, mirroring the API's own `confirm`
+gate (purge has no server-side confirm field, but the console asks anyway
+since deleting a job's rows and journal is unrecoverable). Failures are
+surfaced verbatim from the API's `{"error": …}` body, because those messages
+are written to be read by an operator.
 
 ## Data mapping
 
