@@ -67,6 +67,28 @@ type JobReport struct {
 	ParkedShards     int
 }
 
+// ParkedShardRow is one shard sidelined at its attempt ceiling, as listed in
+// the parked-shards alert email.
+type ParkedShardRow struct {
+	PassNo    int
+	Kind      string
+	RelPath   string
+	Attempt   int
+	Error     string
+	LastAgent string
+}
+
+// ParkedShardsReport is the data for the "job ended with parked shards"
+// alert email — sent whenever a job run ends (converged, hit the pass
+// ceiling, or a delete pass finished) with shards still parked, independent
+// of whether the job spec opts into the routine on_job_complete summary.
+type ParkedShardsReport struct {
+	Job    string
+	Src    string
+	Dst    string
+	Shards []ParkedShardRow
+}
+
 // Palette — a restrained, professional set reused across both templates.
 const (
 	colInk    = "#1f2933" // primary text / header band
@@ -188,6 +210,96 @@ func jobStatus(r JobReport) (string, string) {
 }
 
 // ---------------------------------------------------------------------------
+// Parked-shards alert email
+// ---------------------------------------------------------------------------
+
+// renderParkedShards builds the dedicated alert sent whenever a job run ends
+// with shards still parked at their attempt ceiling — independent of the
+// on_job_complete summary, since a parked shard is an operator action item
+// (retry after fixing the cause, or drop it) rather than routine reporting.
+func renderParkedShards(r ParkedShardsReport) (subject, htmlBody, textBody string) {
+	subject = fmt.Sprintf("%s — %d shard(s) parked, operator attention required", r.Job, len(r.Shards))
+	note := fmt.Sprintf(
+		"%d shard(s) hit their retry ceiling and are parked. Review with `drsync queue` "+
+			"or the WebUI's Queue & shards view, then `drsync queue retry <shard-id>` "+
+			"(after fixing the underlying cause) or `drsync queue drop <shard-id>` to "+
+			"accept the gap.", len(r.Shards))
+
+	htmlBody = htmlDoc(r.Job, r.Src, r.Dst, "Shards parked — action required", "needs attention", colAmber,
+		false, note, "", parkedShardsHTML(r.Shards))
+	textBody = parkedShardsText(r.Job, r.Src, r.Dst, note, r.Shards)
+	return
+}
+
+func parkedShardsHTML(shards []ParkedShardRow) string {
+	if len(shards) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<div style="font-size:13px;font-weight:600;color:%s;padding:6px 0 8px 0;">Parked shards</div>`, colInk)
+	fmt.Fprintf(&b, `<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid %s;border-radius:8px;overflow:hidden;font-size:12px;">`, colLine)
+	headers := []string{"Pass", "Kind", "Path", "Attempts", "Last agent", "Error"}
+	fmt.Fprintf(&b, `<tr style="background:%s;">`, colInk)
+	for _, h := range headers {
+		fmt.Fprintf(&b, `<td align="left" style="padding:8px 12px;color:#ffffff;font-weight:600;">%s</td>`, html.EscapeString(h))
+	}
+	b.WriteString(`</tr>`)
+	for i, sh := range shards {
+		bg := "#ffffff"
+		if i%2 == 1 {
+			bg = colPanel
+		}
+		cells := []string{
+			fmt.Sprintf("%d", sh.PassNo), sh.Kind, sh.RelPath,
+			fmt.Sprintf("%d", sh.Attempt), sh.LastAgent, sh.Error,
+		}
+		fmt.Fprintf(&b, `<tr style="background:%s;">`, bg)
+		for ci, v := range cells {
+			color := colMuted
+			style := ""
+			if ci == 2 { // path
+				color = colInk
+				style = "font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;"
+			} else if ci == 5 { // error
+				color = colRed
+			}
+			fmt.Fprintf(&b, `<td align="left" style="padding:8px 12px;color:%s;border-top:1px solid %s;%s">%s</td>`,
+				color, colLine, style, html.EscapeString(v))
+		}
+		b.WriteString(`</tr>`)
+	}
+	b.WriteString(`</table>`)
+	return b.String()
+}
+
+func parkedShardsText(job, src, dst, note string, shards []ParkedShardRow) string {
+	var b strings.Builder
+	b.WriteString("drsync — Shards parked, action required\n")
+	fmt.Fprintf(&b, "job: %s\n", job)
+	if src != "" {
+		fmt.Fprintf(&b, "source: %s\n", src)
+	}
+	if dst != "" {
+		fmt.Fprintf(&b, "destination: %s\n", dst)
+	}
+	b.WriteString(strings.Repeat("-", 44) + "\n")
+	if len(shards) > 0 {
+		b.WriteString("\nParked shards:\n")
+		b.WriteString("  pass  kind        path                                     attempts  last agent    error\n")
+		for _, sh := range shards {
+			fmt.Fprintf(&b, "  %-4d  %-10s  %-40s  %8d  %-12s  %s\n",
+				sh.PassNo, truncate(sh.Kind, 10), truncate(sh.RelPath, 40), sh.Attempt,
+				truncate(sh.LastAgent, 12), sh.Error)
+		}
+	}
+	if note != "" {
+		fmt.Fprintf(&b, "\n%s\n", note)
+	}
+	b.WriteString("\n--\nAutomated message from the drsync coordinator.\n")
+	return b.String()
+}
+
+// ---------------------------------------------------------------------------
 // HTML rendering — table-based, inline styles (email-client safe)
 // ---------------------------------------------------------------------------
 
@@ -277,7 +389,7 @@ func passTrajectoryHTML(passes []JobPass) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `<div style="font-size:13px;font-weight:600;color:%s;padding:6px 0 8px 0;">Pass trajectory</div>`, colInk)
 	fmt.Fprintf(&b, `<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid %s;border-radius:8px;overflow:hidden;font-size:12px;">`, colLine)
-	headers := []string{"Pass", "State", "Δ files", "Δ bytes", "Orphans", "Verify", "Errors"}
+	headers := []string{"Pass", "State", "Duration", "Δ files", "Δ bytes", "Orphans", "Verify", "Errors"}
 	fmt.Fprintf(&b, `<tr style="background:%s;">`, colInk)
 	for i, h := range headers {
 		align := "left"
@@ -302,6 +414,7 @@ func passTrajectoryHTML(passes []JobPass) string {
 		}{
 			{label, "left"},
 			{p.State, "left"},
+			{humanDuration(p.DurationMS), "right"},
 			{commas(p.DeltaFiles), "right"},
 			{humanBytes(p.DeltaBytes), "right"},
 			{commas(p.Orphans), "right"},
@@ -353,14 +466,14 @@ func textDoc(job, src, dst, title, statusText string, dryRun bool, note string, 
 	}
 	if len(passes) > 0 {
 		b.WriteString("\nPass trajectory:\n")
-		b.WriteString("  pass  state       Δfiles      Δbytes  orphans  verify        errors\n")
+		b.WriteString("  pass  state       duration      Δfiles      Δbytes  orphans  verify        errors\n")
 		for _, p := range passes {
 			label := fmt.Sprintf("%d", p.PassNo)
 			if p.IsDelete {
 				label += "d"
 			}
-			fmt.Fprintf(&b, "  %-4s  %-10s  %8s  %10s  %7s  %-12s  %6s\n",
-				label, truncate(p.State, 10), commas(p.DeltaFiles), humanBytes(p.DeltaBytes),
+			fmt.Fprintf(&b, "  %-4s  %-10s  %8s  %8s  %10s  %7s  %-12s  %6s\n",
+				label, truncate(p.State, 10), humanDuration(p.DurationMS), commas(p.DeltaFiles), humanBytes(p.DeltaBytes),
 				commas(p.Orphans), verifyText(p.VerifyOK, p.VerifyFail), commas(p.Errors))
 		}
 	}

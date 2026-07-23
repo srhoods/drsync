@@ -101,3 +101,7 @@ spec:
       - ops@example.com
     on_pass_complete: false          # email as each pass finishes (the convergence trace)
     on_job_complete: false           # one summary email when the job reaches COMPLETED
+                                      #   (per-pass table includes each pass's duration)
+    # Parked-shard alerts are NOT a flag here: as soon as any shard hits its
+    # retry ceiling, `recipients` above gets an email automatically (batched
+    # per job per check), independent of the two flags — see DESIGN-jobspec.md §1.2.

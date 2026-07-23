@@ -42,10 +42,14 @@ idles), the shard is still granted rather than stranded. A shard that fails its
 max attempts is **parked** for operator attention rather than retried forever.
 
 **Resolving parked shards.** A parked shard blocks its pass (and thus the job)
-from completing — the coordinator will not silently skip work. List parked
-shards with `drsync queue`; fix the underlying cause (remount, permissions,
-etc.); then either **retry** them for a fresh attempt or **drop** them to accept
-the gap and let the pass finish:
+from completing — the coordinator will not silently skip work. If the job spec
+sets `notifications.recipients`, an email fires automatically as soon as a
+shard parks (batched per job — several shards parking together, e.g. a mount
+going unhealthy mid-walk, arrive as one email, not one per shard), independent
+of `on_pass_complete`/`on_job_complete`; see DESIGN-jobspec.md §1.2. List
+parked shards with `drsync queue`; fix the underlying cause (remount,
+permissions, etc.); then either **retry** them for a fresh attempt or **drop**
+them to accept the gap and let the pass finish:
 
 ```
 drsync queue retry <shard-id>      # requeue one shard (attempt reset; any agent)

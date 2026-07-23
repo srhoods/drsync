@@ -158,6 +158,18 @@ func (s *Sender) JobComplete(recipients []string, r JobReport) {
 	s.sendAsync(recipients, subject, htmlBody, textBody)
 }
 
+// ParkedShards emails a dedicated alert to recipients when a job run ends
+// with shards still parked. Best-effort/async, and independent of
+// on_job_complete — a parked shard is an operator action item, not routine
+// completion reporting, so it is not gated behind that flag.
+func (s *Sender) ParkedShards(recipients []string, r ParkedShardsReport) {
+	if !s.Enabled() || len(recipients) == 0 || len(r.Shards) == 0 {
+		return
+	}
+	subject, htmlBody, textBody := renderParkedShards(r)
+	s.sendAsync(recipients, subject, htmlBody, textBody)
+}
+
 func (s *Sender) sendAsync(to []string, subject, htmlBody, textBody string) {
 	full := subject
 	if s.cfg.SubjectPrefix != "" {

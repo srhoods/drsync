@@ -130,12 +130,20 @@ type JobSpec struct {
 // does not, these flags are inert (the coordinator logs a warning). Sending is
 // always best-effort and never affects job outcome.
 type NotificationSpec struct {
-	// Recipients receive every notification for the job (To: header).
+	// Recipients receive every notification for the job (To: header),
+	// including the parked-shard alert below.
 	Recipients []string `yaml:"recipients,omitempty"`
 	// OnPassComplete sends a mail as each pass finishes (the convergence trace).
 	OnPassComplete bool `yaml:"on_pass_complete,omitempty"`
 	// OnJobComplete sends a single summary mail when the job reaches COMPLETED.
 	OnJobComplete bool `yaml:"on_job_complete,omitempty"`
+	// Parked-shard alerts are NOT gated by a flag here: whenever a shard is
+	// newly parked (retry ceiling hit), the coordinator emails Recipients
+	// automatically, independent of OnPassComplete/OnJobComplete — a parked
+	// shard is an operator action item, not routine progress reporting, and
+	// can stall the job indefinitely (passctrl won't cross a phase boundary
+	// while any of that phase's shards are parked), so it can't simply wait
+	// for job completion. See passctrl.checkParkedShards.
 }
 
 // Enabled reports whether the spec asks for any email at all.
