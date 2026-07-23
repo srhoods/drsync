@@ -309,7 +309,8 @@ POST   /api/v1/logout                  clear the session cookie
 GET    /api/v1/whoami                  current session identity + whether login is configured
 ```
 
-- Auth: a bearer token (`-api-token`), and/or interactive login backed by
+- Auth: a bearer token (`-api-token-file`, a mode-0600 file — never a raw
+  command-line value), and/or interactive login backed by
   local host accounts or Active Directory (`/etc/drsync/auth.yaml`, gated by a
   username/group allowlist) that issues a signed, `HttpOnly`/`SameSite=Lax`
   session cookie — either credential is accepted on every protected endpoint.

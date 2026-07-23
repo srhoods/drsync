@@ -575,11 +575,15 @@ REST/WebUI listener (`-listen-http`), plus TLS for that same listener. None of
 this affects the agent protocol port (`-listen-agent`), which keeps its own
 mTLS story (`drsync ca`, §3 "Certificates").
 
-**Bearer token** (`-api-token TOKEN`) — unchanged from before: every request
-needs `Authorization: Bearer TOKEN` (or `?token=` for the WebSocket). Good for
-scripts/CI and for the CLI (`DRSYNC_TOKEN`/`--token`). The WebUI does **not**
-offer a way to enter or store this token — it authenticates only via
-interactive login below, never a bearer token typed into the browser.
+**Bearer token** (`-api-token-file /etc/drsync/api-token`, default path) —
+every request needs `Authorization: Bearer TOKEN` (or `?token=` for the
+WebSocket). Good for scripts/CI and for the CLI (`DRSYNC_TOKEN`/`--token`).
+The WebUI does **not** offer a way to enter or store this token — it
+authenticates only via interactive login below, never a bearer token typed
+into the browser. The token is read from a **file**, not a command-line flag
+(a daemon's argv is visible fleet-wide via `ps`/`/proc`); the file must be
+mode `0600` — drsyncd refuses to start if it is group- or world-readable. See
+INSTALL.md §5 for setup.
 
 **Interactive login** (`/etc/drsync/auth.yaml`, absent by default = disabled) —
 adds a WebUI login screen backed by either the coordinator host's own accounts
@@ -623,8 +627,8 @@ allow:
 - An absent `/etc/drsync/auth.yaml` (the default) disables interactive login
   entirely; the WebUI then connects straight through with no login screen
   (open dev mode, matching prior behaviour) — the coordinator's REST API
-  itself may still be open or bearer-token-gated per `-api-token`, but that
-  token has no UI to enter it in.
+  itself may still be open or bearer-token-gated per `-api-token-file`, but
+  that token has no UI to enter it in.
 
 **HTTP(S) listener TLS** (`/etc/drsync/certs.yaml`, absent by default =
 plain `http://`):

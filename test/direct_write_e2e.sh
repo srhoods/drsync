@@ -28,6 +28,12 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 export DRSYNC_SERVER="$API" DRSYNC_TOKEN=dwtoken
+
+# The coordinator reads its bearer token from a file (never a raw CLI
+# value); the file must be 0600 or drsyncd refuses to start.
+API_TOKEN_FILE="$WORK/api-token"
+echo -n dwtoken >"$API_TOKEN_FILE"
+chmod 600 "$API_TOKEN_FILE"
 DRSYNC="$ROOT/bin/drsync"
 
 # --- build -------------------------------------------------------------------
@@ -52,7 +58,7 @@ chmod 0640 "$SRC/f0001.txt"
 
 # --- services ----------------------------------------------------------------
 "$ROOT/bin/drsyncd" -data-dir "$WORK/coord" -listen-agent 127.0.0.1:$COORD_PORT \
-    -listen-http 127.0.0.1:$HTTP_PORT -api-token dwtoken -log-level warn \
+    -listen-http 127.0.0.1:$HTTP_PORT -api-token-file "$API_TOKEN_FILE" -log-level warn \
     >"$WORK/coord.log" 2>&1 &
 COORD_PID=$!
 wait_coordinator "$API" "$AUTH" || exit 1

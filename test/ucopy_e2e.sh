@@ -38,6 +38,12 @@ make -C "$ROOT/agent" -s
 DRSYNC="$ROOT/bin/drsync"
 export DRSYNC_SERVER="$API" DRSYNC_TOKEN=e2etoken
 
+# The coordinator reads its bearer token from a file (never a raw CLI
+# value); the file must be 0600 or drsyncd refuses to start.
+API_TOKEN_FILE="$WORK/api-token"
+echo -n e2etoken >"$API_TOKEN_FILE"
+chmod 600 "$API_TOKEN_FILE"
+
 # --- source files spanning the block boundary (1 MiB buffer) -----------------
 SRC="$WORK/src" DST="$WORK/dst"
 mkdir -p "$SRC"
@@ -51,7 +57,7 @@ head -c 5242883  /dev/urandom > "$SRC/multi.bin"       # ~5 blocks, odd tail
 # --- services ----------------------------------------------------------------
 "$ROOT/bin/drsyncd" -data-dir "$WORK/coord" \
     -listen-agent "127.0.0.1:${COORD_PORT}" -listen-http "127.0.0.1:${HTTP_PORT}" \
-    -api-token e2etoken -log-level warn >"$WORK/coord.log" 2>&1 &
+    -api-token-file "$API_TOKEN_FILE" -log-level warn >"$WORK/coord.log" 2>&1 &
 COORD_PID=$!
 wait_coordinator "$API" "$AUTH" || exit 1
 
