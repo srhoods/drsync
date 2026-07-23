@@ -7,7 +7,7 @@ export PATH := $(GOBIN):$(PATH)
 # it is also the name of a directory. Without .PHONY, make sees that directory,
 # considers the target up to date, and silently skips the build — so on a fresh
 # clone `make build` produced no agent binary and e2e failed at agent launch.
-.PHONY: all proto build agent fsprobe test test-all webui-test e2e vet clean tools
+.PHONY: all proto build agent fsprobe genfixture test test-all webui-test e2e vet clean tools
 
 all: proto build test
 
@@ -34,6 +34,13 @@ agent:
 fsprobe:
 	$(MAKE) -C tools/fsprobe
 	@mkdir -p bin && cp tools/fsprobe/fsprobe bin/
+
+# Synthetic fidelity-test tree generator (docs/DESIGN-agent.md §9). Also
+# standalone; ships to a source host to build the tree a real sync is tested
+# against. See tools/genfixture/README.md.
+genfixture:
+	$(MAKE) -C tools/genfixture
+	@mkdir -p bin && cp tools/genfixture/genfixture bin/
 
 test:
 	go test ./...
