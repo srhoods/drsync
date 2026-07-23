@@ -98,7 +98,11 @@ CERTIFICATES (mTLS; local, no server needed)
   ca init [--dir D] [--cn NAME] [--days N]
   ca issue --type server|agent --cn NAME [--dir D] [--dns H]... [--ip A]... [--days N]
 
-CONNECTION (every command except 'ca')
+HTTP(S) CERTIFICATE (coordinator's WebUI/API listener; local, no server needed)
+  cert generate-self-signed [--cn NAME] [--dns H]... [--ip A]... [--out DIR] [--days N]
+        Dev/test only. Writes server.crt/server.key; point certs.yaml at them.
+
+CONNECTION (every command except 'ca'/'cert')
   --server URL     coordinator base URL   (or $DRSYNC_SERVER; default http://127.0.0.1:7441)
   --token  TOKEN   API bearer token       (or $DRSYNC_TOKEN)
 
@@ -131,6 +135,8 @@ func main() {
 		err = cmdEvents(os.Args[2:])
 	case "ca":
 		err = cmdCA(os.Args[2:])
+	case "cert":
+		err = cmdCert(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:

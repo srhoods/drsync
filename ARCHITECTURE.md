@@ -324,7 +324,12 @@ drsync-agent
 
 - mTLS between agents and coordinator (per-agent certs, simple internal CA bootstrapped
   by `drsync ca init`).
-- REST API: token auth initially, SSO/OIDC when the WebUI lands.
+- REST API / WebUI: bearer token, and/or interactive login (local host accounts
+  via `/etc/shadow`, or Active Directory via LDAP bind) gated by a username/group
+  allowlist, backed by a signed session cookie (`/etc/drsync/auth.yaml`). The
+  listener itself is plain HTTP by default and switches to HTTPS when a cert/key
+  pair is configured (`/etc/drsync/certs.yaml`). OIDC/SSO remains a possible
+  future addition.
 - Agents run as root but **only** touch configured src/dst roots (paths validated,
   `openat`-anchored — no path traversal outside the roots even via hostile symlinks:
   all traversal uses `O_NOFOLLOW` + fd-relative ops).

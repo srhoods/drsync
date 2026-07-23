@@ -142,6 +142,43 @@ flags and both the coordinator and agents log a loud plaintext warning.
 
 ---
 
+## 4a. Set up WebUI/API login and HTTPS (recommended for any real deployment)
+
+This is separate from §4's agent mTLS — it secures the **REST API / WebUI**
+listener (`-listen-http`), the port browsers and the CLI talk to.
+
+**Login** (`/etc/drsync/auth.yaml`, absent = disabled, falls back to
+`-api-token` only): authenticate WebUI users against the coordinator host's
+own accounts or Active Directory, gated by an allowlist.
+
+```bash
+sudo install -m 600 -o root docs/auth.yaml.example /etc/drsync/auth.yaml
+sudo vi /etc/drsync/auth.yaml   # set mode, allow.users/groups, and (mode: ad) ldap:
+```
+
+See `docs/ADMIN.md` §8 for the full local-vs-AD walkthrough.
+
+**HTTPS** (`/etc/drsync/certs.yaml`, absent = plain `http://`): serve the
+listener over TLS.
+
+```bash
+# quick self-signed pair for dev/test:
+drsync cert generate-self-signed --cn coord.example.com \
+    --dns coord.example.com --ip 10.0.0.10 --out /etc/drsync
+
+cat > /etc/drsync/certs.yaml <<EOF
+cert_file: /etc/drsync/server.crt
+key_file: /etc/drsync/server.key
+EOF
+```
+
+For production, replace `server.crt`/`server.key` with a cert issued by your
+organization's CA rather than the self-signed pair.
+
+Both files are read once at `drsyncd` startup — restart after editing either.
+
+---
+
 ## 5. Run
 
 ### Coordinator
@@ -155,6 +192,8 @@ drsyncd \
   -tls-cert /etc/drsync/coord.example.com.crt \
   -tls-key  /etc/drsync/coord.example.com.key \
   -tls-ca   /etc/drsync/ca.crt \
+  -auth-config /etc/drsync/auth.yaml \
+  -certs-config /etc/drsync/certs.yaml \
   -smtp-config /etc/drsync/smtp.yaml \
   -lease-ttl 30s -heartbeat-interval 5s -log-level info
 ```
@@ -165,7 +204,9 @@ drsyncd \
 | `-listen-agent` | `:7440` | Agent protocol listener. |
 | `-listen-http` | `:7441` | REST API, `/metrics`, `/healthz`, WebSocket. |
 | `-api-token` | *(empty)* | Bearer token for the REST API. Empty = no auth (dev only). |
-| `-tls-cert`/`-tls-key`/`-tls-ca` | *(empty)* | Server cert/key and the CA bundle used to verify agent client certs. All three or none. |
+| `-tls-cert`/`-tls-key`/`-tls-ca` | *(empty)* | **Agent protocol** (`-listen-agent`) server cert/key and the CA bundle used to verify agent client certs. All three or none. |
+| `-auth-config` | `/etc/drsync/auth.yaml` | WebUI/API interactive login (local host accounts or Active Directory) — see `docs/ADMIN.md` §8. The **default path is optional**: if absent, interactive login is disabled and the API stays token-only. A path given explicitly must exist and validate. |
+| `-certs-config` | `/etc/drsync/certs.yaml` | TLS cert/key for the **REST/WebUI listener** (`-listen-http`) — unrelated to `-tls-cert` above. The **default path is optional**: if absent, `-listen-http` serves plain `http://`. A path given explicitly must exist and validate. |
 | `-smtp-config` | `/etc/drsync/smtp.yaml` | SMTP server settings for email notifications. The **default path is optional**: if it is absent, notifications are silently disabled. A path given explicitly must exist and validate. |
 | `-lease-ttl` | `30s` | Shard lease TTL; a dead agent's work is requeued after this. |
 | `-heartbeat-interval` | `5s` | Expected agent heartbeat cadence. |
@@ -328,6 +369,10 @@ Do these in order the first time you stand up a fleet.
 curl -fsS http://coord.example.com:7441/healthz        # → ok
 curl -fsS http://coord.example.com:7441/metrics | head # Prometheus exposition
 ```
+
+(If `-listen-http` is serving HTTPS via `/etc/drsync/certs.yaml`, use
+`https://` — and `curl -k` for a self-signed dev cert the client hasn't been
+told to trust.)
 
 ### 7.2 Agents registered (mTLS handshake succeeded)
 

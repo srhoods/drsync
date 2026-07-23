@@ -16,14 +16,22 @@ drsyncd -listen-http :7441 …      # then browse to
 http://<coordinator>:7441/        # (also /ui)
 ```
 
-Served same-origin, `fetch`/WebSocket calls need no configuration. If the
-coordinator sets `-api-token`, open **⚙ connection** (top right) and paste the
-token — it is stored in `localStorage` and sent as a bearer token; the events
-WebSocket receives it as a `?token=` query parameter.
+Served same-origin, `fetch`/WebSocket calls need no configuration — the
+console always talks to the host it was loaded from. There is no
+coordinator-URL override and no API-token entry anywhere in the UI: an
+operator cannot point their browser at a different coordinator, and the only
+credential the WebUI itself deals with is a session cookie from signing in.
+(The bearer token remains available for the CLI and scripts — see
+`docs/ADMIN.md` §"Authentication & TLS" — but the WebUI never surfaces it.)
 
-You can also open `webui/console.html` directly from disk against a remote
-coordinator: use **⚙ connection** to set the coordinator URL (and token). The
-coordinator sends permissive CORS headers so this cross-origin case works too.
+If the coordinator has interactive login configured (`/etc/drsync/auth.yaml` —
+local host accounts or Active Directory), the console shows a **login
+screen** before anything else and a **logout** button + username chip in the
+top bar once signed in. Login sets an HttpOnly, `SameSite=Lax` session
+cookie (`POST /api/v1/login`) that rides along on every subsequent request
+automatically. If the coordinator has no `auth.yaml` at all (open dev mode),
+the console skips the login screen and connects directly, unchanged.
+
 The connection indicator (top bar) is green when polling and the event socket
 are healthy, amber while connecting, red when the coordinator is unreachable.
 
@@ -116,7 +124,14 @@ optional hardening: `rel_path` comes from the tree being migrated, so a file
 named `<img onerror=…>` would otherwise execute script in an operator's browser
 just by appearing in a parked-shard row.
 
-Auth is a bearer token today; it moves to OIDC per DESIGN-coordinator §6.
+The WebUI's only auth surface is session-cookie login (local host accounts or
+Active Directory) — see `docs/ADMIN.md` §"Authentication & TLS". The bearer
+token is a separate, CLI/script-facing credential the WebUI never asks for or
+stores. OIDC remains a possible future addition per DESIGN-coordinator §6.
+
+The coordinator's HTTP(S) listener serves plain `http://` unless
+`/etc/drsync/certs.yaml` names a cert/key pair, in which case it serves
+`https://` and the session cookie is marked `Secure`.
 
 ## Design notes
 
