@@ -187,9 +187,22 @@ with `-smtp-config`); the spec only names recipients and which events fire:
   bytes, metadata fixes, orphans, verify, errors) and duration. This is the convergence
   trace, arriving pass by pass.
 - `on_job_complete` — a single summary email when the job reaches `COMPLETED`: the full
-  per-pass trajectory table plus totals, convergence status, orphans remaining and any
-  parked shards. (For the last pass of a converging job, both a pass email and the summary
-  arrive.)
+  per-pass trajectory table (state, **duration**, Δfiles, Δbytes, orphans, verify, errors —
+  one row per pass, so a slow convergence shows *where* the time went, not just the totals)
+  plus overall totals, convergence status, orphans remaining and any parked shards. (For the
+  last pass of a converging job, both a pass email and the summary arrive.)
+
+**Parked-shard alerts are independent of both flags above** — sent to `recipients`
+regardless of `on_pass_complete`/`on_job_complete` (but still only when `recipients` is
+non-empty) whenever a shard is newly parked (hits its retry ceiling — attempts exhausted,
+see docs/ADMIN.md §7). A parked shard can permanently stall its job — the coordinator will
+not cross a phase boundary while any of that phase's shards are parked (DESIGN-coordinator.md
+§2) — so this fires on a periodic check (piggybacking passctrl's existing tick, not a
+separate timer) rather than waiting for job completion, which the job may never reach on its
+own until the shard is retried or dropped. Shards that park together in the same tick (e.g. a
+mount going unhealthy mid-walk) are batched into one email per job listing all of them, not
+one email per shard; a shard already alerted on is not re-alerted while it stays parked, but
+parks again as a fresh incident after being retried.
 
 Delivery is **best-effort and asynchronous**: it never blocks or fails a pass, and a
 transport error is logged on the coordinator, not surfaced to the job. If the coordinator

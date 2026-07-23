@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -39,6 +40,16 @@ type Controller struct {
 	// release its cached options and root directory fds. Injected by main; nil in
 	// tests. See agentsrv.Server.NotifyJobDone.
 	NotifyJobDone func(jobID int64)
+
+	// notifiedParked tracks shard IDs already covered by a parked-shard alert
+	// email, so the periodic digest (checkParkedShards, run from tick) never
+	// re-notifies the same shard. A shard is forgotten once it leaves parked
+	// state (retried or dropped) — see checkParkedShards. In-memory only: a
+	// coordinator restart re-sends alerts for shards still parked at boot,
+	// which is the safe direction to be wrong in (a redundant email, not a
+	// silently dropped one).
+	notifiedParkedMu sync.Mutex
+	notifiedParked   map[int64]bool
 }
 
 // jobTerminal fires the agent notification for a job that just reached a
@@ -50,7 +61,7 @@ func (c *Controller) jobTerminal(jobID int64) {
 }
 
 func New(st *store.Store, journalRoot string) *Controller {
-	return &Controller{st: st, journalRoot: journalRoot}
+	return &Controller{st: st, journalRoot: journalRoot, notifiedParked: map[int64]bool{}}
 }
 
 // SetNotifier wires an email sender for pass/job completion notifications. A
@@ -188,7 +199,88 @@ func (c *Controller) tick() error {
 			slog.Error("advance failed", "job", job.Name, "err", err)
 		}
 	}
+	if err := c.checkParkedShards(); err != nil {
+		slog.Error("checkParkedShards failed", "err", err)
+	}
 	return nil
+}
+
+// checkParkedShards emails a digest alert for any shard that is parked and
+// has not already been notified about, grouped one email per job per tick —
+// a burst of shards parking together (e.g. a mount going unhealthy mid-walk)
+// becomes one email listing all of them, not one per shard. A shard parking
+// can permanently stall its job (advance() will not cross a phase boundary
+// while any of that phase's shards are parked), so this tick-driven digest is
+// the operator's actual notification path — not job completion, which the
+// job may never reach until the parked shard is retried or dropped.
+func (c *Controller) checkParkedShards() error {
+	if c.notifier == nil || !c.notifier.Enabled() {
+		return nil
+	}
+	all, err := c.st.ParkedShards()
+	if err != nil {
+		return err
+	}
+	c.notifiedParkedMu.Lock()
+	stillParked := make(map[int64]bool, len(all))
+	byJob := map[string][]store.ParkedShard{}
+	for _, sh := range all {
+		stillParked[sh.ID] = true
+		if !c.notifiedParked[sh.ID] {
+			byJob[sh.Job] = append(byJob[sh.Job], sh)
+		}
+	}
+	// Forget shards that left parked state (retried or dropped) so a shard
+	// that parks again later is alerted on again rather than silently
+	// suppressed forever by a stale map entry.
+	for id := range c.notifiedParked {
+		if !stillParked[id] {
+			delete(c.notifiedParked, id)
+		}
+	}
+	for _, shards := range byJob {
+		for _, sh := range shards {
+			c.notifiedParked[sh.ID] = true
+		}
+	}
+	c.notifiedParkedMu.Unlock()
+
+	for jobName, shards := range byJob {
+		job, err := c.st.GetJob(jobName)
+		if err != nil {
+			slog.Warn("notify: lookup job for parked-shard alert failed", "job", jobName, "err", err)
+			continue
+		}
+		c.emailParkedShards(job, shards)
+	}
+	return nil
+}
+
+// emailParkedShards sends the alert for one job's newly-parked shards.
+// notifications.recipients gates it (like every other email); it does not
+// require on_job_complete, since a parked shard is an operator action item
+// independent of whether the spec opts into routine completion reporting.
+func (c *Controller) emailParkedShards(job *store.Job, shards []store.ParkedShard) {
+	spec, err := model.ParseSpec(job.SpecYAML)
+	if err != nil {
+		slog.Warn("notify: parse spec failed", "job", job.Name, "err", err)
+		return
+	}
+	n := spec.Spec.Notifications
+	if len(n.Recipients) == 0 {
+		return
+	}
+	rows := make([]notify.ParkedShardRow, len(shards))
+	for i, sh := range shards {
+		rows[i] = notify.ParkedShardRow{
+			PassNo: sh.PassNo, Kind: string(sh.Kind), RelPath: sh.RelPath,
+			Attempt: sh.Attempt, Error: sh.Error, LastAgent: sh.LastAgent,
+		}
+	}
+	c.notifier.ParkedShards(n.Recipients, notify.ParkedShardsReport{
+		Job: job.Name, Src: spec.Spec.Source.Path, Dst: spec.Spec.Destination.Path,
+		Shards: rows,
+	})
 }
 
 func (c *Controller) advance(job *store.Job) error {
@@ -617,16 +709,29 @@ func (c *Controller) buildJobReport(job *store.Job) (notify.JobReport, error) {
 			rep.OrphansRemaining = 0
 		}
 	}
-	parked, err := c.st.ParkedShards()
+	parked, err := c.jobParkedShards(job.Name)
 	if err != nil {
 		return notify.JobReport{}, err
 	}
-	for _, sh := range parked {
-		if sh.Job == job.Name {
-			rep.ParkedShards++
+	rep.ParkedShards = len(parked)
+	return rep, nil
+}
+
+// jobParkedShards returns the parked shards belonging to job (store.ParkedShards
+// lists fleet-wide, so this filters to the one job both the summary and the
+// dedicated parked-shards alert email care about).
+func (c *Controller) jobParkedShards(jobName string) ([]store.ParkedShard, error) {
+	all, err := c.st.ParkedShards()
+	if err != nil {
+		return nil, err
+	}
+	var out []store.ParkedShard
+	for _, sh := range all {
+		if sh.Job == jobName {
+			out = append(out, sh)
 		}
 	}
-	return rep, nil
+	return out, nil
 }
 
 // TriggerPass starts the next pass manually. Works on RUNNING jobs between

@@ -88,8 +88,11 @@ func TestNilSenderIsInert(t *testing.T) {
 	if s.Enabled() {
 		t.Fatal("nil sender should not be enabled")
 	}
-	s.PassComplete([]string{"a@b.com"}, PassReport{}) // must not panic
-	s.JobComplete([]string{"a@b.com"}, JobReport{})   // must not panic
+	s.PassComplete([]string{"a@b.com"}, PassReport{})       // must not panic
+	s.JobComplete([]string{"a@b.com"}, JobReport{})         // must not panic
+	s.ParkedShards([]string{"a@b.com"}, ParkedShardsReport{ // must not panic
+		Shards: []ParkedShardRow{{PassNo: 1}},
+	})
 }
 
 func TestBuildMIMEStructure(t *testing.T) {
@@ -160,6 +163,84 @@ func TestRenderJobSummary(t *testing.T) {
 	}
 	if !strings.Contains(htmlBody, "prod-cutover") {
 		t.Error("job name should appear in html")
+	}
+}
+
+// The pass-trajectory table in the job summary must show each pass's
+// duration, not just its deltas — an operator judging whether a slow
+// convergence is worth investigating needs to see where the time went.
+func TestRenderJobSummaryShowsPassDuration(t *testing.T) {
+	_, htmlBody, textBody := renderJob(JobReport{
+		Job: "prod-cutover", State: "COMPLETED", Converged: true,
+		Passes: []JobPass{
+			{PassNo: 1, State: "COMPLETE", DurationMS: 3_725_000, DeltaFiles: 100},
+			{PassNo: 2, State: "COMPLETE", DurationMS: 45_000, DeltaFiles: 0},
+		},
+	})
+	if !strings.Contains(htmlBody, "Duration") {
+		t.Error("html pass trajectory should have a Duration column header")
+	}
+	if !strings.Contains(htmlBody, "1h 2m") {
+		t.Errorf("html should show pass 1's duration (1h 2m):\n%s", htmlBody)
+	}
+	if !strings.Contains(htmlBody, "45s") {
+		t.Errorf("html should show pass 2's duration (45s):\n%s", htmlBody)
+	}
+	if !strings.Contains(textBody, "duration") {
+		t.Error("text pass trajectory should have a duration column header")
+	}
+	if !strings.Contains(textBody, "1h 2m") || !strings.Contains(textBody, "45s") {
+		t.Errorf("text body missing pass durations:\n%s", textBody)
+	}
+}
+
+func TestRenderParkedShardsAlert(t *testing.T) {
+	subject, htmlBody, textBody := renderParkedShards(ParkedShardsReport{
+		Job: "prod-cutover", Src: "/mnt/gpfs/home", Dst: "/mnt/weka/home",
+		Shards: []ParkedShardRow{
+			{PassNo: 2, Kind: "entrylist", RelPath: "deep/tree/broken", Attempt: 5,
+				Error: "EIO", LastAgent: "agent-3"},
+			{PassNo: 2, Kind: "chunk", RelPath: "big.bin", Attempt: 5,
+				Error: "ESTALE", LastAgent: "agent-1"},
+		},
+	})
+	if !strings.Contains(subject, "2 shard(s) parked") {
+		t.Errorf("subject = %q", subject)
+	}
+	if !strings.Contains(subject, "prod-cutover") {
+		t.Errorf("subject should name the job: %q", subject)
+	}
+	for _, want := range []string{"deep/tree/broken", "big.bin", "EIO", "ESTALE", "agent-3", "agent-1"} {
+		if !strings.Contains(htmlBody, want) {
+			t.Errorf("html body missing %q", want)
+		}
+		if !strings.Contains(textBody, want) {
+			t.Errorf("text body missing %q", want)
+		}
+	}
+	if !strings.Contains(htmlBody, "/mnt/gpfs/home") || !strings.Contains(htmlBody, "/mnt/weka/home") {
+		t.Error("html body should carry the job's source/destination paths")
+	}
+	if !strings.Contains(htmlBody, "drsync queue") {
+		t.Error("body should point the operator at `drsync queue`")
+	}
+}
+
+// A parked shard's rel_path and error come from the migration tree / agent,
+// not the operator, so they must be escaped like every other interpolated
+// value reaching the HTML body.
+func TestRenderParkedShardsEscapesPath(t *testing.T) {
+	_, body, _ := renderParkedShards(ParkedShardsReport{
+		Job: "j",
+		Shards: []ParkedShardRow{
+			{PassNo: 1, Kind: "chunk", RelPath: `<img src=x onerror=alert(1)>`, Error: "EIO"},
+		},
+	})
+	if strings.Contains(body, "<img src=x") {
+		t.Error("rel_path reached the HTML body unescaped")
+	}
+	if !strings.Contains(body, "&lt;img src=x") {
+		t.Error("rel_path missing from the body in escaped form")
 	}
 }
 
