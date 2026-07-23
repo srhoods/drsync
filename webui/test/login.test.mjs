@@ -96,3 +96,19 @@ test("there is no coordinator-URL/API-token override anywhere in the page", asyn
     assert.equal(c.$(sel), null, `${sel} should not exist — no connection override is offered`);
   }
 });
+
+let dom6;
+after(() => dom6?.dom.window.close());
+
+test("the username field has no autofocus attribute (it fights the password field for focus)", async () => {
+  const c = await boot({ routeOverrides: routeWithWhoAmI({ username: "", login_configured: true }) });
+  dom6 = c;
+  await c.tick(300);
+  // autofocus re-runs on some visibility/layout changes rather than strictly
+  // once at parse time, so leaving it on the username input while JS also
+  // calls .focus() on it (in showLogin) gave the field two independent ways
+  // to steal focus back after the operator had already moved to the password
+  // field. The fix keeps exactly one: the explicit JS call in showLogin.
+  assert.equal(c.$("#login-user").hasAttribute("autofocus"), false,
+    "login-user must not carry the autofocus attribute");
+});

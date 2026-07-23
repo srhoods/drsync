@@ -128,6 +128,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/jobs", s.auth(s.listJobs))
 	mux.HandleFunc("POST /api/v1/jobs/purge", s.auth(s.purgeJobs))
 	mux.HandleFunc("GET /api/v1/jobs/{name}", s.auth(s.getJob))
+	mux.HandleFunc("GET /api/v1/jobs/{name}/spec", s.auth(s.getJobSpec))
 	mux.HandleFunc("DELETE /api/v1/jobs/{name}", s.auth(s.purgeJob))
 	mux.HandleFunc("POST /api/v1/jobs/{name}/start", s.auth(s.jobAction("start")))
 	mux.HandleFunc("POST /api/v1/jobs/{name}/pause", s.auth(s.jobAction("pause")))
@@ -384,6 +385,25 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		v.Passes = append(v.Passes, passViewOf(p))
 	}
 	writeJSON(w, http.StatusOK, v)
+}
+
+// GET /api/v1/jobs/{name}/spec — the raw YAML the job was submitted with, so
+// an operator can review it or resubmit a variant. Returned verbatim (not
+// re-serialized from the parsed struct) so it reproduces exactly what was
+// submitted, comments and all.
+func (s *Server) getJobSpec(w http.ResponseWriter, r *http.Request) {
+	job, err := s.st.GetJob(r.PathValue("name"))
+	if errors.Is(err, sql.ErrNoRows) {
+		httpErr(w, http.StatusNotFound, "no such job")
+		return
+	}
+	if err != nil {
+		httpErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(job.SpecYAML)
 }
 
 // dropJournal removes a purged job's on-disk journal (best effort; logged).

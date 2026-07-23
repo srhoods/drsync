@@ -62,7 +62,7 @@ const sessionSecretFile = "session.key"
 const journalFlushInterval = 250 * time.Millisecond
 
 // coordinatorVersion is surfaced in the console header and /api/v1/info.
-const coordinatorVersion = "0.1.0-slice5"
+const coordinatorVersion = "0.1.1"
 
 func main() {
 	var (

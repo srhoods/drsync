@@ -59,8 +59,9 @@ export async function boot({ routeOverrides, postHandler } = {}) {
     beforeParse(w) {
       w.fetch = async (url, opts) => {
         const path = String(url).replace(/^https?:\/\/[^/]+/, "");
-        if (opts && opts.method === "POST") {
-          requests.post.push({ path, body: opts.body });
+        const method = (opts && opts.method) || "GET";
+        if (method === "POST" || method === "DELETE") {
+          requests.post.push({ path, method, body: opts.body });
           if (postHandler) {
             const r = await postHandler(path, opts);
             if (r) {
