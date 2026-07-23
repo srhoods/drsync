@@ -19,7 +19,7 @@ action. File data never crosses the control network. A single **CLI**
 | **[docs/INSTALL.md](docs/INSTALL.md)** | Build, dependencies, topology (dual mounts), mTLS setup, WebUI/API login + HTTPS setup, running the coordinator and agents, and **verifying a new setup**. |
 | **[docs/ADMIN.md](docs/ADMIN.md)** | Operator guide: concepts, the job-spec reference, the full CLI, worked use cases (migration, consolidation, cutover, orphan deletion, pathological dirs / huge files), monitoring, authentication & TLS, and troubleshooting. |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | System design and the ratified decisions (D1–D9). |
-| **[webui/](webui/)** | Read-only monitoring console (jobs, convergence, throughput, agent performance, queue/parked shards), served live by the coordinator at `http://<coordinator>:7441/`. |
+| **[webui/](webui/)** | Monitoring + control console (jobs, convergence, throughput, agent performance, queue/parked shards), served live by the coordinator at `http://<coordinator>:7441/` (or `https://` once `/etc/drsync/certs.yaml` is configured). |
 | `docs/DESIGN-*.md` | Deep-dives: protocol, coordinator, agent, jobspec/CLI. |
 
 ## Quick start

@@ -355,7 +355,7 @@ drsync/
 |---|---|---|
 | **1 — MVP** | Coordinator + agent, posix lister, dual-tree diff, copy + full metadata, passes, CLI, Prometheus metrics. Correctness proven by fidelity test matrix. | **Shipped.** Plus mTLS, entry-list sharding for pathological directories, and coordinator-driven fleet spread so a volume below `shard_budget` still fans out across every agent (`test/fanout_e2e.sh`). |
 | **2 — Scale & resilience** | Large-file chunking, GPFS policy lister, verify pass, delete pass, coordinator HA, fault-injection test suite, 1B-file synthetic benchmark. | **Partial.** Shipped: large-file chunking — local parallel ranges **and** cross-fleet chunk fan-out with idempotent recovery (`test/chunk_e2e.sh`, `test/chunk_resilience_e2e.sh`); verify pass (sampled xxHash3); delete pass. Outstanding: GPFS policy lister, coordinator HA, fault-injection suite, 1B-file benchmark. |
-| **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. | **Partial.** Shipped: WebUI console (monitoring, job/agent/parked-shard control, error browser), per-pass reports. Outstanding: Weka snapshot lister, cutover tooling. |
+| **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. | **Partial.** Shipped: WebUI console (monitoring, job/agent/parked-shard control, error browser), per-pass reports, login (local accounts / Active Directory) + logout, optional HTTPS for the REST/WebUI listener, email notifications (per-pass, end-of-job summary with a per-pass duration column, tick-driven parked-shard alert digest). Outstanding: Weka snapshot lister, cutover tooling. |
 
 ---
 

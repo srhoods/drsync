@@ -173,6 +173,18 @@ spec:
     mtime_slop_ns: 1000000        # mtimes within this are "equal" (1 ms)
     spread_mode: auto             # auto | off | always — fleet-wide fan-out (see §4.6)
     spread_target_per_agent: 32   # walk shards per agent to aim for before spreading stops
+
+  # Optional email; inert unless the coordinator has an SMTP config
+  # (INSTALL.md §5.1). Parked-shard alerts are covered in §1 above.
+  notifications:
+    recipients:                   # required if either flag below is set
+      - ops@example.com
+    on_pass_complete: false       # email as each pass finishes (the convergence trace)
+    on_job_complete: false        # one summary email when the job reaches COMPLETED
+                                  #   (per-pass table includes each pass's duration)
+    # Parked-shard alerts are NOT a flag here: as soon as any shard hits its
+    # retry ceiling, `recipients` above gets an email automatically, independent
+    # of the two flags above.
 ```
 
 You can keep the spec minimal and override individual fields at submit time with

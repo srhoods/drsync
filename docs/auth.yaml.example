@@ -2,9 +2,11 @@
 #
 # Install to /etc/drsync/auth.yaml (or point -auth-config elsewhere). Read
 # once at coordinator startup — restart drsyncd after changing it. When the
-# default path (/etc/drsync/auth.yaml) is absent, interactive login (the
-# WebUI login screen) is simply disabled and the API stays token-only
-# (-api-token); a path passed explicitly must exist and validate.
+# default path (/etc/drsync/auth.yaml) is absent, interactive login is
+# disabled and the WebUI connects straight through with no login screen
+# (open dev mode) — the WebUI has no token-entry UI, so -api-token gates
+# only the CLI/scripts in that case, not the browser console. A path passed
+# explicitly must exist and validate.
 #
 # This file may contain an LDAP bind password: chmod 600 and own it by the
 # drsyncd user.
