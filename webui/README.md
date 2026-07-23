@@ -204,3 +204,10 @@ and a reserved semantic trio — green nominal / amber informational / red criti
 CLI read as one system. Monospace for every figure, ID, and label (tabular
 numerals). Theme-aware (light/dark, honouring OS preference and an explicit
 toggle that persists) and reduced-motion-safe.
+
+The favicon is the wordmark's own "dr" mark (ink `d`, accent `r`, a faint
+accent slash) as an inline SVG data URI — no separate asset file, keeping the
+single-self-contained-page property. It carries its own `prefers-color-scheme`
+media query so the browser tab matches the page's theme independent of the
+in-page toggle (a favicon can't read the page's `data-theme` attribute or its
+CSS custom properties; only the OS-level media query is available to it).

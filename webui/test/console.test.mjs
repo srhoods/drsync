@@ -325,6 +325,19 @@ test("hostile values render as text", async () => {
 });
 
 // --------------------------------------------------------------------------
+// Favicon
+// --------------------------------------------------------------------------
+
+test("the page declares a theme-aware favicon", () => {
+  const link = c.$("link[rel='icon']");
+  assert.ok(link, "no <link rel=icon> in the page");
+  const href = link.getAttribute("href");
+  assert.match(href, /^data:image\/svg\+xml/, "favicon should be a self-contained data URI, not an external asset");
+  assert.match(decodeURIComponent(href), /prefers-color-scheme:\s*dark/,
+    "favicon should switch color with the OS theme, like the rest of the console");
+});
+
+// --------------------------------------------------------------------------
 
 test("the page ran without uncaught script errors", () => {
   assert.deepEqual(c.scriptErrors, []);
