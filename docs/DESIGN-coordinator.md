@@ -347,6 +347,22 @@ migration-management signal (flattening curve = ready for cutover window plannin
 ETA model: exponentially-weighted copy rate × remaining known bytes, marked "lower
 bound" while the walk is still discovering (queue depth > 0 and discovery rate > 0).
 
+**Gap — no per-agent walker/copy pool utilization metric.** The agent heartbeat
+(see DESIGN-protocol.md `Heartbeat`) already carries `shard_queue_depth` and
+`copy_queue_depth`, but `onHeartbeat` in `agentsrv/server.go` never reads
+them, and an agent's configured pool sizes (`-w`/`-C` in `agent/src/main.c`)
+aren't sent over the wire at all — so there's no way to compute a true
+busy/total utilization figure for either pool, only queue depth once wired
+through, and no total to divide by even then. The WebUI's fleet view (added
+in PR #25) approximates this instead, from in-flight shard *kind* per agent
+(`chunk` shards counted as copy-pool activity, everything else as
+walker-pool activity) — a labelled proxy, not a real reading, since the
+agent's two pools can steal work from each other and a shard's kind doesn't
+map 1:1 onto which pool actually ran it. Closing this gap needs: (1) a new
+heartbeat field for configured pool size (or a one-time value sent at
+connect), and (2) wiring `shard_queue_depth`/`copy_queue_depth` through to a
+metric here, e.g. `drsync_agent_pool_queue_depth{agent,pool}`.
+
 ## 8. HA Posture (phase 2, designed-for now)
 
 - Active/passive: standby `drsyncd` with the SQLite file + journal directory on shared
