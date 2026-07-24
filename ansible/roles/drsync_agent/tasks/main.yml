@@ -1,0 +1,134 @@
+---
+- name: Assert the walker/copy split percentages sum to 100
+  assert:
+    that: (drsync_agent_walker_pct | int) + (drsync_agent_copy_pct | int) == 100
+    fail_msg: >-
+      drsync_agent_walker_pct ({{ drsync_agent_walker_pct }}) +
+      drsync_agent_copy_pct ({{ drsync_agent_copy_pct }}) must equal 100.
+
+# The agent has no percentage flag — only absolute -w/-C thread counts, each
+# independently validated 1..256 by the agent itself (agent/src/main.c). This
+# derives those counts from detected cores so a heterogeneous fleet gets a
+# sensible split per host without per-host tuning; round() can send either
+# side to 0 on a 1-2 vCPU box, so both are floored at 1 after rounding.
+- name: Compute walker/copy thread counts from detected CPU cores
+  set_fact:
+    drsync_agent_walkers: >-
+      {{ [((ansible_processor_vcpus | int) * (drsync_agent_walker_pct | int) / 100) | round(0, 'common') | int, 1] | max }}
+    drsync_agent_copy_threads: >-
+      {{ [((ansible_processor_vcpus | int) * (drsync_agent_copy_pct | int) / 100) | round(0, 'common') | int, 1] | max }}
+
+- name: Report the computed thread split
+  debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ ansible_processor_vcpus }} vCPUs ->
+      {{ drsync_agent_walkers }} walkers ({{ drsync_agent_walker_pct }}%) /
+      {{ drsync_agent_copy_threads }} copy threads ({{ drsync_agent_copy_pct }}%)
+
+# --- mounts: the agent must be able to see both trees before it can do
+# anything useful, and systemd's RequiresMountsFor= only blocks agent startup
+# on a MISSING mount — it says nothing about whether the paths exist at all
+# (e.g. a fresh host with no mount unit configured yet). Fail loudly here
+# rather than let the agent start and silently sit idle / error on first job.
+
+- name: Check the source mount path exists
+  stat:
+    path: "{{ drsync_agent_source_mount }}"
+  register: _src_mount
+
+- name: Check the destination mount path exists
+  stat:
+    path: "{{ drsync_agent_dest_mount }}"
+  register: _dst_mount
+
+- name: Assert both mount paths exist
+  assert:
+    that:
+      - _src_mount.stat.exists
+      - _src_mount.stat.isdir
+      - _dst_mount.stat.exists
+      - _dst_mount.stat.isdir
+    fail_msg: >-
+      {{ drsync_agent_source_mount }} and {{ drsync_agent_dest_mount }} must
+      both exist as directories on {{ inventory_hostname }} before the agent
+      can run jobs — mount the source and destination filesystems there
+      first (see docs/INSTALL.md §1: every agent host mounts both trees at
+      the exact absolute paths named in the job spec).
+
+# --- io_uring: optional accelerator, not required for correctness -----------
+
+- name: Check the io_uring kernel switch
+  command: sysctl -n kernel.io_uring_disabled
+  register: _uring_sysctl
+  changed_when: false
+  failed_when: false  # absent on kernels too old to have the knob at all — harmless, falls back to fstatat
+
+- name: Enable io_uring at the kernel level (some hardened kernels ship it disabled)
+  ansible.posix.sysctl:
+    name: kernel.io_uring_disabled
+    value: "0"
+    sysctl_file: /etc/sysctl.d/99-drsync.conf
+    state: present
+    reload: true
+  when:
+    - drsync_agent_fix_io_uring_sysctl
+    - drsync_agent_uring_enabled
+    - _uring_sysctl.rc == 0
+    - _uring_sysctl.stdout | trim != "0"
+
+# --- binary + mTLS material ---------------------------------------------------
+
+- name: Install the drsync-agent binary
+  copy:
+    src: "{{ drsync_build_dir }}/bin/drsync-agent"
+    dest: "{{ drsync_install_dir }}/drsync-agent"
+    mode: "0755"
+    owner: root
+    group: root
+  notify: restart drsync-agent
+
+- name: Distribute the fleet CA cert
+  copy:
+    src: "{{ drsync_pki_local_dir }}/ca.crt"
+    dest: "{{ drsync_config_dir }}/ca.crt"
+    mode: "0644"
+    owner: root
+    group: root
+  when: drsync_tls_enabled
+  notify: restart drsync-agent
+
+- name: Distribute this agent's client cert
+  copy:
+    src: "{{ drsync_pki_local_dir }}/{{ inventory_hostname }}.crt"
+    dest: "{{ drsync_config_dir }}/{{ inventory_hostname }}.crt"
+    mode: "0644"
+    owner: root
+    group: root
+  when: drsync_tls_enabled
+  notify: restart drsync-agent
+
+- name: Distribute this agent's client key
+  copy:
+    src: "{{ drsync_pki_local_dir }}/{{ inventory_hostname }}.key"
+    dest: "{{ drsync_config_dir }}/{{ inventory_hostname }}.key"
+    mode: "0600"
+    owner: root
+    group: root
+  when: drsync_tls_enabled
+  notify: restart drsync-agent
+
+# --- systemd unit + service ---------------------------------------------------
+
+- name: Install the drsync-agent systemd unit
+  template:
+    src: drsync-agent.service.j2
+    dest: /etc/systemd/system/drsync-agent.service
+    mode: "0644"
+  notify: restart drsync-agent
+
+- name: Enable and start drsync-agent
+  systemd:
+    name: drsync-agent
+    enabled: true
+    state: started
+    daemon_reload: true

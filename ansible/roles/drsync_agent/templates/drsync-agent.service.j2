@@ -1,0 +1,44 @@
+{{ ansible_managed | comment }}
+{% set args = [
+    '-c ' + coordinator_host + ':' + (drsync_agent_port | string),
+    '-i ' + inventory_hostname,
+    '-w ' + (drsync_agent_walkers | string),
+    '-C ' + (drsync_agent_copy_threads | string),
+] %}
+{% if not drsync_agent_uring_enabled %}
+{% set args = args + ['-U'] %}
+{% endif %}
+{% if not drsync_agent_work_stealing_enabled %}
+{% set args = args + ['-S'] %}
+{% endif %}
+{% if drsync_tls_enabled %}
+{% set args = args + [
+    '-A ' + drsync_config_dir + '/ca.crt',
+    '-E ' + drsync_config_dir + '/' + inventory_hostname + '.crt',
+    '-K ' + drsync_config_dir + '/' + inventory_hostname + '.key',
+] %}
+{% endif %}
+[Unit]
+Description=drsync agent
+RequiresMountsFor={{ drsync_agent_source_mount }} {{ drsync_agent_dest_mount }}
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+# Runs as root: metadata.owner (chown to arbitrary uid/gid) and
+# metadata.specials (mknod for device/FIFO/socket) both require it — see
+# docs/DESIGN-agent.md ("one process per host, run as root").
+ExecStart={{ drsync_install_dir }}/drsync-agent \
+{% for a in args %}
+  {{ a }}{{ ' \\' if not loop.last else '' }}
+{% endfor %}
+
+Restart=always
+RestartSec=2
+# The agent's fd use scales with -w/-C (io_uring rings, held directory fds,
+# concurrent copies); systemd services bypass pam_limits entirely, so
+# /etc/security/limits.conf has no effect here — this is the only lever.
+LimitNOFILE={{ drsync_agent_nofile_limit }}
+
+[Install]
+WantedBy=multi-user.target

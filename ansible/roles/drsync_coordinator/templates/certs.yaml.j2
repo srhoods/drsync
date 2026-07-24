@@ -1,0 +1,5 @@
+{{ ansible_managed | comment }}
+# REST/WebUI listener TLS — unrelated to the agent<->coordinator mTLS
+# material below (-tls-cert/-tls-key/-tls-ca). See docs/certs.yaml.example.
+cert_file: {{ drsync_config_dir }}/server.crt
+key_file: {{ drsync_config_dir }}/server.key

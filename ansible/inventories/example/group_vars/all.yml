@@ -1,0 +1,93 @@
+---
+# ==============================================================================
+# drsync fleet configuration — every path/setting the roles use is defined
+# here (or overridden per-host-group/per-host as usual for Ansible). See
+# ansible/README.md for the full variable reference.
+# ==============================================================================
+
+# --- source tree + build -----------------------------------------------------
+# drsync_repo_dir: the checked-out drsync source tree the controller builds
+# from. Defaults to this playbook's own repo checkout (one level up from
+# ansible/), so the common case ("deploy what I have checked out") needs no
+# override.
+drsync_repo_dir: "{{ playbook_dir }}/.."
+drsync_build_dir: "{{ playbook_dir }}/.build"
+
+# --- network ------------------------------------------------------------------
+coordinator_host: coord01.example.com     # must resolve/be reachable from every agent host
+coordinator_ip: "{{ hostvars[groups['drsync_coordinator'][0]].coordinator_ip | default(omit) }}"
+drsync_agent_port: 7440                   # agent protocol listener (drsyncd -listen-agent)
+drsync_http_port: 7441                    # REST/WebUI/metrics listener (drsyncd -listen-http)
+drsync_listen_agent_addr: "0.0.0.0:{{ drsync_agent_port }}"
+drsync_listen_http_addr: "0.0.0.0:{{ drsync_http_port }}"
+
+# --- filesystem layout (customisable paths) -----------------------------------
+drsync_install_dir: /usr/local/bin
+drsync_config_dir: /etc/drsync
+drsync_data_dir: /var/lib/drsync          # coordinator: SQLite state store + journals
+drsync_pki_local_dir: "{{ drsync_build_dir }}/pki"   # PKI staged on the controller before distribution
+
+# Paths each agent host mounts BOTH filesystems at. Every job spec's
+# source.path/destination.path must match these exactly across the whole
+# fleet (docs/INSTALL.md §1).
+drsync_agent_source_mount: /mnt/src
+drsync_agent_dest_mount: /mnt/dst
+
+# --- mTLS (agent<->coordinator control channel) -------------------------------
+drsync_tls_enabled: true
+drsync_pki_ca_cn: drsync-ca
+drsync_pki_ca_days: 3650
+drsync_pki_leaf_days: 825
+
+# --- coordinator tuning --------------------------------------------------------
+drsync_lease_ttl: 30s
+drsync_heartbeat_interval: 5s
+drsync_log_level: info
+drsync_min_agent_minor: 0
+
+# Optional coordinator features — each is a file the coordinator reads once at
+# startup; leave *_enabled false to skip installing/managing that file, which
+# leaves the feature off exactly as an absent default path would.
+drsync_auth_enabled: false          # WebUI/API interactive login (auth.yaml)
+drsync_auth_mode: local             # local | ad — see docs/ADMIN.md §8
+drsync_auth_allow_users: []
+drsync_auth_allow_groups: []
+drsync_auth_session_ttl_minutes: 480
+# drsync_auth_ldap: {}              # required block when drsync_auth_mode == ad
+
+drsync_https_enabled: false         # REST/WebUI listener HTTPS (certs.yaml)
+                                     # self-signed cert is generated on the
+                                     # controller when true and no
+                                     # drsync_https_cert_src/_key_src is given
+
+drsync_smtp_enabled: false          # email notifications (smtp.yaml)
+drsync_smtp_host: ""
+drsync_smtp_port: null              # null = protocol default for drsync_smtp_security
+drsync_smtp_security: starttls      # starttls | tls | none
+drsync_smtp_username: ""
+drsync_smtp_password: ""
+drsync_smtp_from: ""
+drsync_smtp_subject_prefix: "[drsync]"
+drsync_smtp_helo: ""
+drsync_smtp_timeout_seconds: 30
+
+# --- agent tuning ---------------------------------------------------------------
+# Walker/copy thread split, expressed as a percentage of detected CPU cores
+# (ansible_processor_vcpus). Defaults to 25% walkers / 75% copy threads.
+# Override per-group/per-host as needed, e.g. in group_vars/drsync_agents.yml
+# or a host_vars/<host>.yml for one unusually-shaped box. Must sum to 100.
+drsync_agent_walker_pct: 25
+drsync_agent_copy_pct: 75
+
+drsync_agent_uring_enabled: true          # false adds -U (force serial fstatat)
+drsync_agent_work_stealing_enabled: true  # false adds -S (pin fixed -w/-C sizes)
+drsync_agent_nofile_limit: 1048576        # systemd LimitNOFILE=
+drsync_agent_fix_io_uring_sysctl: true    # set kernel.io_uring_disabled=0 if needed
+
+# --- service ownership --------------------------------------------------------
+# The agent needs root (metadata.owner chown to arbitrary uid/gid, and
+# metadata.specials mknod both require it — docs/DESIGN-agent.md). The
+# coordinator does not, unless drsync_auth_mode: local, which needs /etc/shadow
+# read access (root or the `shadow` group) — see docs/ADMIN.md §8.
+drsync_coordinator_user: root
+drsync_coordinator_group: root

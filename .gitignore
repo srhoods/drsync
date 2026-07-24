@@ -22,6 +22,14 @@ node_modules/
 id_ed25519*
 id_rsa*
 
+# Ansible deploy: build output, minted mTLS material, generated API tokens,
+# and locally-installed collections — all host-specific, secret, and/or
+# fetched (never shared via the repo).
+/ansible/.build/
+/ansible/collections/
+/ansible/inventories/*/group_vars/vault.yml
+*.retry
+
 # Editor / OS cruft
 *~
 .DS_Store

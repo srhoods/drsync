@@ -1,0 +1,20 @@
+---
+drsync_agent_port: 7440
+drsync_agent_source_mount: /mnt/src
+drsync_agent_dest_mount: /mnt/dst
+drsync_tls_enabled: true
+
+# Walker/copy split as a percentage of ansible_processor_vcpus. Must sum to
+# 100. See README.md "Walker/copy thread split" for how this maps to the
+# agent's -w/-C flags, and why there's no ceiling above the agent's own
+# 1..256 per-pool limit here — a host would have to report 512+ vCPUs to a
+# single pool for that to bind, at which point the operator should be
+# splitting that box into more than one agent identity rather than tuning
+# around it.
+drsync_agent_walker_pct: 25
+drsync_agent_copy_pct: 75
+
+drsync_agent_uring_enabled: true
+drsync_agent_work_stealing_enabled: true
+drsync_agent_nofile_limit: 1048576
+drsync_agent_fix_io_uring_sysctl: true

@@ -1,0 +1,10 @@
+---
+# See docs/INSTALL.md §4 for the manual equivalent of what this role
+# automates. All three (CA, server cert, per-agent client certs) are
+# generated once — each step is guarded with `creates:` so re-running the
+# playbook never regenerates (and so never silently rotates) existing trust
+# material. To rotate a cert on purpose, remove its .crt/.key from
+# drsync_pki_local_dir and re-run.
+drsync_pki_ca_cn: drsync-ca
+drsync_pki_ca_days: 3650
+drsync_pki_leaf_days: 825

@@ -1,0 +1,185 @@
+---
+- name: Install the drsyncd binary
+  copy:
+    src: "{{ drsync_build_dir }}/bin/drsyncd"
+    dest: "{{ drsync_install_dir }}/drsyncd"
+    mode: "0755"
+    owner: root
+    group: root
+  notify: restart drsyncd
+
+- name: Ensure the coordinator data directory exists
+  file:
+    path: "{{ drsync_data_dir }}"
+    state: directory
+    mode: "0750"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+
+# --- mTLS (agent<->coordinator control channel) ------------------------------
+
+- name: Distribute the fleet CA cert
+  copy:
+    src: "{{ drsync_pki_local_dir }}/ca.crt"
+    dest: "{{ drsync_config_dir }}/ca.crt"
+    mode: "0644"
+    owner: root
+    group: root
+  when: drsync_tls_enabled
+  notify: restart drsyncd
+
+- name: Distribute the coordinator's server cert
+  copy:
+    src: "{{ drsync_pki_local_dir }}/{{ coordinator_host }}.crt"
+    dest: "{{ drsync_config_dir }}/{{ coordinator_host }}.crt"
+    mode: "0644"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_tls_enabled
+  notify: restart drsyncd
+
+- name: Distribute the coordinator's server key
+  copy:
+    src: "{{ drsync_pki_local_dir }}/{{ coordinator_host }}.key"
+    dest: "{{ drsync_config_dir }}/{{ coordinator_host }}.key"
+    mode: "0600"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_tls_enabled
+  notify: restart drsyncd
+
+# --- REST API bearer token ----------------------------------------------------
+# Generated once on the controller (so re-running the playbook never rotates
+# a token already handed out to operators/scripts) and only copied down if
+# the coordinator doesn't have one yet.
+
+- name: Check whether a token already exists on the controller
+  stat:
+    path: "{{ drsync_build_dir }}/api-token"
+  delegate_to: localhost
+  become: false
+  register: _token_local
+
+- name: Generate an API token on the controller (only if one doesn't exist yet)
+  shell: openssl rand -hex 32 > {{ drsync_build_dir }}/api-token
+  args:
+    creates: "{{ drsync_build_dir }}/api-token"
+  delegate_to: localhost
+  become: false
+  when: not _token_local.stat.exists
+
+- name: Distribute the API token (only if the coordinator doesn't have one yet)
+  copy:
+    src: "{{ drsync_build_dir }}/api-token"
+    dest: "{{ drsync_config_dir }}/api-token"
+    mode: "0600"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+    force: false  # never overwrite a token already deployed to this host
+  notify: restart drsyncd
+
+# --- optional: WebUI/API interactive login (auth.yaml) -----------------------
+
+- name: Install auth.yaml (WebUI/API interactive login)
+  template:
+    src: auth.yaml.j2
+    dest: "{{ drsync_config_dir }}/auth.yaml"
+    mode: "0600"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_auth_enabled
+  notify: restart drsyncd
+
+- name: Remove auth.yaml when login is disabled
+  file:
+    path: "{{ drsync_config_dir }}/auth.yaml"
+    state: absent
+  when: not drsync_auth_enabled
+  notify: restart drsyncd
+
+# --- optional: REST/WebUI listener HTTPS (certs.yaml) -------------------------
+
+- name: Generate a self-signed HTTPS cert on the controller (only if none supplied and none exists yet)
+  command: >
+    {{ drsync_build_dir }}/bin/drsync cert generate-self-signed
+    --cn {{ coordinator_host }}
+    --dns {{ coordinator_host }}
+    {{ '--ip ' + coordinator_ip if coordinator_ip is defined and coordinator_ip else '' }}
+    --out {{ drsync_build_dir }}/pki
+  args:
+    creates: "{{ drsync_build_dir }}/pki/server.crt"
+  delegate_to: localhost
+  become: false
+  when: drsync_https_enabled and not drsync_https_cert_src
+
+- name: Install the HTTPS cert
+  copy:
+    src: "{{ drsync_https_cert_src or (drsync_build_dir + '/pki/server.crt') }}"
+    dest: "{{ drsync_config_dir }}/server.crt"
+    mode: "0644"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_https_enabled
+  notify: restart drsyncd
+
+- name: Install the HTTPS key
+  copy:
+    src: "{{ drsync_https_key_src or (drsync_build_dir + '/pki/server.key') }}"
+    dest: "{{ drsync_config_dir }}/server.key"
+    mode: "0600"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_https_enabled
+  notify: restart drsyncd
+
+- name: Install certs.yaml
+  template:
+    src: certs.yaml.j2
+    dest: "{{ drsync_config_dir }}/certs.yaml"
+    mode: "0644"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_https_enabled
+  notify: restart drsyncd
+
+- name: Remove certs.yaml when HTTPS is disabled
+  file:
+    path: "{{ drsync_config_dir }}/certs.yaml"
+    state: absent
+  when: not drsync_https_enabled
+  notify: restart drsyncd
+
+# --- optional: SMTP notifications (smtp.yaml) ---------------------------------
+
+- name: Install smtp.yaml
+  template:
+    src: smtp.yaml.j2
+    dest: "{{ drsync_config_dir }}/smtp.yaml"
+    mode: "0600"
+    owner: "{{ drsync_coordinator_user }}"
+    group: "{{ drsync_coordinator_group }}"
+  when: drsync_smtp_enabled
+  notify: restart drsyncd
+
+- name: Remove smtp.yaml when notifications are disabled
+  file:
+    path: "{{ drsync_config_dir }}/smtp.yaml"
+    state: absent
+  when: not drsync_smtp_enabled
+  notify: restart drsyncd
+
+# --- systemd unit + service ---------------------------------------------------
+
+- name: Install the drsyncd systemd unit
+  template:
+    src: drsyncd.service.j2
+    dest: /etc/systemd/system/drsyncd.service
+    mode: "0644"
+  notify: restart drsyncd
+
+- name: Enable and start drsyncd
+  systemd:
+    name: drsyncd
+    enabled: true
+    state: started
+    daemon_reload: true

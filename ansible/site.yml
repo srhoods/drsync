@@ -1,0 +1,53 @@
+---
+# drsync fleet deployment.
+#
+# Layout mirrors docs/INSTALL.md: build once, mint mTLS trust once, then
+# converge the coordinator host and every agent host onto that state.
+# Every play is safe to re-run — each step guards on the state it would
+# create, not on "did we run before".
+#
+#   ansible-playbook site.yml                      # full deploy
+#   ansible-playbook site.yml --tags coordinator    # coordinator only
+#   ansible-playbook site.yml --tags agents         # agents only
+#   ansible-playbook site.yml --tags verify         # just re-run the smoke checks
+
+- name: Build drsync binaries (controller)
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  tags: [build]
+  roles:
+    - role: drsync_build
+
+- name: Mint fleet mTLS trust (controller)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [pki]
+  roles:
+    - role: drsync_pki
+      when: drsync_tls_enabled | default(true)
+
+- name: Deploy the drsync coordinator
+  hosts: drsync_coordinator
+  become: true
+  tags: [coordinator]
+  roles:
+    - role: drsync_common
+    - role: drsync_coordinator
+
+- name: Deploy drsync agents
+  hosts: drsync_agents
+  become: true
+  tags: [agents]
+  roles:
+    - role: drsync_common
+    - role: drsync_agent
+
+- name: Verify the fleet is up and ready to run jobs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [verify]
+  roles:
+    - role: drsync_verify

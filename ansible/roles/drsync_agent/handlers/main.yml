@@ -1,0 +1,6 @@
+---
+- name: restart drsync-agent
+  systemd:
+    name: drsync-agent
+    state: restarted
+    daemon_reload: true

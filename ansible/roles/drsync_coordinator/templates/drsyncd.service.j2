@@ -1,0 +1,40 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=drsync coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ drsync_coordinator_user }}
+Group={{ drsync_coordinator_group }}
+ExecStart={{ drsync_install_dir }}/drsyncd \
+  -data-dir {{ drsync_data_dir }} \
+  -listen-agent {{ drsync_listen_agent_addr }} \
+  -listen-http {{ drsync_listen_http_addr }} \
+  -api-token-file {{ drsync_config_dir }}/api-token \
+{% if drsync_tls_enabled %}
+  -tls-cert {{ drsync_config_dir }}/{{ coordinator_host }}.crt \
+  -tls-key {{ drsync_config_dir }}/{{ coordinator_host }}.key \
+  -tls-ca {{ drsync_config_dir }}/ca.crt \
+{% endif %}
+{% if drsync_auth_enabled %}
+  -auth-config {{ drsync_config_dir }}/auth.yaml \
+{% endif %}
+{% if drsync_https_enabled %}
+  -certs-config {{ drsync_config_dir }}/certs.yaml \
+{% endif %}
+{% if drsync_smtp_enabled %}
+  -smtp-config {{ drsync_config_dir }}/smtp.yaml \
+{% endif %}
+  -lease-ttl {{ drsync_lease_ttl }} \
+  -heartbeat-interval {{ drsync_heartbeat_interval }} \
+  -min-agent-minor {{ drsync_min_agent_minor }} \
+  -log-level {{ drsync_log_level }}
+Restart=always
+RestartSec=2
+{% if drsync_data_dir == '/var/lib/drsync' %}
+StateDirectory=drsync
+{% endif %}
+
+[Install]
+WantedBy=multi-user.target

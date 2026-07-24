@@ -1,0 +1,31 @@
+{{ ansible_managed | comment }}
+# See docs/auth.yaml.example and docs/ADMIN.md §8 for the full reference.
+mode: {{ drsync_auth_mode }}
+
+allow:
+  users:
+{% for u in drsync_auth_allow_users %}
+    - {{ u }}
+{% endfor %}
+  groups:
+{% for g in drsync_auth_allow_groups %}
+    - {{ g }}
+{% endfor %}
+
+session_ttl_minutes: {{ drsync_auth_session_ttl_minutes }}
+{% if drsync_auth_mode == 'ad' %}
+
+ldap:
+  url: {{ drsync_auth_ldap.url }}
+  starttls: {{ drsync_auth_ldap.starttls | default(false) | lower }}
+  insecure_skip_verify: {{ drsync_auth_ldap.insecure_skip_verify | default(false) | lower }}
+  bind_dn: "{{ drsync_auth_ldap.bind_dn }}"
+  bind_password: "{{ drsync_auth_ldap.bind_password }}"
+  base_dn: "{{ drsync_auth_ldap.base_dn }}"
+{% if drsync_auth_ldap.user_filter is defined %}
+  user_filter: "{{ drsync_auth_ldap.user_filter }}"
+{% endif %}
+{% if drsync_auth_ldap.group_attribute is defined %}
+  group_attribute: {{ drsync_auth_ldap.group_attribute }}
+{% endif %}
+{% endif %}
