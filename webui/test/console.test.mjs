@@ -200,7 +200,7 @@ test("in-flight panel shows what the agent is holding", () => {
   assert.match(panel(), /2 items/);
   assert.match(panel(), /as of .* ago/, "snapshot age not stated");
   assert.match(panel(), /chunk/);
-  assert.match(panel(), /entry-list/);
+  assert.match(panel(), /large-dir/);
 });
 
 test("running and queued items are distinguished", () => {
