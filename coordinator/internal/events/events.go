@@ -143,15 +143,20 @@ func (p *Poller) tickPasses(j *store.Job) {
 		return
 	}
 	for _, ps := range passes {
+		kinds, err := p.st.ShardKindsPresent(ps.ID)
+		if err != nil {
+			return
+		}
+		effState := ps.State.EffectiveState(kinds)
 		key := j.Name + "/" + strconv.Itoa(ps.PassNo)
 		prev, known := p.passStates[key]
-		if ps.State == prev {
+		if effState == prev {
 			continue
 		}
-		p.passStates[key] = ps.State
-		if p.primed && (known || ps.State != model.PassComplete) {
+		p.passStates[key] = effState
+		if p.primed && (known || effState != model.PassComplete) {
 			p.bus.Publish(Event{Type: "pass_state", Job: j.Name, PassNo: ps.PassNo,
-				Data: map[string]any{"state": ps.State, "prev": prev}})
+				Data: map[string]any{"state": effState, "prev": prev}})
 		}
 	}
 	// One stats frame per tick while the job is live (the --watch heartbeat).
@@ -165,9 +170,13 @@ func (p *Poller) tickPasses(j *store.Job) {
 		for st, n := range counts {
 			queue[string(st)] = n
 		}
+		kinds, err := p.st.ShardKindsPresent(ps.ID)
+		if err != nil {
+			return
+		}
 		p.bus.Publish(Event{Type: "stats", Job: j.Name, PassNo: ps.PassNo,
 			Data: map[string]any{
-				"pass_state":     ps.State,
+				"pass_state":     ps.State.EffectiveState(kinds),
 				"entries_walked": ps.EntriesWalked,
 				"files_copied":   ps.FilesCopied,
 				"bytes_copied":   ps.BytesCopied,
