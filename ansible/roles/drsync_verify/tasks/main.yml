@@ -1,0 +1,48 @@
+---
+# Confirms the fleet is actually left in a working, job-ready state — not
+# just "systemctl start returned 0" — by reproducing docs/INSTALL.md §7.1/§7.2:
+# poll the coordinator's health endpoint, then confirm every agent host this
+# playbook deployed shows up connected over its mTLS handshake.
+
+- name: Determine the coordinator's REST scheme
+  set_fact:
+    drsync_verify_scheme: "{{ 'https' if drsync_https_enabled else 'http' }}"
+
+- name: Wait for the coordinator to answer /healthz
+  uri:
+    url: "{{ drsync_verify_scheme }}://{{ coordinator_host }}:{{ drsync_http_port }}/healthz"
+    validate_certs: "{{ not drsync_https_enabled or (drsync_https_cert_src | length > 0) }}"
+    status_code: 200
+  register: _health
+  until: _health.status == 200
+  retries: "{{ drsync_verify_startup_timeout | default(30) }}"
+  delay: 1
+
+- name: Read the coordinator's own API token (for the /api/v1/agents check below)
+  slurp:
+    src: "{{ drsync_build_dir }}/api-token"
+  register: _token_b64
+  when: drsync_verify_check_agents | default(true)
+
+- name: Poll /api/v1/agents until every deployed agent is connected
+  uri:
+    url: "{{ drsync_verify_scheme }}://{{ coordinator_host }}:{{ drsync_http_port }}/api/v1/agents"
+    headers:
+      Authorization: "Bearer {{ (_token_b64.content | b64decode).strip() }}"
+    validate_certs: "{{ not drsync_https_enabled or (drsync_https_cert_src | length > 0) }}"
+    status_code: 200
+  register: _agents
+  until: >-
+    _agents.status == 200
+    and (groups['drsync_agents']
+         | difference(_agents.json | selectattr('connected', 'equalto', true) | map(attribute='id') | list)
+         | length) == 0
+  retries: "{{ drsync_verify_startup_timeout | default(30) }}"
+  delay: 2
+  when: drsync_verify_check_agents | default(true)
+
+- name: Report fleet status
+  debug:
+    msg: >-
+      Coordinator {{ coordinator_host }}:{{ drsync_http_port }} is healthy.
+      {{ (groups['drsync_agents'] | length) }} agent(s) expected, all connected.

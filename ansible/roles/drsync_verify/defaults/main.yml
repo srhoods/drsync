@@ -1,0 +1,3 @@
+---
+drsync_verify_startup_timeout: 30   # seconds (roughly) to wait for the coordinator / agent handshakes
+drsync_verify_check_agents: true

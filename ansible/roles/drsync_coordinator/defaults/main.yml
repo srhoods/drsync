@@ -1,0 +1,35 @@
+---
+drsync_data_dir: /var/lib/drsync
+drsync_listen_agent_addr: "0.0.0.0:7440"
+drsync_listen_http_addr: "0.0.0.0:7441"
+drsync_lease_ttl: 30s
+drsync_heartbeat_interval: 5s
+drsync_log_level: info
+drsync_min_agent_minor: 0
+drsync_tls_enabled: true
+drsync_coordinator_user: root
+drsync_coordinator_group: root
+
+drsync_auth_enabled: false
+drsync_auth_mode: local
+drsync_auth_allow_users: []
+drsync_auth_allow_groups: []
+drsync_auth_session_ttl_minutes: 480
+drsync_auth_ldap: {}
+
+drsync_https_enabled: false
+drsync_https_cert_src: ""   # path on the controller; empty = generate a self-signed pair
+drsync_https_key_src: ""
+
+drsync_smtp_enabled: false
+drsync_smtp_host: ""
+drsync_smtp_port: null
+drsync_smtp_security: starttls
+drsync_smtp_username: ""
+drsync_smtp_password: ""
+drsync_smtp_from: ""
+drsync_smtp_subject_prefix: "[drsync]"
+drsync_smtp_helo: ""
+drsync_smtp_timeout_seconds: 30
+
+drsync_verify_startup_timeout: 30

@@ -1,0 +1,9 @@
+---
+# certs.yaml/auth.yaml/smtp.yaml and the mTLS material are all read once at
+# drsyncd startup only (docs/INSTALL.md), so any change to them — or to the
+# unit file itself — needs an explicit restart, not just a reload.
+- name: restart drsyncd
+  systemd:
+    name: drsyncd
+    state: restarted
+    daemon_reload: true

@@ -1,0 +1,82 @@
+---
+# Builds bin/drsyncd, bin/drsync (Go) and agent/bin/drsync-agent (C) from
+# drsync_repo_dir, once, on the controller — see the "Build once on the
+# controller, ship binaries" note in ansible/README.md for why this doesn't
+# run per-target-host. `go build`/`make` are themselves incremental, so
+# re-running this role when nothing changed is a fast no-op; it is not a
+# from-scratch idempotency check bolted on top; it comes from the underlying
+# build tools.
+
+- name: Check Go toolchain is present and new enough
+  command: go version
+  register: _go_version
+  changed_when: false
+
+- name: Extract the Go toolchain's semantic version
+  set_fact:
+    _go_semver: "{{ _go_version.stdout | regex_search('go(\\d+\\.\\d+(\\.\\d+)?)', '\\1') | first }}"
+
+- name: Assert Go toolchain meets the version drsync/go.mod requires
+  assert:
+    that: _go_semver is version(drsync_go_min_version, '>=')
+    fail_msg: >-
+      Go {{ _go_semver }} does not satisfy the go.mod requirement
+      (>= {{ drsync_go_min_version }}). Install a newer Go toolchain on the
+      controller (https://go.dev/dl/) before re-running.
+    success_msg: "Go toolchain OK: {{ _go_version.stdout }}"
+
+- name: Check a C compiler is present (agent build)
+  command: "{{ item }} --version"
+  loop: [gcc, cc]
+  register: _cc_check
+  changed_when: false
+  failed_when: false
+
+- name: Assert at least one C compiler was found
+  assert:
+    that: _cc_check.results | selectattr('rc', 'equalto', 0) | list | length > 0
+    fail_msg: >-
+      No C compiler found on the controller. Install gcc (or clang, and set
+      CC=clang) plus libzstd-dev/libzstd-devel and libssl-dev/openssl-devel —
+      see docs/INSTALL.md §2.
+
+- name: Ensure the build output directory exists
+  file:
+    path: "{{ drsync_build_dir }}/bin"
+    state: directory
+    mode: "0755"
+
+- name: Build the coordinator (drsyncd)
+  command: go build -o {{ drsync_build_dir }}/bin/drsyncd ./coordinator/cmd/drsyncd
+  args:
+    chdir: "{{ drsync_repo_dir }}"
+  changed_when: true  # go build's own incrementality makes an unchanged rebuild cheap; module cache is what's actually reused
+
+- name: Build the operator CLI (drsync) — also used by drsync_pki for `drsync ca`
+  command: go build -o {{ drsync_build_dir }}/bin/drsync ./cli/drsync
+  args:
+    chdir: "{{ drsync_repo_dir }}"
+  changed_when: true
+
+- name: Build the C agent (drsync-agent)
+  command: make -C {{ drsync_repo_dir }}/agent
+  changed_when: true
+
+- name: Stat the built agent binary
+  stat:
+    path: "{{ drsync_repo_dir }}/agent/bin/drsync-agent"
+  register: _agent_bin
+
+- name: Assert the agent binary was actually produced
+  assert:
+    that: _agent_bin.stat.exists
+    fail_msg: >-
+      {{ drsync_repo_dir }}/agent/bin/drsync-agent was not produced by `make`.
+      Check the build output above for the actual compiler/linker error.
+
+- name: Stage the agent binary alongside the Go binaries
+  copy:
+    src: "{{ drsync_repo_dir }}/agent/bin/drsync-agent"
+    dest: "{{ drsync_build_dir }}/bin/drsync-agent"
+    mode: "0755"
+    remote_src: true

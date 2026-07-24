@@ -1,0 +1,50 @@
+---
+# Mints the fleet's mTLS trust material on the controller, once:
+#   - the fleet CA (ca.crt/ca.key)
+#   - the coordinator's server cert, SAN'd for every address agents dial
+#   - one client cert per agent host, CN == inventory_hostname
+#
+# Runs in the `hosts: localhost` play in site.yml (see the mTLS PKI design
+# note in ansible/README.md for why cert issuance lives on the controller,
+# not on remote hosts). Every step below is guarded by `creates:`, so a
+# second run of the whole playbook does not touch already-issued material —
+# this is the idempotency guarantee requirement #2 needs for the one step
+# that is genuinely "run once ever", not "converge every time".
+
+- name: Ensure the local PKI staging directory exists
+  file:
+    path: "{{ drsync_pki_local_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Init the fleet CA (only if it doesn't exist yet)
+  command: >
+    {{ drsync_build_dir }}/bin/drsync ca init
+    --dir {{ drsync_pki_local_dir }}
+    --cn {{ drsync_pki_ca_cn }}
+    --days {{ drsync_pki_ca_days }}
+  args:
+    creates: "{{ drsync_pki_local_dir }}/ca.crt"
+
+- name: Issue the coordinator's server cert (only if it doesn't exist yet)
+  command: >
+    {{ drsync_build_dir }}/bin/drsync ca issue
+    --dir {{ drsync_pki_local_dir }}
+    --type server
+    --cn {{ coordinator_host }}
+    --dns {{ coordinator_host }}
+    {{ '--ip ' + coordinator_ip if coordinator_ip is defined and coordinator_ip else '' }}
+    --days {{ drsync_pki_leaf_days }}
+  args:
+    creates: "{{ drsync_pki_local_dir }}/{{ coordinator_host }}.crt"
+
+- name: Issue one client cert per agent host (only for hosts missing one)
+  command: >
+    {{ drsync_build_dir }}/bin/drsync ca issue
+    --dir {{ drsync_pki_local_dir }}
+    --type agent
+    --cn {{ item }}
+    --days {{ drsync_pki_leaf_days }}
+  args:
+    creates: "{{ drsync_pki_local_dir }}/{{ item }}.crt"
+  loop: "{{ groups['drsync_agents'] }}"

@@ -1,0 +1,17 @@
+{{ ansible_managed | comment }}
+# See docs/smtp.yaml.example for the full reference.
+host: {{ drsync_smtp_host }}
+{% if drsync_smtp_port %}
+port: {{ drsync_smtp_port }}
+{% endif %}
+security: {{ drsync_smtp_security }}
+{% if drsync_smtp_username %}
+username: {{ drsync_smtp_username }}
+password: "{{ drsync_smtp_password }}"
+{% endif %}
+from: "{{ drsync_smtp_from }}"
+subject_prefix: "{{ drsync_smtp_subject_prefix }}"
+{% if drsync_smtp_helo %}
+helo: {{ drsync_smtp_helo }}
+{% endif %}
+timeout_seconds: {{ drsync_smtp_timeout_seconds }}

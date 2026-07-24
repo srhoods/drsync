@@ -1,0 +1,22 @@
+---
+# Shared prep for both the coordinator and agent hosts: the config directory
+# every drsyncd/*.yaml and mTLS material below it lives in. mode 0750: root
+# (or the coordinator's service user) plus its own group only — the files
+# placed inside individually tighten further where they hold secrets
+# (api-token, smtp.yaml, private keys all end up 0600).
+
+- name: Ensure /etc/drsync (config dir) exists
+  file:
+    path: "{{ drsync_config_dir }}"
+    state: directory
+    mode: "0750"
+    owner: root
+    group: root
+
+- name: Ensure the install directory exists
+  file:
+    path: "{{ drsync_install_dir }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
