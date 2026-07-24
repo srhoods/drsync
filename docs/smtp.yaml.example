@@ -23,3 +23,10 @@ from: "drsync <drsync@example.com>"    # required: From header + envelope sender
 subject_prefix: "[drsync]"             # optional: prepended to every subject
 helo: coordinator.example.com          # optional: EHLO name; defaults to hostname
 timeout_seconds: 30                    # optional: bounds the whole SMTP exchange
+
+# Parked-shard alerts: a job's first newly-parked shard emails immediately;
+# anything more that parks within this many seconds is held and merged into
+# one follow-up email instead of firing individually — caps how many emails
+# a job stuck parking shards (e.g. a degrading mount) can send. Optional;
+# defaults to 300 (5 minutes).
+parked_shard_rollup_seconds: 300

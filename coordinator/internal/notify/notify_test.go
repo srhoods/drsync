@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
@@ -28,6 +29,26 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.TimeoutSeconds != 30 {
 		t.Errorf("default timeout = %d", cfg.TimeoutSeconds)
+	}
+	if cfg.ParkedShardRollupSeconds != 300 {
+		t.Errorf("default parked_shard_rollup_seconds = %d, want 300", cfg.ParkedShardRollupSeconds)
+	}
+}
+
+func TestLoadConfigParkedShardRollupOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "smtp.yaml")
+	os.WriteFile(path, []byte("host: h\nfrom: a@b.com\nparked_shard_rollup_seconds: 60\n"), 0o600)
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ParkedShardRollupSeconds != 60 {
+		t.Errorf("parked_shard_rollup_seconds = %d, want 60", cfg.ParkedShardRollupSeconds)
+	}
+	s := NewSender(cfg)
+	if got, want := s.ParkedShardRollup(), 60*time.Second; got != want {
+		t.Errorf("ParkedShardRollup() = %v, want %v", got, want)
 	}
 }
 
@@ -87,6 +108,9 @@ func TestNilSenderIsInert(t *testing.T) {
 	var s *Sender
 	if s.Enabled() {
 		t.Fatal("nil sender should not be enabled")
+	}
+	if got := s.ParkedShardRollup(); got != 0 {
+		t.Errorf("nil sender ParkedShardRollup() = %v, want 0", got)
 	}
 	s.PassComplete([]string{"a@b.com"}, PassReport{})       // must not panic
 	s.JobComplete([]string{"a@b.com"}, JobReport{})         // must not panic

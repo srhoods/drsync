@@ -199,10 +199,15 @@ see docs/ADMIN.md §7). A parked shard can permanently stall its job — the coo
 not cross a phase boundary while any of that phase's shards are parked (DESIGN-coordinator.md
 §2) — so this fires on a periodic check (piggybacking passctrl's existing tick, not a
 separate timer) rather than waiting for job completion, which the job may never reach on its
-own until the shard is retried or dropped. Shards that park together in the same tick (e.g. a
-mount going unhealthy mid-walk) are batched into one email per job listing all of them, not
-one email per shard; a shard already alerted on is not re-alerted while it stays parked, but
-parks again as a fresh incident after being retried.
+own until the shard is retried or dropped. A job's first newly-parked shard since its last
+alert (or since the job started) emails immediately; anything more that parks within the
+coordinator's configured rollup window (`parked_shard_rollup_seconds` in smtp.yaml, default 5
+minutes) is held and merged into a single follow-up once the window elapses, rather than each
+firing its own email — this covers both shards parking together in the same tick (e.g. a mount
+going unhealthy mid-walk) and a slower trickle spread across many ticks, either of which would
+otherwise spam one email per shard. A shard already alerted on (sent, or currently held
+pending a rollup flush) is not re-alerted while it stays parked, but parks again as a fresh
+incident after being retried.
 
 Delivery is **best-effort and asynchronous**: it never blocks or fails a pass, and a
 transport error is logged on the coordinator, not surfaced to the job. If the coordinator

@@ -41,15 +41,29 @@ type Controller struct {
 	// tests. See agentsrv.Server.NotifyJobDone.
 	NotifyJobDone func(jobID int64)
 
-	// notifiedParked tracks shard IDs already covered by a parked-shard alert
-	// email, so the periodic digest (checkParkedShards, run from tick) never
-	// re-notifies the same shard. A shard is forgotten once it leaves parked
-	// state (retried or dropped) — see checkParkedShards. In-memory only: a
-	// coordinator restart re-sends alerts for shards still parked at boot,
-	// which is the safe direction to be wrong in (a redundant email, not a
-	// silently dropped one).
-	notifiedParkedMu sync.Mutex
-	notifiedParked   map[int64]bool
+	// parkedAlertMu guards parkedAlerted and parkedRollup below.
+	parkedAlertMu sync.Mutex
+	// parkedAlerted tracks shard IDs already covered by a parked-shard alert —
+	// sent, or currently held in a job's pending rollup batch — so the
+	// periodic check (checkParkedShards, run from tick) never double-counts a
+	// shard. A shard is forgotten once it leaves parked state (retried or
+	// dropped) — see checkParkedShards. In-memory only: a coordinator restart
+	// re-sends alerts for shards still parked at boot, which is the safe
+	// direction to be wrong in (a redundant email, not a silently dropped one).
+	parkedAlerted map[int64]bool
+	// parkedRollup holds, per job, the shards newly parked since that job's
+	// last parked-shard email plus when that email went out — see
+	// checkParkedShards for the send-now-vs-hold decision this drives: a
+	// job's first newly-parked shard (or the first since parkedRollup last
+	// flushed) emails immediately, and any more that park within the
+	// notifier's configured rollup window are batched here instead of each
+	// firing their own email, then flushed together once the window elapses.
+	parkedRollup map[string]*parkedRollupState
+}
+
+type parkedRollupState struct {
+	lastSentAt time.Time
+	pending    []store.ParkedShard
 }
 
 // jobTerminal fires the agent notification for a job that just reached a
@@ -61,7 +75,8 @@ func (c *Controller) jobTerminal(jobID int64) {
 }
 
 func New(st *store.Store, journalRoot string) *Controller {
-	return &Controller{st: st, journalRoot: journalRoot, notifiedParked: map[int64]bool{}}
+	return &Controller{st: st, journalRoot: journalRoot,
+		parkedAlerted: map[int64]bool{}, parkedRollup: map[string]*parkedRollupState{}}
 }
 
 // SetNotifier wires an email sender for pass/job completion notifications. A
@@ -205,14 +220,19 @@ func (c *Controller) tick() error {
 	return nil
 }
 
-// checkParkedShards emails a digest alert for any shard that is parked and
-// has not already been notified about, grouped one email per job per tick —
-// a burst of shards parking together (e.g. a mount going unhealthy mid-walk)
-// becomes one email listing all of them, not one per shard. A shard parking
-// can permanently stall its job (advance() will not cross a phase boundary
-// while any of that phase's shards are parked), so this tick-driven digest is
-// the operator's actual notification path — not job completion, which the
-// job may never reach until the parked shard is retried or dropped.
+// checkParkedShards alerts on shards that are parked and not yet covered by
+// an email, rolled up per job so a burst — whether every shard parks in the
+// same tick, or they trickle in one at a time over minutes (e.g. a mount
+// degrading mid-walk) — sends one email, not one per shard or one per tick.
+// A job's first newly-parked shard since its last alert emails immediately;
+// anything more that parks within the notifier's configured rollup window
+// (Config.ParkedShardRollupSeconds, default 5 minutes) is held and merged
+// into a single follow-up once the window elapses, rather than each firing
+// its own email. A shard parking can permanently stall its job (advance()
+// will not cross a phase boundary while any of that phase's shards are
+// parked), so this tick-driven check is the operator's actual notification
+// path — not job completion, which the job may never reach until the parked
+// shard is retried or dropped.
 func (c *Controller) checkParkedShards() error {
 	if c.notifier == nil || !c.notifier.Enabled() {
 		return nil
@@ -221,31 +241,57 @@ func (c *Controller) checkParkedShards() error {
 	if err != nil {
 		return err
 	}
-	c.notifiedParkedMu.Lock()
+	now := time.Now()
+	rollup := c.notifier.ParkedShardRollup()
+
+	c.parkedAlertMu.Lock()
 	stillParked := make(map[int64]bool, len(all))
-	byJob := map[string][]store.ParkedShard{}
+	newByJob := map[string][]store.ParkedShard{}
 	for _, sh := range all {
 		stillParked[sh.ID] = true
-		if !c.notifiedParked[sh.ID] {
-			byJob[sh.Job] = append(byJob[sh.Job], sh)
+		if !c.parkedAlerted[sh.ID] {
+			newByJob[sh.Job] = append(newByJob[sh.Job], sh)
+			c.parkedAlerted[sh.ID] = true
 		}
 	}
 	// Forget shards that left parked state (retried or dropped) so a shard
 	// that parks again later is alerted on again rather than silently
 	// suppressed forever by a stale map entry.
-	for id := range c.notifiedParked {
+	for id := range c.parkedAlerted {
 		if !stillParked[id] {
-			delete(c.notifiedParked, id)
+			delete(c.parkedAlerted, id)
 		}
 	}
-	for _, shards := range byJob {
-		for _, sh := range shards {
-			c.notifiedParked[sh.ID] = true
-		}
-	}
-	c.notifiedParkedMu.Unlock()
 
-	for jobName, shards := range byJob {
+	// Decide send-now vs. hold for every job with new parks this tick, and
+	// separately flush any job whose hold window has now elapsed even without
+	// a new park this tick (otherwise a burst that stops arriving right at
+	// the window edge could wait for a park that never comes).
+	toSend := map[string][]store.ParkedShard{}
+	for jobName, shards := range newByJob {
+		st := c.parkedRollup[jobName]
+		if st == nil {
+			st = &parkedRollupState{}
+			c.parkedRollup[jobName] = st
+		}
+		if st.lastSentAt.IsZero() || now.Sub(st.lastSentAt) >= rollup {
+			toSend[jobName] = append(st.pending, shards...)
+			st.pending = nil
+			st.lastSentAt = now
+		} else {
+			st.pending = append(st.pending, shards...)
+		}
+	}
+	for jobName, st := range c.parkedRollup {
+		if len(st.pending) > 0 && now.Sub(st.lastSentAt) >= rollup {
+			toSend[jobName] = append(toSend[jobName], st.pending...)
+			st.pending = nil
+			st.lastSentAt = now
+		}
+	}
+	c.parkedAlertMu.Unlock()
+
+	for jobName, shards := range toSend {
 		job, err := c.st.GetJob(jobName)
 		if err != nil {
 			slog.Warn("notify: lookup job for parked-shard alert failed", "job", jobName, "err", err)
