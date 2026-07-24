@@ -207,7 +207,7 @@ lease shard ──> dual-tree walk ──> emit tasks ────────�
 - **Directory metadata is applied in a final fix-up sweep per shard** (children first),
   because writing into a directory disturbs its mtime, and restrictive dir modes (e.g.
   0500) must land *after* population.
-- **Large-file chunking (implemented):** a file ≥ `chunk_threshold` (default 1 GiB) and
+- **Large-file chunking (implemented):** a file ≥ `chunk_threshold` (default 8 GiB) and
   larger than one `chunk_size` becomes independent chunk-copy tasks (offset/length). The
   coordinator lays out the ranges and grants them **across hosts**, all writing one
   shared destination temp (preallocated with `fallocate`); a final task fsyncs, applies

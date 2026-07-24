@@ -118,21 +118,21 @@ spec:
     - include: "**"
 
   passes:
-    max: 10                       # ceiling on passes (default 10)
+    max: 5                        # ceiling on passes (default 5)
     schedule: continuous          # continuous | manual  (manual = you trigger each pass)
     converge_when:                # stop early once a pass delta is "small enough"
       delta_files_below: 1        # a pass that changes 0 files always converges regardless
       delta_bytes_below: 0
 
   copy:
-    chunk_threshold: 1GiB         # files ≥ this are copied in parallel ranges (huge files)
-    chunk_size: 1GiB              # range per chunk task; a file > this fans out across agents
+    chunk_threshold: 8GiB         # files ≥ this are copied in parallel ranges (huge files)
+    chunk_size: 8GiB              # range per chunk task; a file > this fans out across agents
     buffer_size: 1MiB
     preserve_sparse: true         # SEEK_HOLE/SEEK_DATA extent copy
     server_side_copy: auto        # auto | off | require  (copy_file_range / NFSv4.2 SSC / reflink)
     temp_naming: ".drsync.tmp."   # prefix only; job/pass/shard suffix is appended
-    fsync: per_file               # per_file | batched  (batched is ~5× faster, weaker crash durability)
-    direct_write: false           # new files skip the temp+rename (~2× on GPFS/Weka); updates stay atomic
+    fsync: batched                # per_file | batched  (batched is ~5× faster, weaker crash durability)
+    direct_write: true            # new files skip the temp+rename (~2× on GPFS/Weka); updates stay atomic
 
   metadata:
     owner: true
@@ -157,14 +157,14 @@ spec:
       on_mismatch: recopy         # recopy | fail
 
   deletes:
-    mode: report                  # report | mirror  (see §5; delete still needs the CLI gate)
+    mode: mirror                  # report | mirror  (see §5; delete still needs the CLI gate)
 
   limits:
     bandwidth_per_agent: 0        # bytes/s, 0 = unlimited
     iops_per_agent: 0
 
   tuning:
-    shard_budget: 250000          # entries a shard handles before it self-splits
+    shard_budget: 2000            # entries a shard handles before it self-splits
     dir_split_threshold: 50000    # a directory bigger than this is fanned out as entry-list shards
     entrylist_batch: 4000         # names per entry-list shard = the granularity of that fan-out
     statx_batch: 256              # statx in flight per walker = io_uring ring depth
@@ -345,8 +345,8 @@ extreme.
   agent's prefetch window and stall the rest of the tree. The cap yields when
   that directory is the only work left, so it never idles the fleet.
 
-- **Very large files.** A file at/above `copy.chunk_threshold` (default 1 GiB)
-  and larger than one `copy.chunk_size` (default 1 GiB) is **copied across the
+- **Very large files.** A file at/above `copy.chunk_threshold` (default 8 GiB)
+  and larger than one `copy.chunk_size` (default 8 GiB) is **copied across the
   fleet**: the agent that walks it hands the file to the coordinator, which fans
   its byte ranges out as chunk tasks to different hosts, all writing one shared
   temp that a final task fsyncs, stamps with metadata, and renames into place —
@@ -381,7 +381,7 @@ fan-out only in its first moments.
 | `spread_mode` | Behaviour |
 |---|---|
 | `auto` (default) | Fan out while the fleet is starved. Leave it here. |
-| `off` | Never fan out early: a shard descends until `shard_budget` runs out. A volume smaller than `shard_budget` (250 000 entries) is then walked by **one thread on one agent** — the rest of the fleet idles. Diagnostic only. |
+| `off` | Never fan out early: a shard descends until `shard_budget` runs out. A volume smaller than `shard_budget` (2,000 entries) is then walked by **one thread on one agent** — the rest of the fleet idles. Diagnostic only. |
 | `always` | Fan out on every grant regardless of queue depth. Costs a coordinator round trip per directory; use it to reproduce distribution problems, not in production. |
 
 Check that a job is actually spread with `drsync job status <job>` (per-agent

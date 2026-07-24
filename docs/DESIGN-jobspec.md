@@ -44,22 +44,22 @@ spec:
     - include: "**"                  # implicit default
 
   passes:
-    max: 10                          # hard stop; convergence usually stops earlier
+    max: 5                           # hard stop; convergence usually stops earlier
     converge_when:
       delta_files_below: 100000      # OR-combined convergence criteria
       delta_bytes_below: 50GiB
     schedule: continuous             # continuous | manual (operator triggers each pass)
 
   copy:
-    chunk_threshold: 1GiB            # files >= this are split into chunk tasks
-    chunk_size: 1GiB                 # size of each chunk task (file > this fans out)
+    chunk_threshold: 8GiB            # files >= this are split into chunk tasks
+    chunk_size: 8GiB                 # size of each chunk task (file > this fans out)
     buffer_size: 1MiB                # io_uring buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA; auto-fallback to zero-detect
     server_side_copy: auto           # try copy_file_range (NFSv4.2), fallback read/write
     temp_naming: ".drsync.tmp."      # PREFIX for in-progress destination names;
                                      # "<job>-<pass>.<shard>.<seq>" is appended
-    fsync: per_file                  # per_file | batched(n)
-    direct_write: false              # copy a NEW file straight to its final name,
+    fsync: batched                   # per_file | batched(n)
+    direct_write: true               # copy a NEW file straight to its final name,
                                      # skipping the temp+rename — ~2x on filesystems
                                      # that serialize directory ops (GPFS/Weka).
                                      # Trades atomicity: a crash mid-write leaves a
@@ -94,7 +94,7 @@ spec:
       on_mismatch: recopy            # recopy | fail
 
   deletes:
-    mode: report                     # D5: report | mirror (mirror requires --i-know flag
+    mode: mirror                     # D5: report | mirror (mirror requires --i-know flag
                                      # at pass trigger time as a second gate)
 
   limits:
@@ -104,7 +104,7 @@ spec:
     src_load_ceiling: null           # optional: pause if src latency p99 exceeds N ms
 
   tuning:                            # rarely touched; sane defaults from D7 sizing
-    shard_budget: 250000             # entries processed before pushing subdirs back
+    shard_budget: 2000               # entries processed before pushing subdirs back
     dir_split_threshold: 50000       # single-dir size that triggers entry-list sharding
     statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (pow2, 1–4096)
     mtime_slop_ns: 1000000           # 1ms slop for cross-FS timestamp granularity
