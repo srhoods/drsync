@@ -443,6 +443,21 @@ func (s *Store) JobSummaries() ([]*JobSummary, error) {
 		v.DryRun = dry != 0
 		out = append(out, &v)
 	}
+	for _, v := range out {
+		if v.LatestPassNo == 0 || v.LatestPassState == model.PassComplete {
+			continue
+		}
+		var passID int64
+		if err := s.rdb.QueryRow(`SELECT id FROM passes WHERE job_id = ? AND pass_no = ?`,
+			v.ID, v.LatestPassNo).Scan(&passID); err != nil {
+			continue // best-effort: fall back to the stored state
+		}
+		kinds, err := s.ShardKindsPresent(passID)
+		if err != nil {
+			continue
+		}
+		v.LatestPassState = v.LatestPassState.EffectiveState(kinds)
+	}
 	return out, rows.Err()
 }
 
@@ -1201,6 +1216,29 @@ func (s *Store) PassOfShard(shardID int64) (int64, error) {
 // ShardStateCounts returns shard counts by state for a pass. Served from the
 // maintained shard_counts rollup on the read pool — O(states), no full scan,
 // no write-lock contention.
+// ShardKindsPresent reports which shard kinds have any (queued/leased/done/
+// parked) shards for a pass. Reporting uses this to catch a pass whose live
+// queue has already moved on to the next phase's shard kind while
+// passes.state has not yet been flipped to match — see PassState.EffectiveState.
+func (s *Store) ShardKindsPresent(passID int64) (map[model.ShardKind]bool, error) {
+	rows, err := s.rdb.Query(`SELECT kind, SUM(n) FROM shard_counts
+		WHERE pass_id = ? GROUP BY kind HAVING SUM(n) > 0`, passID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[model.ShardKind]bool{}
+	for rows.Next() {
+		var k string
+		var n int64
+		if err := rows.Scan(&k, &n); err != nil {
+			return nil, err
+		}
+		out[model.ShardKind(k)] = true
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ShardStateCounts(passID int64) (map[model.ShardState]int64, error) {
 	rows, err := s.rdb.Query(`SELECT state, SUM(n) FROM shard_counts
 		WHERE pass_id = ? GROUP BY state HAVING SUM(n) > 0`, passID)

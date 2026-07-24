@@ -911,3 +911,72 @@ func TestCreateJobDestinationConflictIsAtomic(t *testing.T) {
 		t.Fatalf("%d concurrent submits of the same destination created %d jobs, want 1", n, created)
 	}
 }
+
+// TestShardKindsPresent locks down the query ShardKindsPresent.EffectiveState
+// relies on: a kind with only DONE shards still counts as present (the pass
+// isn't "back out" of a phase once its shards finish), and a kind with zero
+// rows in shard_counts is absent.
+func TestShardKindsPresent(t *testing.T) {
+	s := openTest(t)
+	_, passID, shardID := seed(t, s) // one KindDir shard, QUEUED
+
+	kinds, err := s.ShardKindsPresent(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !kinds[model.KindDir] || kinds[model.KindDirfix] {
+		t.Fatalf("kinds = %+v, want {dir: true}", kinds)
+	}
+
+	rows, err := s.LeaseShards("agent-a", 4, time.Minute)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("lease: rows=%v err=%v", rows, err)
+	}
+	if err := s.CompleteShard(shardID, rows[0].LeaseID, nil); err != nil {
+		t.Fatal(err)
+	}
+	kinds, err = s.ShardKindsPresent(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !kinds[model.KindDir] {
+		t.Fatalf("kinds = %+v, want dir still present once DONE", kinds)
+	}
+}
+
+// TestJobSummariesReportsLiveShardKindOverStaleState reproduces the reported
+// bug directly: passctrl.advance seeds a phase's shards before flipping
+// passes.state to that phase (deliberately, so a tick can't see the new
+// phase with an empty queue and skip it), so there is a real window where
+// DIRFIX shards are already queued/leased while the stored pass state still
+// reads SCANNING. JobSummaries — the WebUI job list / API source — must
+// report the phase the live queue proves, not the stale stored one.
+func TestJobSummariesReportsLiveShardKindOverStaleState(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, _ := seed(t, s) // pass created in PassScanning
+
+	if _, err := s.InsertShards(passID, 0,
+		[]NewShard{{Kind: model.KindDirfix, Payload: []byte("x")}}); err != nil {
+		t.Fatal(err)
+	}
+	// passes.state deliberately NOT flipped yet — this is the window advance()
+	// leaves open between seeding and SetPassState.
+
+	sums, err := s.JobSummaries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *JobSummary
+	for _, v := range sums {
+		if v.ID == jobID {
+			got = v
+		}
+	}
+	if got == nil {
+		t.Fatal("job missing from JobSummaries")
+	}
+	if got.LatestPassState != model.PassDirfix {
+		t.Fatalf("LatestPassState = %s, want DIRFIX (stored state is still SCANNING, "+
+			"but dirfix shards are already queued)", got.LatestPassState)
+	}
+}

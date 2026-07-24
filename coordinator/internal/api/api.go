@@ -382,6 +382,14 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, p := range passes {
+		if p.State != model.PassComplete {
+			kinds, err := s.st.ShardKindsPresent(p.ID)
+			if err != nil {
+				httpErr(w, http.StatusInternalServerError, "%v", err)
+				return
+			}
+			p.State = p.State.EffectiveState(kinds)
+		}
 		v.Passes = append(v.Passes, passViewOf(p))
 	}
 	writeJSON(w, http.StatusOK, v)
