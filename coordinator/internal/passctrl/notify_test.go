@@ -86,9 +86,19 @@ func serveOneSMTPConn(conn net.Conn, got chan string) {
 
 func setNotifier(t *testing.T, c *Controller) chan string {
 	t.Helper()
+	return setNotifierWithRollup(t, c, 0)
+}
+
+// setNotifierWithRollup is setNotifier with an explicit parked-shard rollup
+// window, for tests that exercise the hold-and-merge behavior in
+// checkParkedShards. rollupSeconds: 0 means "no rollup" (every new park
+// sends immediately), matching every pre-existing test in this file.
+func setNotifierWithRollup(t *testing.T, c *Controller, rollupSeconds int) chan string {
+	t.Helper()
 	host, port, got := mockSMTP(t)
 	c.SetNotifier(notify.NewSender(&notify.Config{
 		Host: host, Port: port, Security: "none", From: "drsync <d@example.com>", TimeoutSeconds: 2,
+		ParkedShardRollupSeconds: rollupSeconds,
 	}))
 	return got
 }
@@ -304,6 +314,102 @@ func TestCheckParkedShardsBatchesPerJob(t *testing.T) {
 		}
 	}
 	assertNoEmail(t, got) // exactly one email, not three
+}
+
+// A burst that trickles in slower than one tick — e.g. a degrading mount
+// parking a shard every few seconds over minutes — must not send an email
+// per shard: the first park alerts immediately (operators still hear about
+// the incident right away), but anything more that parks within the rollup
+// window is held and merged into one follow-up, not fired individually.
+func TestCheckParkedShardsRollsUpTrickleWithinWindow(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, notifyTestSpec(""))
+	got := setNotifierWithRollup(t, c, 1) // 1s window, so the test runs fast
+
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parkOneShard(t, c, pass, "first/park")
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	body := awaitEmail(t, got) // first park in a quiet job: immediate
+	if !strings.Contains(body, "first/park") {
+		t.Fatalf("first alert missing first/park:\n%s", body)
+	}
+
+	// Two more shards park inside the still-open rollup window (well under
+	// 1s after the first email) — checkParkedShards runs on each but must
+	// NOT email either one individually.
+	parkOneShard(t, c, pass, "second/park")
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoEmail(t, got)
+
+	parkOneShard(t, c, pass, "third/park")
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoEmail(t, got)
+
+	// Window elapses; the next check flushes both held shards together in
+	// ONE email, not two.
+	time.Sleep(1100 * time.Millisecond)
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	body = awaitEmail(t, got)
+	for _, want := range []string{"second/park", "third/park"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rollup email missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "first/park") {
+		t.Errorf("rollup email re-sent the already-alerted first/park:\n%s", body)
+	}
+	assertNoEmail(t, got) // exactly one rollup email, not two
+}
+
+// A job that keeps parking shards throughout the rollup window must still
+// get an email once the window closes — checkParkedShards must flush a
+// job's held batch on the tick the window elapses even if that particular
+// tick brings no new park, otherwise a burst that stops right at the edge
+// could wait indefinitely for a park that never comes.
+func TestCheckParkedShardsFlushesOnWindowElapseWithoutNewPark(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, notifyTestSpec(""))
+	got := setNotifierWithRollup(t, c, 1)
+
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parkOneShard(t, c, pass, "immediate")
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	awaitEmail(t, got)
+
+	parkOneShard(t, c, pass, "held")
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoEmail(t, got) // held, inside the window
+
+	time.Sleep(1100 * time.Millisecond)
+	// No new shard parks on this tick — only the window elapsing should
+	// trigger the flush.
+	if err := c.checkParkedShards(); err != nil {
+		t.Fatal(err)
+	}
+	body := awaitEmail(t, got)
+	if !strings.Contains(body, "held") {
+		t.Errorf("window-elapse flush missing the held shard:\n%s", body)
+	}
 }
 
 func TestJobParkedShardsFiltersByJob(t *testing.T) {

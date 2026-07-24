@@ -48,6 +48,13 @@ type Config struct {
 	SubjectPrefix string `yaml:"subject_prefix,omitempty"`
 	// TimeoutSeconds bounds the whole SMTP exchange; defaults to 30.
 	TimeoutSeconds int `yaml:"timeout_seconds,omitempty"`
+	// ParkedShardRollupSeconds bounds how often a job may send a parked-shard
+	// alert: the first newly-parked shard in a job emails immediately, and any
+	// further shards that park within this many seconds afterward are held and
+	// rolled into a single follow-up email once the window elapses, rather
+	// than one email per shard. Defaults to 300 (5 minutes). See
+	// passctrl.checkParkedShards.
+	ParkedShardRollupSeconds int `yaml:"parked_shard_rollup_seconds,omitempty"`
 }
 
 // LoadConfig reads, defaults and validates the SMTP config at path. When
@@ -95,6 +102,9 @@ func (c *Config) applyDefaults() {
 	if c.TimeoutSeconds == 0 {
 		c.TimeoutSeconds = 30
 	}
+	if c.ParkedShardRollupSeconds == 0 {
+		c.ParkedShardRollupSeconds = 300
+	}
 	if c.HELO == "" {
 		if h, err := os.Hostname(); err == nil {
 			c.HELO = h
@@ -139,6 +149,16 @@ func NewSender(cfg *Config) *Sender {
 
 // Enabled reports whether s can actually send (non-nil and configured).
 func (s *Sender) Enabled() bool { return s != nil && s.cfg != nil }
+
+// ParkedShardRollup returns the configured parked-shard rollup window (see
+// Config.ParkedShardRollupSeconds), or 0 if s is nil/disabled — callers that
+// gate on Enabled() first never observe the zero value as a real setting.
+func (s *Sender) ParkedShardRollup() time.Duration {
+	if !s.Enabled() {
+		return 0
+	}
+	return time.Duration(s.cfg.ParkedShardRollupSeconds) * time.Second
+}
 
 // PassComplete emails a per-pass report to recipients. Best-effort and async.
 func (s *Sender) PassComplete(recipients []string, r PassReport) {
