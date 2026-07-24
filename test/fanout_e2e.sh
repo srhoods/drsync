@@ -6,8 +6,10 @@
 # smaller than that never split at all — the root shard walked the entire tree on
 # one thread of one agent while the rest of the cluster idled.
 #
-# Both runs below use the SAME small tree and the default shard_budget. They
-# differ only in tuning.spread_mode, which isolates the fix:
+# Both runs below use the SAME small tree and an explicit, held-fixed
+# shard_budget (well above the tree's file count, so shard_budget itself
+# never triggers a split). They differ only in tuning.spread_mode, which
+# isolates the fix:
 #   spread_mode=off  → the old behaviour: exactly ONE agent walks (the control)
 #   spread_mode=auto → the fix: all THREE agents walk
 set -euo pipefail
@@ -51,10 +53,10 @@ echo -n fanouttoken >"$API_TOKEN_FILE"
 chmod 600 "$API_TOKEN_FILE"
 
 # --- source tree -------------------------------------------------------------
-# ~4800 files over 60 leaf directories: far below shard_budget (250k) and every
-# directory far below dir_split_threshold (50k), so NEITHER of the pre-existing
-# split triggers can fire. This is exactly the shape that used to pin a whole
-# volume to one agent.
+# ~4800 files over 60 leaf directories: far below the shard_budget the job
+# spec pins below (250k) and every directory far below dir_split_threshold
+# (50k), so NEITHER of the pre-existing split triggers can fire. This is
+# exactly the shape that used to pin a whole volume to one agent.
 SRC="$WORK/src"
 for top in $(seq 1 12); do
     for sub in $(seq 1 5); do
@@ -135,9 +137,12 @@ spec:
     mode: off
   tuning:
     spread_mode: $spread
+    # Pinned explicitly (not left to the coordinator's default) so this test
+    # holds shard_budget fixed and varies only spread_mode: the whole point
+    # is that a small volume must fan out on spread_mode alone, without
+    # shard_budget doing the splitting instead.
+    shard_budget: 250000
 EOF
-    # shard_budget deliberately left at its 250k default: the whole point is
-    # that a small volume must fan out without hand-tuning it.
     "$DRSYNC" job submit "$WORK/$name.yaml" --start >/dev/null \
         || fail "$name: submit failed"
     for _ in $(seq 1 240); do

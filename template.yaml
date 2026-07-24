@@ -32,21 +32,21 @@ spec:
     - exclude: "**/*.tmp"
 
   passes:
-    max: 10                          # hard ceiling; convergence usually stops sooner
+    max: 5                           # hard ceiling; convergence usually stops sooner
     schedule: continuous             # continuous | manual (operator triggers each pass)
     converge_when:                   # stop once a pass's delta is under EITHER (OR-combined)
       delta_files_below: 0           # 0 = only the zero-delta fixpoint stops the job
       delta_bytes_below: 0           # e.g. 50GiB to stop while a small delta remains
 
   copy:
-    chunk_threshold: 1GiB            # files >= this are eligible to split into chunk tasks
-    chunk_size: 1GiB                 # bytes per chunk; a file > this fans out across agents
+    chunk_threshold: 8GiB            # files >= this are eligible to split into chunk tasks
+    chunk_size: 8GiB                 # bytes per chunk; a file > this fans out across agents
     buffer_size: 1MiB                # copy buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA, with zero-detect fallback
     server_side_copy: auto           # auto | off | require (copy_file_range / reflink)
     temp_naming: ".drsync.tmp."      # prefix for in-progress destination names
-    fsync: per_file                  # per_file | batched
-    direct_write: false              # write NEW files straight to their final name (faster
+    fsync: batched                   # per_file | batched
+    direct_write: true               # write NEW files straight to their final name (faster
                                      # on GPFS/Weka; a crash leaves a partial, re-copied
                                      # next pass). Updates always use the atomic temp+rename.
 
@@ -77,7 +77,7 @@ spec:
       on_mismatch: recopy            # recopy | fail
 
   deletes:
-    mode: report                     # report | mirror — mirror deletes destination orphans
+    mode: mirror                     # report | mirror — mirror deletes destination orphans
                                      # and requires a second explicit gate at pass-trigger time
 
   limits:
@@ -86,7 +86,7 @@ spec:
 
   # Rarely changed; defaults are sized for a small fleet of fast agents.
   tuning:
-    shard_budget: 250000             # entries a walker processes before pushing subdirs back
+    shard_budget: 2000               # entries a walker processes before pushing subdirs back
     dir_split_threshold: 50000       # single-directory size that triggers entry-list sharding
     entrylist_batch: 4000            # names per entry-list shard (sets a huge dir's fan-out)
     statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (1–4096)

@@ -73,7 +73,7 @@ type JobSpec struct {
 			ServerSideCopy string   `yaml:"server_side_copy"`
 			TempNaming     string   `yaml:"temp_naming"`
 			Fsync          string   `yaml:"fsync"`
-			DirectWrite    bool     `yaml:"direct_write"`
+			DirectWrite    *bool    `yaml:"direct_write"`
 		} `yaml:"copy"`
 		Metadata struct {
 			Owner  *bool `yaml:"owner"`
@@ -173,19 +173,16 @@ func boolDefault(p **bool, v bool) {
 func (s *JobSpec) ApplyDefaults() {
 	sp := &s.Spec
 	if sp.Passes.Max == 0 {
-		sp.Passes.Max = 10
+		sp.Passes.Max = 5
 	}
 	if sp.Passes.Schedule == "" {
 		sp.Passes.Schedule = "continuous"
 	}
 	if sp.Copy.ChunkThreshold == 0 {
-		sp.Copy.ChunkThreshold = 1 << 30 // 1 GiB
+		sp.Copy.ChunkThreshold = 8 << 30 // 8 GiB
 	}
 	if sp.Copy.ChunkSize == 0 {
-		// One chunk per GiB by default. With chunk_threshold at 1 GiB, a file
-		// only fans out once it exceeds a single chunk (> chunk_size), so an
-		// 8 GiB default would have kept every file up to 8 GiB on one agent.
-		sp.Copy.ChunkSize = 1 << 30
+		sp.Copy.ChunkSize = 8 << 30 // 8 GiB
 	}
 	if sp.Copy.BufferSize == 0 {
 		sp.Copy.BufferSize = 1 << 20
@@ -198,8 +195,9 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Copy.TempNaming = ".drsync.tmp."
 	}
 	if sp.Copy.Fsync == "" {
-		sp.Copy.Fsync = "per_file"
+		sp.Copy.Fsync = "batched"
 	}
+	boolDefault(&sp.Copy.DirectWrite, true)
 	boolDefault(&sp.Metadata.Owner, true)
 	boolDefault(&sp.Metadata.Mode, true)
 	boolDefault(&sp.Metadata.Times, true)
@@ -221,10 +219,10 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Verify.Checksum.OnMismatch = "recopy"
 	}
 	if sp.Deletes.Mode == "" {
-		sp.Deletes.Mode = "report"
+		sp.Deletes.Mode = "mirror"
 	}
 	if sp.Tuning.ShardBudget == 0 {
-		sp.Tuning.ShardBudget = 250_000
+		sp.Tuning.ShardBudget = 2_000
 	}
 	if sp.Tuning.DirSplitThreshold == 0 {
 		sp.Tuning.DirSplitThreshold = 50_000
@@ -387,7 +385,7 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 			BufferSize:     uint64(sp.Copy.BufferSize),
 			PreserveSparse: *sp.Copy.PreserveSparse,
 			TempPrefix:     sp.Copy.TempNaming,
-			DirectWrite:    sp.Copy.DirectWrite,
+			DirectWrite:    *sp.Copy.DirectWrite,
 		},
 		Metadata: &drsyncpb.MetadataOptions{
 			Owner:  *sp.Metadata.Owner,
