@@ -253,6 +253,82 @@ func TestReapDoneShards(t *testing.T) {
 	}
 }
 
+// TestReapDoneShardsPreservesDoneCount guards the regression the four failing
+// e2e tests (fanout_e2e, deep_e2e, scale_e2e, e2e) caught in CI: reaping must
+// not make a completed pass's reported DONE total disappear along with the
+// rows. ShardStateCounts is the API's pass-detail endpoint's only source for
+// "how many shards of this pass finished", so it has to keep counting a
+// shard that ran and succeeded, whether or not the reaper has since deleted
+// its row.
+func TestReapDoneShardsPreservesDoneCount(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	batch := make([]NewShard, 30)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d-%03d", i)}
+	}
+	ids, err := s.InsertShards(passID, 0, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+			string(model.ShardDone), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pre-existing root shard from seed() is also QUEUED->left alone here;
+	// only count the 30 we just marked DONE below, before reaping anything.
+	before, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before[model.ShardDone] != 30 {
+		t.Fatalf("DONE before reap = %d, want 30", before[model.ShardDone])
+	}
+
+	if n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindDir}); err != nil || n != 30 {
+		t.Fatalf("reap = %d, %v; want 30, nil", n, err)
+	}
+
+	after, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[model.ShardDone] != 30 {
+		t.Fatalf("DONE after reap = %d, want 30 (unchanged despite rows being deleted)", after[model.ShardDone])
+	}
+
+	// A second, independent reap call (a later phase transition on the same
+	// pass reaping a different kind) must ADD to shards_reaped, not overwrite
+	// it — the running total across the pass's whole life must be additive.
+	batch2 := make([]NewShard, 5)
+	for i := range batch2 {
+		batch2[i] = NewShard{Kind: model.KindVerify, RelPath: fmt.Sprintf("v-%03d", i)}
+	}
+	ids2, err := s.InsertShards(passID, 0, batch2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids2 {
+		if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+			string(model.ShardDone), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindVerify}); err != nil || n != 5 {
+		t.Fatalf("second reap = %d, %v; want 5, nil", n, err)
+	}
+	final, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final[model.ShardDone] != 35 {
+		t.Fatalf("DONE after second reap = %d, want 35 (30 + 5, additive across reaps)", final[model.ShardDone])
+	}
+}
+
 // TestReapDoneShardsBatched checks that a backlog bigger than one batch is
 // only partially drained per call (the batching that keeps a huge reap from
 // holding the writer lock for one long delete) and a second call picks up

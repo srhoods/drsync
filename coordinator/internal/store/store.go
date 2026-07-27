@@ -94,6 +94,11 @@ CREATE TABLE IF NOT EXISTS passes (
   fidelity_exceptions INTEGER NOT NULL DEFAULT 0,
   verify_ok INTEGER NOT NULL DEFAULT 0,
   verify_fail INTEGER NOT NULL DEFAULT 0,
+  -- Historical DONE-shard total the Shard Reaper has deleted for this pass.
+  -- ShardStateCounts adds this to the live DONE count from shard_counts, so a
+  -- reaped pass still reports the DONE total it actually had — reaping frees
+  -- the row, not the fact that the shard ran and succeeded.
+  shards_reaped INTEGER NOT NULL DEFAULT 0,
   UNIQUE (job_id, pass_no)
 );
 CREATE TABLE IF NOT EXISTS shards (
@@ -285,6 +290,7 @@ var migrations = []string{
 	// 0 for rows written before the column existed, which is also the minor an
 	// agent that predates minor negotiation reports — the two are equivalent.
 	`ALTER TABLE agents ADD COLUMN proto_minor INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE passes ADD COLUMN shards_reaped INTEGER NOT NULL DEFAULT 0`,
 }
 
 func (s *Store) Close() error {
@@ -1194,20 +1200,32 @@ const ReapBatchSize = 20000
 // Callers must only pass kinds whose phase has fully drained — advance()'s
 // queued+leased check (ShardStateCounts) is what proves that, at the moment
 // it transitions a pass past that phase, so it is the only correct call site
-// (see passctrl.advance). A DONE shard's row carries no state anything reads
-// again afterward: pass-level counters live denormalized on passes
-// (AccumulatePassCounters), and parent_shard_id is a plain int with no FK back
-// to the parent row's own content (children never re-read it), so deleting it
-// out from under still-referencing children is safe.
+// (see passctrl.advance). parent_shard_id is a plain int with no FK back to
+// the parent row's own content (children never re-read it), so deleting a
+// DONE parent out from under still-referencing children is safe, and
+// pass-level file/byte counters live denormalized on passes
+// (AccumulatePassCounters) rather than derived by re-scanning shards.
 //
-// Deleting from shards fires shard_counts_ad, so the rollup an operator's
-// queue/report views read stays exact without any extra bookkeeping here.
+// The DONE *count* itself is not otherwise denormalized anywhere, though, and
+// operator-facing views (the pass-detail API, CLI) read it live from the
+// shard_counts rollup — so deleting the rows the rollup counts would zero out
+// a completed pass's reported DONE total almost immediately. This bumps
+// passes.shards_reaped by the same amount in the same transaction as the
+// delete, so ShardStateCounts can report shards_reaped + the live DONE count
+// and the total an operator sees is unaffected by whether the rows are still
+// there.
 func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, error) {
 	if len(kinds) == 0 {
 		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
 	ph := strings.TrimSuffix(strings.Repeat("?,", len(kinds)), ",")
 	args := make([]any, 0, len(kinds)+3)
 	args = append(args, passID, string(model.ShardDone))
@@ -1215,9 +1233,20 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 		args = append(args, string(k))
 	}
 	args = append(args, ReapBatchSize)
-	return s.execCount(`DELETE FROM shards WHERE id IN (
+	n, err := execCountTx(tx, `DELETE FROM shards WHERE id IN (
 		SELECT id FROM shards WHERE pass_id = ? AND state = ? AND kind IN (`+ph+`)
 		LIMIT ?)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, tx.Commit()
+	}
+	if _, err := tx.Exec(`UPDATE passes SET shards_reaped = shards_reaped + ? WHERE id = ?`,
+		n, passID); err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
 }
 
 // incrementalVacuumPages bounds how many freed pages IncrementalVacuum
@@ -1371,6 +1400,12 @@ func (s *Store) ShardKindsPresent(passID int64) (map[model.ShardKind]bool, error
 	return out, rows.Err()
 }
 
+// ShardStateCounts returns shard counts by state for a pass, live rows plus
+// whatever the Shard Reaper has already deleted: DONE is shard_counts' live
+// DONE (queued/leased/parked shards are never reaped, so those need no such
+// adjustment) plus passes.shards_reaped, so a fully-reaped completed pass
+// still reports the DONE total it actually had rather than the zero its
+// remaining row count would otherwise suggest.
 func (s *Store) ShardStateCounts(passID int64) (map[model.ShardState]int64, error) {
 	rows, err := s.rdb.Query(`SELECT state, SUM(n) FROM shard_counts
 		WHERE pass_id = ? GROUP BY state HAVING SUM(n) > 0`, passID)
@@ -1387,7 +1422,18 @@ func (s *Store) ShardStateCounts(passID int64) (map[model.ShardState]int64, erro
 		}
 		out[model.ShardState(st)] = n
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var reaped int64
+	if err := s.rdb.QueryRow(`SELECT shards_reaped FROM passes WHERE id = ?`, passID).
+		Scan(&reaped); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if reaped > 0 {
+		out[model.ShardDone] += reaped
+	}
+	return out, nil
 }
 
 // QueueRow is one (job, pass, shard-state) bucket of the global queue view.

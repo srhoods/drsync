@@ -141,12 +141,17 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   DONE rows the moment it proves that phase fully drained (the same queued+leased
   check that gates the phase transition itself), batched (`store.ReapBatchSize`) so
   one reap never holds the writer lock as long as a multi-million-row backlog would
-  take in one delete. Nothing reads a DONE shard's row again afterward — pass-level
-  totals live denormalized on `passes` (`AccumulatePassCounters`), not derived by
-  re-scanning `shards` — so this loses no reporting fidelity. The database is opened
-  with `auto_vacuum=INCREMENTAL` and a periodic `PRAGMA incremental_vacuum` pump
-  reclaims the pages the reaper frees, so deleting rows actually shrinks the file
-  instead of leaving freed-but-unreturned pages in it forever.
+  take in one delete. Pass-level file/byte totals live denormalized on `passes`
+  (`AccumulatePassCounters`), not derived by re-scanning `shards`, so those are
+  unaffected — but the shard-count-by-state operator views (pass-detail API, CLI)
+  read live from the `shard_counts` rollup, which the reaper's deletes correctly
+  drain to zero. `passes.shards_reaped` preserves the historical DONE total across
+  that (bumped in the same transaction as each reap), so `ShardStateCounts` still
+  reports what a completed pass actually did — per-row detail (which shard, which
+  agent) does not survive, only the count. The database is opened with
+  `auto_vacuum=INCREMENTAL` and a periodic `PRAGMA incremental_vacuum` pump reclaims
+  the pages the reaper frees, so deleting rows actually shrinks the file instead of
+  leaving freed-but-unreturned pages in it forever.
 
 ## 4. Scheduler
 

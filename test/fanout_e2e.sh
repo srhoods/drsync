@@ -93,13 +93,21 @@ for _ in $(seq 1 40); do
 done
 [[ "${n:-0}" -eq 3 ]] || fail "expected 3 connected agents, got ${n:-0}"
 
-# walk_agents JOB → number of distinct agents that ran a dir/entrylist shard in
-# PASS 1. Read from the coordinator's own record: shards.lease_agent survives
-# completion, so it is the authoritative account of who did the walking.
+# walk_agents JOB → number of distinct agents that have run a dir/entrylist
+# shard in PASS 1 SO FAR. Read from the coordinator's own record:
+# shards.lease_agent is the authoritative account of who did the walking.
 #
 # Scoped to one pass because each pass seeds its own root shard, and to walk
 # kinds because verify/delete tasks fan out regardless — either would mask the
 # thing under test.
+#
+# Must be sampled WHILE pass 1 is still scanning, not after the job completes:
+# the Shard Reaper deletes a pass's DONE dir/entrylist shards the moment its
+# own drain check proves SCANNING finished (the same commit as the
+# SCANNING→DIRFIX transition), so by COMPLETED those rows — and the
+# lease_agent breakdown on them — are already gone. run_job below tracks the
+# high-water mark across the whole run instead of reading it once at the end,
+# the same fix chunk_e2e.sh needed for its own post-reap shard count.
 walk_agents() {
     python3 - "$WORK/coord/state.db" "$1" <<'EOF'
 import sqlite3, sys
@@ -112,12 +120,12 @@ rows = con.execute("""
     WHERE j.name = ? AND p.pass_no = 1
       AND s.kind IN ('dir','entrylist') AND s.lease_agent IS NOT NULL
     GROUP BY s.lease_agent ORDER BY 2 DESC""", (job,)).fetchall()
-print("   pass-1 walk shards per agent: "
-      + (", ".join(f"{a}={n}" for a, n in rows) or "<none>"), file=sys.stderr)
 print(len(rows))
 EOF
 }
 
+# run_job JOB DST SPREAD → prints the high-water mark of distinct agents seen
+# walking pass 1, sampled throughout the run (see walk_agents above).
 run_job() {
     local name=$1 dst=$2 spread=$3
     cat > "$WORK/$name.yaml" <<EOF
@@ -145,25 +153,30 @@ spec:
 EOF
     "$DRSYNC" job submit "$WORK/$name.yaml" --start >/dev/null \
         || fail "$name: submit failed"
+    local n_walk=0 n state
     for _ in $(seq 1 240); do
-        STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/$name" | grep -o '"state":"[A-Z]*"' | head -1)
-        [[ "$STATE" == '"state":"COMPLETED"' ]] && return 0
-        sleep 0.5
+        n=$(walk_agents "$name")
+        [[ "${n:-0}" -gt "$n_walk" ]] && n_walk=$n
+        state=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/$name" | grep -o '"state":"[A-Z]*"' | head -1)
+        [[ "$state" == '"state":"COMPLETED"' ]] && break
+        sleep 0.25
     done
-    tail -5 "$WORK/coord.log"
-    fail "$name: did not converge (state=${STATE:-none})"
+    if [[ "$state" != '"state":"COMPLETED"' ]]; then
+        tail -5 "$WORK/coord.log"
+        fail "$name: did not converge (state=${state:-none})"
+    fi
+    echo "   pass-1 walk agents (high-water): $n_walk" >&2
+    echo "$n_walk"
 }
 
 # --- control: the old behaviour ----------------------------------------------
 echo "== control: spread_mode=off (pre-fix behaviour) =="
-run_job fanout-off "$WORK/dst-off" off
-N_OFF=$(walk_agents fanout-off)
+N_OFF=$(run_job fanout-off "$WORK/dst-off" off)
 [[ "$N_OFF" -eq 1 ]] || fail "spread off: expected the walk pinned to 1 agent, got $N_OFF"
 
 # --- the fix ------------------------------------------------------------------
 echo "== fix: spread_mode=auto =="
-run_job fanout-auto "$WORK/dst-auto" auto
-N_AUTO=$(walk_agents fanout-auto)
+N_AUTO=$(run_job fanout-auto "$WORK/dst-auto" auto)
 [[ "$N_AUTO" -eq 3 ]] || fail "spread auto: expected all 3 agents walking, got $N_AUTO"
 
 # --- fan-out must not cost correctness ----------------------------------------

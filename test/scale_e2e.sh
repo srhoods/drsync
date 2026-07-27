@@ -87,22 +87,32 @@ EOF
 "$DRSYNC" job submit "$WORK/job.yaml" --start | grep -q "job scale started" \
     || fail "submit failed"
 
-STATE=""
-for _ in $(seq 1 180); do
-    STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/scale" | grep -o '"state":"[A-Z]*"' | head -1)
-    [[ "$STATE" == '"state":"COMPLETED"' ]] && break
-    sleep 0.5
-done
-[[ "$STATE" == '"state":"COMPLETED"' ]] || { tail -8 "$WORK"/agent.log "$WORK"/coord.log; fail "did not converge (state=$STATE)"; }
-
-# 1. entry-list path fired: the coordinator recorded entrylist shards
+# 1. entry-list path fired: the coordinator recorded entrylist shards.
+# Sampled WHILE the job is still running, not after it completes: the Shard
+# Reaper deletes a pass's DONE entrylist shards the moment its own drain check
+# proves SCANNING finished, well before the job reaches COMPLETED, so a query
+# for them run only at the end would always read back zero — not because the
+# entry-list path wasn't taken, but because the evidence was correctly reaped.
+# Track the high-water mark across the whole run instead (same fix chunk_e2e.sh
+# and fanout_e2e.sh needed for their own post-reap shard queries).
 DB=$(ls "$WORK/coord"/*.db 2>/dev/null | head -1)
-NEL=$(python3 - "$DB" <<'PY'
+entrylist_count() {
+    python3 - "$DB" <<'PY'
 import sqlite3, sys
-c = sqlite3.connect(sys.argv[1])
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 print(c.execute("select count(*) from shards where kind='entrylist'").fetchone()[0])
 PY
-)
+}
+NEL=0
+STATE=""
+for _ in $(seq 1 180); do
+    n=$(entrylist_count)
+    [[ "${n:-0}" -gt "$NEL" ]] && NEL=$n
+    STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/scale" | grep -o '"state":"[A-Z]*"' | head -1)
+    [[ "$STATE" == '"state":"COMPLETED"' ]] && break
+    sleep 0.25
+done
+[[ "$STATE" == '"state":"COMPLETED"' ]] || { tail -8 "$WORK"/agent.log "$WORK"/coord.log; fail "did not converge (state=$STATE)"; }
 [[ "${NEL:-0}" -ge 1 ]] || fail "no entrylist shards recorded (entry-list path not taken)"
 
 # 2. chunked-copy path fired for the huge file
