@@ -140,6 +140,7 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 	sched := scheduler.New(st, met, leaseTTL)
 	journalRoot := filepath.Join(dataDir, "journals")
 	pc := passctrl.New(st, journalRoot)
+	pc.SetMetrics(met)
 
 	// Email notifications. An absent default config disables them silently; an
 	// explicitly-configured path that is missing or invalid is a hard error.
@@ -233,6 +234,7 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 	defer stop()
 
 	go sched.RunSweeper(ctx, leaseTTL/3)
+	go st.RunIncrementalVacuum(ctx, 30*time.Second)
 	go pc.Run(ctx, 2*time.Second)
 	go poller.Run(ctx, time.Second)
 	// Journal durability: fsync persisted batches, then ack each agent up to its

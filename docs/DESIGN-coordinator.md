@@ -134,6 +134,19 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   20 ms or 1000 ops — keeps SQLite happy and makes crash recovery trivial (WAL replay).
 - Recovery on restart: load `shards WHERE state='LEASED'` → leases resume their TTL
   countdown from `lease_expiry` (persisted absolute time); everything else is stateless.
+- **Shard Reaper:** `shards` is sized by every unit of work ever created, not just
+  live work — a DONE row otherwise sits in the table for the rest of the job's life,
+  which is most of it on a large tree (a single pass over a big filesystem can put
+  millions of rows through SCANNING alone). `passctrl.advance()` deletes a phase's
+  DONE rows the moment it proves that phase fully drained (the same queued+leased
+  check that gates the phase transition itself), batched (`store.ReapBatchSize`) so
+  one reap never holds the writer lock as long as a multi-million-row backlog would
+  take in one delete. Nothing reads a DONE shard's row again afterward — pass-level
+  totals live denormalized on `passes` (`AccumulatePassCounters`), not derived by
+  re-scanning `shards` — so this loses no reporting fidelity. The database is opened
+  with `auto_vacuum=INCREMENTAL` and a periodic `PRAGMA incremental_vacuum` pump
+  reclaims the pages the reaper frees, so deleting rows actually shrinks the file
+  instead of leaving freed-but-unreturned pages in it forever.
 
 ## 4. Scheduler
 

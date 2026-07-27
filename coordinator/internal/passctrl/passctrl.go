@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"drsync/coordinator/internal/journal"
+	"drsync/coordinator/internal/metrics"
 	"drsync/coordinator/internal/model"
 	"drsync/coordinator/internal/notify"
 	"drsync/coordinator/internal/store"
@@ -35,7 +36,8 @@ const dirfixBatchSize = 1000
 type Controller struct {
 	st          *store.Store
 	journalRoot string
-	notifier    *notify.Sender // nil when email is disabled (no SMTP config)
+	notifier    *notify.Sender   // nil when email is disabled (no SMTP config)
+	met         *metrics.Metrics // nil in tests that don't call SetMetrics
 	// NotifyJobDone tells connected agents a job reached a terminal state so they
 	// release its cached options and root directory fds. Injected by main; nil in
 	// tests. See agentsrv.Server.NotifyJobDone.
@@ -82,6 +84,10 @@ func New(st *store.Store, journalRoot string) *Controller {
 // SetNotifier wires an email sender for pass/job completion notifications. A
 // nil sender leaves notifications disabled (the Sender methods are no-ops).
 func (c *Controller) SetNotifier(n *notify.Sender) { c.notifier = n }
+
+// SetMetrics wires the Prometheus counters reapPhase reports to. Left nil in
+// tests that don't call this — reapPhase's nil check makes that a no-op.
+func (c *Controller) SetMetrics(m *metrics.Metrics) { c.met = m }
 
 // StartJob transitions READY→RUNNING and seeds pass 1 with the root shard.
 func (c *Controller) StartJob(name string) error {
@@ -396,7 +402,18 @@ func (c *Controller) advance(job *store.Job) error {
 		}
 		slog.Info("pass phase: SCANNING → DIRFIX", "job", job.Name,
 			"pass", pass.PassNo, "dirs", n, "temps_reclaimed", r)
-		return c.st.SetPassState(pass.ID, model.PassDirfix)
+		if err := c.st.SetPassState(pass.ID, model.PassDirfix); err != nil {
+			return err
+		}
+		// The drain check above proves every probe/dir/entrylist/chunk shard of
+		// this pass is now DONE (dir/entrylist/chunk can otherwise recur all
+		// through SCANNING via recursive directory fan-out, which is exactly why
+		// nowhere earlier than this — the one point the whole phase is proven
+		// drained — is safe). This is the scan phase's own shard volume: on a
+		// large tree it dwarfs every later phase, so reaping it here is the
+		// single biggest win against the shards table growing unbounded.
+		c.reapPhase(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
+		return nil
 	case model.PassDirfix:
 		n, err := c.seedVerify(job, pass)
 		if err != nil {
@@ -404,7 +421,11 @@ func (c *Controller) advance(job *store.Job) error {
 		}
 		slog.Info("pass phase: DIRFIX → VERIFY", "job", job.Name,
 			"pass", pass.PassNo, "verify_entries", n)
-		return c.st.SetPassState(pass.ID, model.PassVerify)
+		if err := c.st.SetPassState(pass.ID, model.PassVerify); err != nil {
+			return err
+		}
+		c.reapPhase(job, pass, model.KindDirfix)
+		return nil
 	case model.PassVerify:
 		// DELETE phase only on explicit operator trigger (D5); default skips.
 		slog.Info("pass complete", "job", job.Name, "pass", pass.PassNo,
@@ -412,6 +433,7 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassComplete); err != nil {
 			return err
 		}
+		c.reapPhase(job, pass, model.KindVerify)
 		jobDone, converged, err := c.decideNextPass(job, pass)
 		if err != nil {
 			return err
@@ -427,6 +449,7 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassComplete); err != nil {
 			return err
 		}
+		c.reapPhase(job, pass, model.KindDelete)
 		// A delete pass never auto-seeds another pass: back to COMPLETED,
 		// further passes are explicit operator triggers.
 		if err := c.st.SetJobState(job.ID, model.JobCompleted); err != nil {
@@ -438,6 +461,49 @@ func (c *Controller) advance(job *store.Job) error {
 		return nil
 	}
 	return nil
+}
+
+// reapPhaseBudget caps the wall time reapPhase spends looping
+// store.ReapDoneShards batches for one phase transition. Each batch is its
+// own transaction (store.ReapBatchSize rows), so looping just trades a longer
+// single tick for draining a phase's DONE backlog fully rather than trickling
+// it out — this only needs to bound how long that one tick's remaining jobs
+// wait behind it, not correctness: nothing else reads a DONE row, and a
+// backlog this call doesn't finish for hitting the cap is picked up in full
+// (from the same LIMIT-bounded query, no lost progress) the next time this
+// same call site fires — which, for scan-phase kinds, is only ever this one
+// phase transition of this one pass, so exceeding the budget on a truly
+// enormous backlog leaves a remainder that lasts until the job is purged.
+// 30s at ReapBatchSize keeps that a rare, not routine, outcome.
+const reapPhaseBudget = 30 * time.Second
+
+// reapPhase deletes the now-fully-drained phase's DONE shards, looping
+// store.ReapDoneShards batches until the phase's backlog is exhausted or
+// reapPhaseBudget elapses. Best-effort: a reap failure must not stop the
+// phase transition that already committed above it — logging and moving on
+// costs disk, not correctness.
+func (c *Controller) reapPhase(job *store.Job, pass *store.Pass, kinds ...model.ShardKind) {
+	deadline := time.Now().Add(reapPhaseBudget)
+	var total int64
+	for time.Now().Before(deadline) {
+		n, err := c.st.ReapDoneShards(pass.ID, kinds)
+		if err != nil {
+			slog.Warn("shard reap failed", "job", job.Name, "pass", pass.PassNo,
+				"kinds", kinds, "reaped_before_error", total, "err", err)
+			break
+		}
+		total += n
+		if n < store.ReapBatchSize {
+			break // batch came back short: backlog exhausted
+		}
+	}
+	if total > 0 {
+		slog.Info("reaped done shards", "job", job.Name, "pass", pass.PassNo,
+			"kinds", kinds, "reaped", total)
+		if c.met != nil {
+			c.met.ShardsReaped.Add(float64(total))
+		}
+	}
 }
 
 // decideNextPass applies the convergence rule: stop when the pass delta is

@@ -31,6 +31,7 @@ type Metrics struct {
 	JournalBatches  prometheus.Counter
 	JournalFsyncErr prometheus.Counter
 	Grants          prometheus.Counter
+	ShardsReaped    prometheus.Counter
 }
 
 func New() *Metrics {
@@ -73,9 +74,12 @@ func New() *Metrics {
 			Help: "Journal fsync failures; acks withheld until a later flush succeeds."}),
 		Grants: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "drsync_work_grants_total", Help: "Work items granted to agents."}),
+		ShardsReaped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "drsync_shards_reaped_total",
+			Help: "DONE shard rows deleted by the Shard Reaper once their phase drains."}),
 	}
 	reg.MustRegister(m.ScanEntries, m.CopyFiles, m.CopyBytes, m.AgentUp, m.AgentRSS,
 		m.ShardDuration, m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked,
-		m.JournalBatches, m.JournalFsyncErr, m.Grants)
+		m.JournalBatches, m.JournalFsyncErr, m.Grants, m.ShardsReaped)
 	return m
 }
