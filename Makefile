@@ -22,6 +22,7 @@ build: agent
 	go build ./...
 	go build -o bin/drsyncd ./coordinator/cmd/drsyncd
 	go build -o bin/drsync-journal ./coordinator/cmd/drsync-journal
+	go build -o bin/drsync-admin ./coordinator/cmd/drsync-admin
 	go build -o bin/drsync ./cli/drsync
 
 agent:

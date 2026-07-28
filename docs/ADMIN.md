@@ -553,6 +553,109 @@ anything you need first (`drsync report <name> --json`, `drsync journal cat
 
 ---
 
+## 6b. `drsync-admin` — direct database console
+
+`drsync-admin` is a standalone, full-screen console for browsing and editing
+the coordinator's SQLite state file directly. It opens the DB with the same
+WAL/`busy_timeout` settings the coordinator itself uses, so it is safe to run
+**against a live `drsyncd`** — reads never block the grant hot path, and a
+write simply waits (up to 5s) if the writer is momentarily busy. It needs no
+running coordinator, no network access, and no REST/API credentials — just a
+path to the state file.
+
+```bash
+bin/drsync-admin -db /var/lib/drsync/state.db              # browse, read-only
+bin/drsync-admin -db /var/lib/drsync/state.db -write        # allow field edits
+bin/drsync-admin -db /var/lib/drsync/state.db -theme mono   # colour-blind-safe / NO_COLOR-style
+```
+
+**What it shows:**
+- Every table (`jobs`, `passes`, `shards`, `agents`, `shard_counts`,
+  `chunk_groups`, `splits`, `journal_cursors`) with live row counts, full
+  schema, and filterable row browsing (`/` to filter: `col=val`, `col!=val`,
+  `col>val`, `col<val`, `col~substring`, comma-joined as AND). `shards` can be
+  millions of rows at PB scale (§3 of `DESIGN-coordinator.md`), so browsing
+  without a filter is capped (a truncation notice tells you to narrow it).
+- A **Database info** screen: PRAGMA configuration (`journal_mode`,
+  `auto_vacuum`, `page_size`, `synchronous`, `foreign_keys`, `busy_timeout`),
+  on-disk file and WAL size, and summary counts by job/agent state.
+
+**Editing** is opt-in (`-write`) and restricted to a small, explicit allowlist
+of columns the coordinator itself already treats as operator-mutable — the
+same fields `drsync agent disable`/`queue retry`/`job cancel` touch, not
+arbitrary cells:
+
+| Table | Column | Same effect as |
+|---|---|---|
+| `shards` | `priority` | manually re-ranking a stuck or urgent shard ahead of the queue (`shards_sched` orders by `priority DESC, id`) |
+| `shards` | `state`, `attempt` | manually requeuing a `PARKED` shard (like `drsync queue retry`, but hand-editable) |
+| `agents` | `enabled` | `drsync agent disable`/administrative drain |
+| `jobs` | `state` | forcing a stuck job to `CANCELLED` |
+
+Selecting a row opens every column; only allowlisted columns render as
+editable fields (everything else is read-only). Saving always shows a
+before/after diff in a confirmation modal — nothing is written until you
+confirm. If a row has nothing editable at all (read-only mode, or a table with
+no allowlisted columns, e.g. `shard_counts`/`chunk_groups`/`splits`/
+`journal_cursors`), the row view is a pure viewer with a single **Close**
+button — there is no Save/Cancel pair implying a change is possible when
+there isn't one. There is no raw-SQL escape hatch; every write goes through
+this same allowlist and confirmation path.
+
+**Bulk editing** many rows at once (e.g. re-prioritizing every `PARKED` shard
+after fixing the cause) doesn't require opening each row individually:
+1. Filter down to the rows you want (`/`, e.g. `state=PARKED`).
+2. `Space` checks the highlighted row; `a` checks/unchecks every row currently
+   loaded (respecting the filter and the same row cap that guards `shards` at
+   PB scale).
+3. `e` opens a bulk-edit dialog: pick one allowlisted column and one new
+   value, applied to every checked row.
+4. Confirmation is a single grouped summary, not one line per row — e.g.
+   "247 row(s): `0` -> `30`, 3 row(s): `5` -> `30`" — followed by a per-row
+   write, with a final count of how many succeeded if any individual row
+   failed partway through.
+
+Changing the filter clears the current checkbox selection (row positions just
+changed under the new result set, so stale checkboxes could otherwise silently
+bulk-edit the wrong rows).
+
+**Refreshing** a table view or the Database info screen is on-demand by
+default — nothing is re-queried until you ask for it:
+- `r` reloads immediately.
+- `R` opens a dialog to set (or turn off) a timed auto-refresh, in whole
+  seconds. The minimum is 5s — a lower value is accepted but silently raised
+  to the floor rather than rejected, with the applied value shown in the
+  status line, since a fat-fingered "1" should still do something useful.
+  Auto-refresh stops the moment you leave the screen (`Esc`); it does not
+  keep running in the background across tables, and is off again by default
+  the next time you open one.
+- A running auto-refresh does **not** clear a table view's checkbox
+  selection (unlike an explicit filter change) — the whole point of timed
+  refresh is to keep a screen current while you're mid-way through checking
+  rows for a bulk edit, so wiping that selection every few seconds would
+  defeat it. Bulk-edit's confirmation step always re-reads each row's current
+  value immediately before writing, so a checkbox left checked across a
+  refresh can at worst re-apply an already-correct value — it can't corrupt
+  an unrelated row.
+
+**Colour**: the `default` theme (Okabe–Ito-derived blue/orange/vermillion, not
+a red/green pair — the most common colour-blind confusion) and `high-contrast`
+(maximal luminance separation) are both built from fixed 256-colour-palette
+indices (`tcell.PaletteColor`), not named colours or RGB triples. Named/RGB
+colours only render as specified when the terminal advertises true-colour
+support in its terminfo entry; under `TERM=screen-256color` or
+`tmux-256color` — every tmux/screen session, regardless of what the real
+terminal underneath supports — tcell quantizes them to the nearest of 256
+palette entries, and different terminals do that approximation differently.
+A fixed palette index has no such step: every terminal that supports 256
+colours renders it identically, so the theme can't be reinterpreted by a
+multiplexer. `mono` carries all meaning through text markers alone
+(`[OK]`/`[..]`/`[!!]`/`[--]`) and is used automatically when `NO_COLOR` is
+set. State colour is always paired with one of those markers, so meaning
+never depends on colour alone.
+
+---
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause & fix |
@@ -690,4 +793,8 @@ drsync ca issue --type agent  --cn agent-01
 
 # HTTP(S) listener cert (WebUI/API; dev/test — see §8)
 drsync cert generate-self-signed --cn coord --dns coord --ip 10.0.0.10 --out /etc/drsync
+
+# direct DB console (browse/edit state.db; see §6b) — safe alongside a live drsyncd
+drsync-admin -db /var/lib/drsync/state.db
+drsync-admin -db /var/lib/drsync/state.db -write
 ```
