@@ -19,6 +19,21 @@ import (
 // look, it lets stale colour from a previous draw bleed through, which is
 // exactly the "mono still shows colour" bug this comment is here to prevent
 // regressing.
+//
+// Every colour is built via tcell.PaletteColor(n) — a fixed index into the
+// 256-colour palette — never a named constant (tcell.ColorSteelBlue etc.) or
+// an arbitrary RGB triple. Named/RGB colours only render as intended when
+// the terminal advertises true-colour support via its terminfo entry; under
+// TERM=screen-256color or tmux-256color (every tmux/screen session, on this
+// host, regardless of what the real terminal underneath supports) tcell
+// quantizes them to the nearest of 256 palette entries, and different
+// terminals/multiplexers make that approximation differently — which is
+// exactly the "colours get overwritten by tmux or other screen managers"
+// complaint this rewrite exists to close. Indices 16-231 (the 6x6x6 colour
+// cube, steps 0/95/135/175/215/255 per channel) and 232-255 (the greyscale
+// ramp) are numeric palette slots with no quantization step at all: every
+// terminal that supports 256 colours renders index 25 as the same colour,
+// full stop. See paletteColor()'s doc comment for the exact index derivation.
 type Theme struct {
 	Name string
 
@@ -52,47 +67,69 @@ type Theme struct {
 	FieldText       tcell.Color
 }
 
+// paletteColor builds a colour from a fixed 256-colour palette index, never
+// from a named constant or an RGB triple — see the Theme doc comment for why.
+func paletteColor(index int) tcell.Color { return tcell.PaletteColor(index) }
+
+// The 256-colour cube/greyscale indices behind each named value below,
+// derived from the Okabe–Ito colour-blind-safe palette snapped to the
+// nearest exact 6x6x6-cube grid point — see the palette-preview artifact
+// reviewed before this landed. Named here once so the two colour themes
+// below both draw from the same verified set rather than picking indices
+// ad hoc.
+const (
+	idxBlue      = 25  // #005faf — Okabe–Ito "blue", snapped
+	idxSkyBlue   = 74  // #5fafd7 — Okabe–Ito "sky blue", snapped; selection bg
+	idxBluGreen  = 35  // #00af5f — Okabe–Ito "bluish green"; alt good
+	idxOrange    = 178 // #d7af00 — Okabe–Ito "orange"; warn
+	idxVermilion = 166 // #d75f00 — Okabe–Ito "vermillion"; bad (not red)
+	idxGreyDim   = 244 // #808080 — grey ramp; subtle/secondary text
+	idxGreyLabel = 250 // #bcbcbc — grey ramp; form labels
+	idxWhite     = 231 // #ffffff — cube corner, not the ANSI "white" name
+	idxBlack     = 16  // #000000 — cube corner, not the ANSI "black" name
+)
+
 var themes = map[string]Theme{
-	// Default: blue/orange/amber triad on the terminal's own black-on-white
-	// (or white-on-black) background, high separation for all common CVD
-	// types; avoids relying on red vs green.
+	// Default: blue/orange/vermillion triad on a fixed dark ground (not the
+	// terminal's own background — see the Theme doc comment), high
+	// separation for all common CVD types, avoids relying on red vs green.
 	"default": {
 		Name:            "default",
-		Background:      tcell.ColorDefault,
-		Foreground:      tcell.ColorDefault,
-		Border:          tcell.ColorSteelBlue,
-		Title:           tcell.ColorSteelBlue,
-		Label:           tcell.ColorSteelBlue,
-		Subtle:          tcell.ColorGray,
-		Good:            tcell.ColorDodgerBlue,
-		Warn:            tcell.ColorDarkOrange,
-		Bad:             tcell.ColorGoldenrod, // deep amber, not red — stays distinct from Warn via shape markers too
-		Neutral:         tcell.ColorGray,
-		ListSelection:   tcell.ColorSteelBlue,
-		SelectedText:    tcell.ColorWhite,
-		FieldBackground: tcell.ColorSteelBlue,
-		FieldText:       tcell.ColorWhite,
+		Background:      paletteColor(idxBlack),
+		Foreground:      paletteColor(idxGreyLabel),
+		Border:          paletteColor(idxBlue),
+		Title:           paletteColor(idxWhite),
+		Label:           paletteColor(idxGreyLabel),
+		Subtle:          paletteColor(idxGreyDim),
+		Good:            paletteColor(idxBluGreen),
+		Warn:            paletteColor(idxOrange),
+		Bad:             paletteColor(idxVermilion),
+		Neutral:         paletteColor(idxGreyDim),
+		ListSelection:   paletteColor(idxSkyBlue),
+		SelectedText:    paletteColor(idxBlack),
+		FieldBackground: paletteColor(idxBlue),
+		FieldText:       paletteColor(idxWhite),
 	},
-	// High-contrast: black background, maximal luminance separation for
-	// low-vision users, still no red/green-only pair. Editable fields get
-	// their own white-on-blue pairing so they never collide with the
-	// white-on-white row-selection highlight.
+	// High-contrast: same fixed dark ground, maximal luminance separation
+	// for low-vision users, still no red/green-only pair. Editable fields
+	// keep their own background/text pairing so they never collide with the
+	// selection highlight the way an overloaded single colour once did.
 	"high-contrast": {
 		Name:            "high-contrast",
-		Background:      tcell.ColorBlack,
-		Foreground:      tcell.ColorWhite,
-		Border:          tcell.ColorWhite,
-		Title:           tcell.ColorWhite,
-		Label:           tcell.ColorWhite,
-		Subtle:          tcell.ColorGray,
-		Good:            tcell.ColorAqua,
-		Warn:            tcell.ColorYellow,
-		Bad:             tcell.ColorWhite, // Bad is distinguished by the [!!] marker under this theme
-		Neutral:         tcell.ColorGray,
-		ListSelection:   tcell.ColorWhite,
-		SelectedText:    tcell.ColorBlack,
-		FieldBackground: tcell.ColorNavy,
-		FieldText:       tcell.ColorWhite,
+		Background:      paletteColor(idxBlack),
+		Foreground:      paletteColor(idxWhite),
+		Border:          paletteColor(idxWhite),
+		Title:           paletteColor(idxWhite),
+		Label:           paletteColor(idxWhite),
+		Subtle:          paletteColor(idxGreyDim),
+		Good:            paletteColor(idxBluGreen),
+		Warn:            paletteColor(idxOrange),
+		Bad:             paletteColor(idxWhite), // distinguished by the [!!] marker under this theme
+		Neutral:         paletteColor(idxGreyDim),
+		ListSelection:   paletteColor(idxWhite),
+		SelectedText:    paletteColor(idxBlack),
+		FieldBackground: paletteColor(idxBlue),
+		FieldText:       paletteColor(idxWhite),
 	},
 	// Mono: real black-and-white/greyscale only — every colour value here is
 	// explicit (never ColorDefault), so nothing bleeds through and nothing
@@ -101,20 +138,20 @@ var themes = map[string]Theme{
 	// --theme=mono is passed.
 	"mono": {
 		Name:            "mono",
-		Background:      tcell.ColorBlack,
-		Foreground:      tcell.ColorWhite,
-		Border:          tcell.ColorWhite,
-		Title:           tcell.ColorWhite,
-		Label:           tcell.ColorWhite,
-		Subtle:          tcell.ColorWhite,
-		Good:            tcell.ColorWhite,
-		Warn:            tcell.ColorWhite,
-		Bad:             tcell.ColorWhite,
-		Neutral:         tcell.ColorWhite,
-		ListSelection:   tcell.ColorWhite,
-		SelectedText:    tcell.ColorBlack,
-		FieldBackground: tcell.ColorWhite,
-		FieldText:       tcell.ColorBlack,
+		Background:      paletteColor(idxBlack),
+		Foreground:      paletteColor(idxWhite),
+		Border:          paletteColor(idxWhite),
+		Title:           paletteColor(idxWhite),
+		Label:           paletteColor(idxWhite),
+		Subtle:          paletteColor(idxWhite),
+		Good:            paletteColor(idxWhite),
+		Warn:            paletteColor(idxWhite),
+		Bad:             paletteColor(idxWhite),
+		Neutral:         paletteColor(idxWhite),
+		ListSelection:   paletteColor(idxWhite),
+		SelectedText:    paletteColor(idxBlack),
+		FieldBackground: paletteColor(idxWhite),
+		FieldText:       paletteColor(idxBlack),
 	},
 }
 

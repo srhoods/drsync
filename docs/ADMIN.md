@@ -619,12 +619,21 @@ Changing the filter clears the current checkbox selection (row positions just
 changed under the new result set, so stale checkboxes could otherwise silently
 bulk-edit the wrong rows).
 
-**Colour**: the `default` theme avoids a red/green-only contrast (the most
-common colour-blind confusion) in favour of blue/orange/amber; `high-contrast`
-maximizes luminance separation; `mono` carries all meaning through text
-markers alone (`[OK]`/`[..]`/`[!!]`/`[--]`) and is used automatically when
-`NO_COLOR` is set. State colour is always paired with one of those markers, so
-meaning never depends on colour alone.
+**Colour**: the `default` theme (Okabe–Ito-derived blue/orange/vermillion, not
+a red/green pair — the most common colour-blind confusion) and `high-contrast`
+(maximal luminance separation) are both built from fixed 256-colour-palette
+indices (`tcell.PaletteColor`), not named colours or RGB triples. Named/RGB
+colours only render as specified when the terminal advertises true-colour
+support in its terminfo entry; under `TERM=screen-256color` or
+`tmux-256color` — every tmux/screen session, regardless of what the real
+terminal underneath supports — tcell quantizes them to the nearest of 256
+palette entries, and different terminals do that approximation differently.
+A fixed palette index has no such step: every terminal that supports 256
+colours renders it identically, so the theme can't be reinterpreted by a
+multiplexer. `mono` carries all meaning through text markers alone
+(`[OK]`/`[..]`/`[!!]`/`[--]`) and is used automatically when `NO_COLOR` is
+set. State colour is always paired with one of those markers, so meaning
+never depends on colour alone.
 
 ---
 
