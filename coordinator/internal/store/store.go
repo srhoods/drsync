@@ -4,6 +4,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
@@ -93,6 +94,11 @@ CREATE TABLE IF NOT EXISTS passes (
   fidelity_exceptions INTEGER NOT NULL DEFAULT 0,
   verify_ok INTEGER NOT NULL DEFAULT 0,
   verify_fail INTEGER NOT NULL DEFAULT 0,
+  -- Historical DONE-shard total the Shard Reaper has deleted for this pass.
+  -- ShardStateCounts adds this to the live DONE count from shard_counts, so a
+  -- reaped pass still reports the DONE total it actually had — reaping frees
+  -- the row, not the fact that the shard ran and succeeded.
+  shards_reaped INTEGER NOT NULL DEFAULT 0,
   UNIQUE (job_id, pass_no)
 );
 CREATE TABLE IF NOT EXISTS shards (
@@ -190,6 +196,20 @@ func Open(path string) (*Store, error) {
 	}
 	// One connection: SQLite single-writer, and we serialize with s.mu anyway.
 	db.SetMaxOpenConns(1)
+
+	// auto_vacuum must be set before the schema below creates any table, and is
+	// a permanent property of a database file once one exists: switching an
+	// existing NONE (the SQLite default) database to INCREMENTAL requires a
+	// one-time VACUUM to rewrite the file, which is why this happens ahead of
+	// CREATE TABLE and is itself guarded on the current mode. Without this, the
+	// Shard Reaper's deletes free pages inside the file but the file on disk
+	// never shrinks — exactly the "purge doesn't help without a reset" failure
+	// mode this exists to close.
+	if err := ensureIncrementalVacuum(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("auto_vacuum: %w", err)
+	}
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -203,14 +223,27 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
 	}
-	// Rebuild the shard_counts rollup from the authoritative shards table. Done
-	// once at startup so an upgraded DB (or one that predates the table) is
-	// consistent; the triggers keep it exact from here on.
-	if _, err := db.Exec(`DELETE FROM shard_counts;
-		INSERT INTO shard_counts (pass_id, kind, state, n)
-		SELECT pass_id, kind, state, COUNT(*) FROM shards GROUP BY pass_id, kind, state;`); err != nil {
+	// Rebuild the shard_counts rollup from the authoritative shards table. Only
+	// needed for a DB that predates the table (shard_counts empty, shards not):
+	// once populated, the AFTER INSERT/UPDATE/DELETE triggers keep it exact and
+	// transactional with every shard row change, clean shutdown or not, so
+	// re-deriving it from scratch on every restart would just be an unindexed
+	// GROUP BY over the whole shards table for no benefit — at millions of rows
+	// (the scale the Shard Reaper below exists for) that cost is paid at every
+	// restart for nothing.
+	var countsRows, shardRows int64
+	if err := db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM shard_counts), (SELECT COUNT(*) FROM shards)`).
+		Scan(&countsRows, &shardRows); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("rebuild shard_counts: %w", err)
+		return nil, fmt.Errorf("check shard_counts: %w", err)
+	}
+	if countsRows == 0 && shardRows > 0 {
+		if _, err := db.Exec(`INSERT INTO shard_counts (pass_id, kind, state, n)
+			SELECT pass_id, kind, state, COUNT(*) FROM shards GROUP BY pass_id, kind, state;`); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("rebuild shard_counts: %w", err)
+		}
 	}
 
 	// Separate read-only connection pool. WAL lets these reads run concurrently
@@ -225,6 +258,30 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, rdb: rdb}, nil
 }
 
+// ensureIncrementalVacuum switches the database to auto_vacuum=INCREMENTAL if
+// it is not already in that mode. VACUUM rewrites the whole file, so this only
+// pays that one-time cost the first time a coordinator with this code opens a
+// pre-existing (auto_vacuum=NONE, the SQLite default) database; a database
+// created fresh, or already migrated by an earlier run, is a no-op check.
+func ensureIncrementalVacuum(db *sql.DB) error {
+	var mode int
+	if err := db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	const incremental = 2
+	if mode == incremental {
+		return nil
+	}
+	if _, err := db.Exec(`PRAGMA auto_vacuum = INCREMENTAL`); err != nil {
+		return err
+	}
+	// The pragma above only stages the change; VACUUM performs it and is what
+	// actually reads/rewrites the whole file, so this is the expensive step
+	// (once) for any database not already using auto_vacuum.
+	_, err := db.Exec(`VACUUM`)
+	return err
+}
+
 // migrations are additive DDL applied after the base schema; each must be
 // idempotent (guarded by the duplicate-column check in Open).
 var migrations = []string{
@@ -233,6 +290,7 @@ var migrations = []string{
 	// 0 for rows written before the column existed, which is also the minor an
 	// agent that predates minor negotiation reports — the two are equivalent.
 	`ALTER TABLE agents ADD COLUMN proto_minor INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE passes ADD COLUMN shards_reaped INTEGER NOT NULL DEFAULT 0`,
 }
 
 func (s *Store) Close() error {
@@ -1126,6 +1184,109 @@ func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Durat
 	return err
 }
 
+// ReapBatchSize bounds how many DONE shards ReapDoneShards deletes per call.
+// A pass whose phase just drained can have millions of DONE rows behind it
+// (state is sized by shards, and that includes finished ones until something
+// reaps them); deleting them all in one transaction would hold s.mu — and
+// therefore every agent's grant/renew/complete hot-path call — for however
+// long that delete takes. Batching bounds each call's cost; callers loop
+// (see passctrl.reapPhase) until a batch comes back short of this size, which
+// is how they detect the backlog is exhausted rather than merely paused.
+const ReapBatchSize = 20000
+
+// ReapDoneShards deletes up to ReapBatchSize DONE shards of the given kinds
+// for one pass, and returns how many were deleted.
+//
+// Callers must only pass kinds whose phase has fully drained — advance()'s
+// queued+leased check (ShardStateCounts) is what proves that, at the moment
+// it transitions a pass past that phase, so it is the only correct call site
+// (see passctrl.advance). parent_shard_id is a plain int with no FK back to
+// the parent row's own content (children never re-read it), so deleting a
+// DONE parent out from under still-referencing children is safe, and
+// pass-level file/byte counters live denormalized on passes
+// (AccumulatePassCounters) rather than derived by re-scanning shards.
+//
+// The DONE *count* itself is not otherwise denormalized anywhere, though, and
+// operator-facing views (the pass-detail API, CLI) read it live from the
+// shard_counts rollup — so deleting the rows the rollup counts would zero out
+// a completed pass's reported DONE total almost immediately. This bumps
+// passes.shards_reaped by the same amount in the same transaction as the
+// delete, so ShardStateCounts can report shards_reaped + the live DONE count
+// and the total an operator sees is unaffected by whether the rows are still
+// there.
+func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, error) {
+	if len(kinds) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(kinds)), ",")
+	args := make([]any, 0, len(kinds)+3)
+	args = append(args, passID, string(model.ShardDone))
+	for _, k := range kinds {
+		args = append(args, string(k))
+	}
+	args = append(args, ReapBatchSize)
+	n, err := execCountTx(tx, `DELETE FROM shards WHERE id IN (
+		SELECT id FROM shards WHERE pass_id = ? AND state = ? AND kind IN (`+ph+`)
+		LIMIT ?)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, tx.Commit()
+	}
+	if _, err := tx.Exec(`UPDATE passes SET shards_reaped = shards_reaped + ? WHERE id = ?`,
+		n, passID); err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
+}
+
+// incrementalVacuumPages bounds how many freed pages IncrementalVacuum
+// reclaims per call — small enough that the write-lock hold is negligible
+// next to a normal shard-completion write, run often enough (RunIncrementalVacuum)
+// to keep pace with the Shard Reaper's steady trickle of freed pages.
+const incrementalVacuumPages = 500
+
+// IncrementalVacuum reclaims up to n freed pages back to the OS. Cheap and
+// safe to call often: with auto_vacuum=INCREMENTAL (set at Open), deleting
+// rows only marks their pages free in the file's internal freelist — the file
+// itself does not shrink until this pragma runs. Paired with the Shard
+// Reaper's deletes, this is what turns "reaped rows" into actual disk space
+// given back, rather than freelist bloat the file quietly carries forever.
+func (s *Store) IncrementalVacuum(n int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, n))
+	return err
+}
+
+// RunIncrementalVacuum periodically reclaims freed pages until ctx is done.
+// A small, frequent pull (incrementalVacuumPages per tick) keeps the file size
+// tracking what the Shard Reaper actually frees, instead of letting a large
+// backlog of freed-but-unreclaimed pages build up between rare big VACUUMs.
+func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := s.IncrementalVacuum(incrementalVacuumPages); err != nil {
+				slog.Error("incremental vacuum failed", "err", err)
+			}
+		}
+	}
+}
+
 // ExpireLeases re-queues shards whose lease TTL passed; shards at the attempt
 // ceiling park instead. Returns (requeued, parked).
 func (s *Store) ExpireLeases(now time.Time) (int64, int64, error) {
@@ -1239,6 +1400,12 @@ func (s *Store) ShardKindsPresent(passID int64) (map[model.ShardKind]bool, error
 	return out, rows.Err()
 }
 
+// ShardStateCounts returns shard counts by state for a pass, live rows plus
+// whatever the Shard Reaper has already deleted: DONE is shard_counts' live
+// DONE (queued/leased/parked shards are never reaped, so those need no such
+// adjustment) plus passes.shards_reaped, so a fully-reaped completed pass
+// still reports the DONE total it actually had rather than the zero its
+// remaining row count would otherwise suggest.
 func (s *Store) ShardStateCounts(passID int64) (map[model.ShardState]int64, error) {
 	rows, err := s.rdb.Query(`SELECT state, SUM(n) FROM shard_counts
 		WHERE pass_id = ? GROUP BY state HAVING SUM(n) > 0`, passID)
@@ -1255,7 +1422,18 @@ func (s *Store) ShardStateCounts(passID int64) (map[model.ShardState]int64, erro
 		}
 		out[model.ShardState(st)] = n
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var reaped int64
+	if err := s.rdb.QueryRow(`SELECT shards_reaped FROM passes WHERE id = ?`, passID).
+		Scan(&reaped); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if reaped > 0 {
+		out[model.ShardDone] += reaped
+	}
+	return out, nil
 }
 
 // QueueRow is one (job, pass, shard-state) bucket of the global queue view.

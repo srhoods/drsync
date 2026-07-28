@@ -168,6 +168,332 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	_ = passID
 }
 
+// TestReapDoneShards checks the core Shard Reaper contract: only DONE shards
+// of the requested kinds are deleted, everything else (other kinds, other
+// states, other passes) is untouched, and the shard_counts rollup stays exact
+// afterward (the AFTER DELETE trigger, not special-cased reap logic, is what
+// keeps it consistent).
+func TestReapDoneShards(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, _ := seed(t, s) // seed's root shard is QUEUED, kind=dir
+
+	// A second pass's shards must never be touched by a reap scoped to passID.
+	otherPass, err := s.CreatePass(jobID, 2, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPassID := otherPass.ID
+
+	mk := func(pid int64, kind model.ShardKind, n int) []int64 {
+		batch := make([]NewShard, n)
+		for i := range batch {
+			batch[i] = NewShard{Kind: kind, RelPath: fmt.Sprintf("%s-%03d", kind, i)}
+		}
+		ids, err := s.InsertShards(pid, 0, batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ids
+	}
+	markDone := func(ids ...int64) {
+		for _, id := range ids {
+			if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+				string(model.ShardDone), id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	dirDone := mk(passID, model.KindDir, 5)
+	markDone(dirDone...)
+	verifyDone := mk(passID, model.KindVerify, 3)
+	markDone(verifyDone...)
+	dirQueued := mk(passID, model.KindDir, 2) // left QUEUED: must survive
+	otherDone := mk(otherPassID, model.KindDir, 4)
+	markDone(otherDone...)
+	assertCountsConsistent(t, s, "after seeding reap fixture")
+
+	n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != int64(len(dirDone)) {
+		t.Fatalf("reaped %d, want %d", n, len(dirDone))
+	}
+	assertCountsConsistent(t, s, "after reaping dir")
+
+	for _, id := range dirDone {
+		var count int
+		s.db.QueryRow(`SELECT COUNT(*) FROM shards WHERE id = ?`, id).Scan(&count)
+		if count != 0 {
+			t.Errorf("done dir shard %d survived reap", id)
+		}
+	}
+	for _, id := range append(append(dirQueued, verifyDone...), otherDone...) {
+		var count int
+		s.db.QueryRow(`SELECT COUNT(*) FROM shards WHERE id = ?`, id).Scan(&count)
+		if count != 1 {
+			t.Errorf("shard %d should have survived reap (wrong kind/state/pass), got count=%d", id, count)
+		}
+	}
+
+	// A second call against an already-reaped kind is a no-op, not an error.
+	n, err = s.ReapDoneShards(passID, []model.ShardKind{model.KindDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("expected nothing left to reap, got %d", n)
+	}
+
+	// Reaping with no kinds is a no-op guard, not "reap everything".
+	n, err = s.ReapDoneShards(passID, nil)
+	if err != nil || n != 0 {
+		t.Fatalf("ReapDoneShards(nil kinds) = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// TestReapDoneShardsPreservesDoneCount guards the regression the four failing
+// e2e tests (fanout_e2e, deep_e2e, scale_e2e, e2e) caught in CI: reaping must
+// not make a completed pass's reported DONE total disappear along with the
+// rows. ShardStateCounts is the API's pass-detail endpoint's only source for
+// "how many shards of this pass finished", so it has to keep counting a
+// shard that ran and succeeded, whether or not the reaper has since deleted
+// its row.
+func TestReapDoneShardsPreservesDoneCount(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	batch := make([]NewShard, 30)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d-%03d", i)}
+	}
+	ids, err := s.InsertShards(passID, 0, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+			string(model.ShardDone), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The pre-existing root shard from seed() is also QUEUED->left alone here;
+	// only count the 30 we just marked DONE below, before reaping anything.
+	before, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before[model.ShardDone] != 30 {
+		t.Fatalf("DONE before reap = %d, want 30", before[model.ShardDone])
+	}
+
+	if n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindDir}); err != nil || n != 30 {
+		t.Fatalf("reap = %d, %v; want 30, nil", n, err)
+	}
+
+	after, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[model.ShardDone] != 30 {
+		t.Fatalf("DONE after reap = %d, want 30 (unchanged despite rows being deleted)", after[model.ShardDone])
+	}
+
+	// A second, independent reap call (a later phase transition on the same
+	// pass reaping a different kind) must ADD to shards_reaped, not overwrite
+	// it — the running total across the pass's whole life must be additive.
+	batch2 := make([]NewShard, 5)
+	for i := range batch2 {
+		batch2[i] = NewShard{Kind: model.KindVerify, RelPath: fmt.Sprintf("v-%03d", i)}
+	}
+	ids2, err := s.InsertShards(passID, 0, batch2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids2 {
+		if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+			string(model.ShardDone), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindVerify}); err != nil || n != 5 {
+		t.Fatalf("second reap = %d, %v; want 5, nil", n, err)
+	}
+	final, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final[model.ShardDone] != 35 {
+		t.Fatalf("DONE after second reap = %d, want 35 (30 + 5, additive across reaps)", final[model.ShardDone])
+	}
+}
+
+// TestReapDoneShardsBatched checks that a backlog bigger than one batch is
+// only partially drained per call (the batching that keeps a huge reap from
+// holding the writer lock for one long delete) and a second call picks up
+// where the first left off.
+func TestReapDoneShardsBatched(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	total := ReapBatchSize + 100
+	batch := make([]NewShard, total)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindVerify, RelPath: fmt.Sprintf("v-%06d", i)}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+	// One bulk UPDATE rather than per-row: this test only cares about count
+	// behavior across the batch boundary, not which specific ids survive.
+	if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE pass_id = ? AND kind = ?`,
+		string(model.ShardDone), passID, string(model.KindVerify)); err != nil {
+		t.Fatal(err)
+	}
+
+	n1, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindVerify})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n1 != ReapBatchSize {
+		t.Fatalf("first batch = %d, want exactly ReapBatchSize (%d)", n1, ReapBatchSize)
+	}
+	n2, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindVerify})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n2 != int64(total)-n1 {
+		t.Fatalf("second batch = %d, want %d (the remainder)", n2, int64(total)-n1)
+	}
+	assertCountsConsistent(t, s, "after batched reap")
+}
+
+// TestOpenSetsIncrementalVacuum checks the auto_vacuum migration Open performs:
+// a pre-existing database (the SQLite default, auto_vacuum=NONE) is converted
+// to INCREMENTAL on open, and reopening an already-converted database is a
+// cheap no-op (no needless VACUUM on every restart).
+func TestOpenSetsIncrementalVacuum(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mode int
+	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Fatalf("auto_vacuum = %d, want 2 (INCREMENTAL)", mode)
+	}
+	s.Close()
+
+	// Reopening must not fail and must keep the mode (VACUUM is one-time).
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Fatalf("auto_vacuum after reopen = %d, want 2 (INCREMENTAL)", mode)
+	}
+}
+
+// TestIncrementalVacuumReclaimsSpace exercises IncrementalVacuum end to end:
+// after reaping a large batch of DONE shards, running it should not error and
+// the database's freelist should shrink (pages actually handed back).
+func TestIncrementalVacuumReclaimsSpace(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	batch := make([]NewShard, 5000)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindVerify, Payload: make([]byte, 512),
+			RelPath: fmt.Sprintf("v-%06d", i)}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE pass_id = ? AND kind = ?`,
+		string(model.ShardDone), passID, string(model.KindVerify)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindVerify})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+
+	var freelistBefore int
+	if err := s.db.QueryRow(`PRAGMA freelist_count`).Scan(&freelistBefore); err != nil {
+		t.Fatal(err)
+	}
+	if freelistBefore == 0 {
+		t.Fatal("expected freed pages on the freelist after reaping; test fixture didn't produce any")
+	}
+	if err := s.IncrementalVacuum(freelistBefore); err != nil {
+		t.Fatal(err)
+	}
+	var freelistAfter int
+	if err := s.db.QueryRow(`PRAGMA freelist_count`).Scan(&freelistAfter); err != nil {
+		t.Fatal(err)
+	}
+	if freelistAfter >= freelistBefore {
+		t.Fatalf("freelist_count did not shrink: before=%d after=%d", freelistBefore, freelistAfter)
+	}
+}
+
+// TestOpenSkipsRebuildWhenRollupPopulated guards the startup-scan fix: Open
+// must not re-derive shard_counts from a full GROUP BY over shards when the
+// rollup is already populated (the normal case on every restart after the
+// first). Only a rollup that is empty while shards is not (a pre-upgrade or
+// pre-existing DB) should trigger the rebuild.
+func TestOpenSkipsRebuildWhenRollupPopulated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, passID, _ := seed(t, s)
+	if _, err := s.InsertShards(passID, 0, []NewShard{{Kind: model.KindVerify}}); err != nil {
+		t.Fatal(err)
+	}
+	assertCountsConsistent(t, s, "before corrupting rollup")
+
+	// Sabotage the rollup directly so a real rebuild would visibly fix it; if
+	// Open's skip-when-populated guard regresses to "always rebuild", this
+	// corrupted row would disappear on reopen and the test would pass for the
+	// wrong reason — so leave it in place and assert it survives instead.
+	if _, err := s.db.Exec(`UPDATE shard_counts SET n = n + 1000 WHERE pass_id = ? LIMIT 1`, passID); err != nil {
+		// LIMIT on UPDATE isn't supported by this SQLite build; fall back to
+		// bumping every row for this pass, which is just as good a sentinel.
+		if _, err := s.db.Exec(`UPDATE shard_counts SET n = n + 1000 WHERE pass_id = ?`, passID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	var n int64
+	if err := s2.db.QueryRow(`SELECT SUM(n) FROM shard_counts WHERE pass_id = ?`, passID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 1000 {
+		t.Fatalf("rollup was rebuilt on reopen despite already being populated (sentinel corruption lost): sum=%d", n)
+	}
+}
+
 const specYAML = `
 apiVersion: drsync/v1
 kind: Job

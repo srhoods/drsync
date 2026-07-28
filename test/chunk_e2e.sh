@@ -93,17 +93,22 @@ spec:
   verify: { checksum: { sample_rate: 1.0 } }
 EOF
 "$DRSYNC" job submit "$WORK/job.yaml" --start >/dev/null || fail "submit failed"
-STATE=""
-for _ in $(seq 1 240); do
-    STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/chunk" | grep -o '"state":"[A-Z]*"' | head -1)
-    [[ "$STATE" == '"state":"COMPLETED"' ]] && break
-    sleep 0.5
-done
-[[ "$STATE" == '"state":"COMPLETED"' ]] || {
-    tail -8 "$WORK"/coord.log "$WORK"/chunk-*.log; fail "did not converge (state=$STATE)"; }
 
 # --- 1. chunks ran, spread across more than one agent ------------------------
-read -r NCHUNK NAGENTS < <(python3 - "$WORK/coord/state.db" <<'PY'
+# Sampled WHILE pass 1 is still scanning, not after the job completes: the
+# Shard Reaper deletes a pass's DONE chunk shards the moment its own drain
+# check proves the SCANNING phase finished (same commit as the SCANNING→DIRFIX
+# transition), so by the time the job reaches COMPLETED those rows are already
+# gone — querying them post-completion would always read back zero, not
+# because nothing ran but because the evidence was correctly reaped. Track the
+# high-water mark across the whole run instead of reading it once at the end,
+# mirroring how chunk_abort_reclaim_e2e.sh polls chunk_groups.n_done mid-flight
+# for the same reason.
+NCHUNK=0
+NAGENTS=0
+STATE=""
+for _ in $(seq 1 240); do
+    read -r n a < <(python3 - "$WORK/coord/state.db" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 rows = con.execute("""
@@ -111,13 +116,19 @@ rows = con.execute("""
     JOIN passes p ON p.id = s.pass_id JOIN jobs j ON j.id = p.job_id
     WHERE j.name='chunk' AND p.pass_no=1 AND s.kind='chunk' AND s.lease_agent IS NOT NULL
     GROUP BY s.lease_agent""").fetchall()
-total = sum(n for _, n in rows)
-print(total, len(rows), file=sys.stderr)
-print(total, len(rows))
+print(sum(n for _, n in rows), len(rows))
 PY
 )
-[[ "${NCHUNK:-0}" -ge 11 ]] || fail "expected >=11 chunk shards (10 data + finalize), got ${NCHUNK:-0}"
-[[ "${NAGENTS:-0}" -ge 2 ]] || fail "chunks did not spread: ran on ${NAGENTS:-0} agent(s)"
+    [[ "${n:-0}" -gt "$NCHUNK" ]] && NCHUNK=$n
+    [[ "${a:-0}" -gt "$NAGENTS" ]] && NAGENTS=$a
+    STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/chunk" | grep -o '"state":"[A-Z]*"' | head -1)
+    [[ "$STATE" == '"state":"COMPLETED"' ]] && break
+    sleep 0.25
+done
+[[ "$STATE" == '"state":"COMPLETED"' ]] || {
+    tail -8 "$WORK"/coord.log "$WORK"/chunk-*.log; fail "did not converge (state=$STATE)"; }
+[[ "$NCHUNK" -ge 11 ]] || fail "expected >=11 chunk shards (10 data + finalize), got $NCHUNK"
+[[ "$NAGENTS" -ge 2 ]] || fail "chunks did not spread: ran on $NAGENTS agent(s)"
 
 # --- 2. the file is byte-exact and metadata survived finalize ----------------
 [[ "$(sha256sum "$DST/huge.bin" | cut -d' ' -f1)" == "$HUGE_SUM" ]] \
