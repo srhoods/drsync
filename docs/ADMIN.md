@@ -619,6 +619,25 @@ Changing the filter clears the current checkbox selection (row positions just
 changed under the new result set, so stale checkboxes could otherwise silently
 bulk-edit the wrong rows).
 
+**Refreshing** a table view or the Database info screen is on-demand by
+default — nothing is re-queried until you ask for it:
+- `r` reloads immediately.
+- `R` opens a dialog to set (or turn off) a timed auto-refresh, in whole
+  seconds. The minimum is 5s — a lower value is accepted but silently raised
+  to the floor rather than rejected, with the applied value shown in the
+  status line, since a fat-fingered "1" should still do something useful.
+  Auto-refresh stops the moment you leave the screen (`Esc`); it does not
+  keep running in the background across tables, and is off again by default
+  the next time you open one.
+- A running auto-refresh does **not** clear a table view's checkbox
+  selection (unlike an explicit filter change) — the whole point of timed
+  refresh is to keep a screen current while you're mid-way through checking
+  rows for a bulk edit, so wiping that selection every few seconds would
+  defeat it. Bulk-edit's confirmation step always re-reads each row's current
+  value immediately before writing, so a checkbox left checked across a
+  refresh can at worst re-apply an already-correct value — it can't corrupt
+  an unrelated row.
+
 **Colour**: the `default` theme (Okabe–Ito-derived blue/orange/vermillion, not
 a red/green pair — the most common colour-blind confusion) and `high-contrast`
 (maximal luminance separation) are both built from fixed 256-colour-palette

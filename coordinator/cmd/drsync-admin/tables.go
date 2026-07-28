@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -32,6 +33,7 @@ type TableView struct {
 	rows    []Row
 	colName []string
 	checked map[int]bool
+	refresh autoRefresher
 }
 
 func newTableView(app *App, table string) (*TableView, error) {
@@ -84,6 +86,12 @@ func newTableView(app *App, table string) (*TableView, error) {
 				app.openBulkEdit(tv)
 			}
 			return nil
+		case event.Rune() == 'r':
+			tv.refreshInPlace()
+			return nil
+		case event.Rune() == 'R':
+			app.openRefreshDialog(&tv.refresh, tv.refreshInPlace, tv.updateStatus)
+			return nil
 		}
 		return event
 	})
@@ -98,7 +106,30 @@ func newTableView(app *App, table string) (*TableView, error) {
 	return tv, nil
 }
 
+// reload re-runs the current filter and always clears checkbox selection —
+// row identity/positions just changed under a (possibly new) filter, so
+// stale checkboxes could otherwise silently bulk-edit the wrong rows. Used
+// when the operator explicitly changes the filter.
 func (tv *TableView) reload(filter string) {
+	tv.doReload(filter, true)
+}
+
+// refreshInPlace re-runs the same query an auto-refresh tick or manual 'r'
+// keypress uses: it does NOT clear checkbox selection. A timed refresh is
+// explicitly meant to keep the screen current while an operator is mid-way
+// through checking rows for a bulk edit; wiping their selection every few
+// seconds would make the timer feature fight the bulk-edit feature. Row
+// identity can still have shifted (rows added/removed by the coordinator
+// between ticks), so this is a deliberate trade-off, not a guarantee — the
+// bulk-edit confirmation always re-reads each row's current value right
+// before writing (see confirmBulkApply), so a stale checkbox can at worst
+// re-apply a value that's already correct, never silently corrupt an
+// unrelated row.
+func (tv *TableView) refreshInPlace() {
+	tv.doReload(tv.filter.GetText(), false)
+}
+
+func (tv *TableView) doReload(filter string, clearChecked bool) {
 	clause, args, err := buildFilterClause(tv.cols, filter)
 	if err != nil {
 		tv.status.SetText(fmt.Sprintf("[red::]filter error: %v[-::]", err))
@@ -112,10 +143,9 @@ func (tv *TableView) reload(filter string) {
 	}
 	tv.rows = rows
 	tv.colName = names
-	// Row identity/positions just changed under a new filter — stale
-	// checkbox state pointing at different rows would silently bulk-edit
-	// the wrong thing, so any change to the result set clears selection.
-	tv.checked = map[int]bool{}
+	if clearChecked {
+		tv.checked = map[int]bool{}
+	}
 	tv.render()
 	tv.updateStatus()
 }
@@ -135,8 +165,15 @@ func (tv *TableView) updateStatus() {
 	if tv.app.writable && hasEditableColumns(tv.table) {
 		checkedMsg = fmt.Sprintf("  |  %d checked (space: check, a: all, e: bulk edit)", len(tv.checked))
 	}
-	tv.status.SetText(fmt.Sprintf("%d row(s) shown%s  |  mode: %s%s  |  Enter: view/edit row  |  /: filter  |  Esc: back",
-		shown, truncated, mode, checkedMsg))
+	tv.status.SetText(fmt.Sprintf("%d row(s) shown%s  |  mode: %s%s  |  refresh: %s  |  Enter: view/edit  |  r/R: refresh  |  /: filter  |  Esc: back",
+		shown, truncated, mode, checkedMsg, refreshLabel(tv.refresh.Interval())))
+}
+
+func refreshLabel(interval time.Duration) string {
+	if interval <= 0 {
+		return "on-demand"
+	}
+	return interval.String()
 }
 
 func (tv *TableView) toggleChecked(rowIdx int) {

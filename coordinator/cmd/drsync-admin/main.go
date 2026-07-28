@@ -113,7 +113,14 @@ func (a *App) openTable(name string) {
 		return
 	}
 	page := "table:" + name
-	a.pages.AddAndSwitchToPage(page, backable(tv.root, func() { a.pages.SwitchToPage("tables") }), true)
+	a.pages.AddAndSwitchToPage(page, backable(tv.root, func() {
+		// Stop any running auto-refresh ticker before leaving: a fresh
+		// TableView is constructed the next time this table is opened, so a
+		// ticker left running here would keep reloading a screen nobody can
+		// see, leaking a goroutine per open/close cycle.
+		tv.refresh.Stop()
+		a.pages.SwitchToPage("tables")
+	}), true)
 	a.setFocus(tv.grid)
 }
 
@@ -123,9 +130,12 @@ func (a *App) showTableView(tv *TableView) {
 }
 
 func (a *App) openDBInfo() {
-	view := newDBInfoView(a.db, a.dbPath)
-	a.pages.AddAndSwitchToPage("dbinfo", backable(view, func() { a.pages.SwitchToPage("tables") }), true)
-	a.setFocus(view)
+	d := newDBInfoView(a, a.dbPath)
+	a.pages.AddAndSwitchToPage("dbinfo", backable(d.view, func() {
+		d.refresh.Stop()
+		a.pages.SwitchToPage("tables")
+	}), true)
+	a.setFocus(d.view)
 }
 
 func (a *App) flashStatus(msg string) {

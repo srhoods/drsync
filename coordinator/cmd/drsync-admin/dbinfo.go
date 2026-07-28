@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -92,9 +93,36 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-func newDBInfoView(db *sql.DB, dbPath string) *tview.TextView {
-	tv := tview.NewTextView().SetDynamicColors(true)
-	tv.SetBorder(true).SetTitle(" Database ")
-	tv.SetText(renderDBInfo(db, dbPath))
-	return tv
+// DBInfoView is the "Database" screen: PRAGMA config, file sizes, and
+// summary counts, with the same on-demand/timed refresh model as a table
+// view (see refresh.go) since these counts change just as live jobs run.
+type DBInfoView struct {
+	app     *App
+	dbPath  string
+	view    *tview.TextView
+	refresh autoRefresher
+}
+
+func newDBInfoView(app *App, dbPath string) *DBInfoView {
+	d := &DBInfoView{app: app, dbPath: dbPath, view: tview.NewTextView().SetDynamicColors(true)}
+	d.view.SetBorder(true).SetTitle(" Database ")
+	d.view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Rune() {
+		case 'r':
+			d.refreshInPlace()
+			return nil
+		case 'R':
+			app.openRefreshDialog(&d.refresh, d.refreshInPlace, d.refreshInPlace)
+			return nil
+		}
+		return event
+	})
+	d.refreshInPlace()
+	return d
+}
+
+func (d *DBInfoView) refreshInPlace() {
+	footer := fmt.Sprintf("\n[::b]Refresh[::-]  %s  |  r: refresh now  |  R: set timed refresh  |  Esc: back",
+		refreshLabel(d.refresh.Interval()))
+	d.view.SetText(renderDBInfo(d.app.db, d.dbPath) + footer)
 }
