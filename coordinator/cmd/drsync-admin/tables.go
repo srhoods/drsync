@@ -44,7 +44,7 @@ func newTableView(app *App, table string) (*TableView, error) {
 
 	tv.filter = tview.NewInputField().SetLabel("filter (col=val, col!=val, col>val, col~substr, comma-joined AND): ")
 	tv.grid = tview.NewTable().SetBorders(false).SetSelectable(true, false).SetFixed(1, 0)
-	tv.grid.SetSelectedStyle(tcell.StyleDefault.Background(app.theme.Selection))
+	tv.grid.SetSelectedStyle(tcell.StyleDefault.Background(app.theme.ListSelection).Foreground(app.theme.SelectedText))
 	tv.status = tview.NewTextView().SetDynamicColors(true)
 
 	tv.filter.SetDoneFunc(func(key tcell.Key) {
@@ -139,6 +139,15 @@ func (a *App) newTablesScreen() *tview.Flex {
 	}
 	list := tview.NewList().ShowSecondaryText(true)
 	list.SetBorder(true).SetTitle(" Tables ")
+	// Explicit, not inherited from tview.Styles at construction time: List
+	// snapshots the package-level style vars into its own selectedStyle field
+	// when NewList() runs, so a global theme applied afterwards would leave
+	// the very first (auto-selected) row using tview's built-in default
+	// colours instead of this theme's — which is exactly how a mono/
+	// high-contrast theme ended up with an invisible black-on-black or
+	// white-on-white selected row.
+	list.SetSelectedTextColor(a.theme.SelectedText)
+	list.SetSelectedBackgroundColor(a.theme.ListSelection)
 	for _, t := range names {
 		t := t
 		n, _ := tableRowCount(a.db, t)
