@@ -106,3 +106,33 @@ func TestRowStringHandlesNilAndBytes(t *testing.T) {
 		t.Errorf("int64 -> %q, want 5", r.String(2))
 	}
 }
+
+func TestHasEditableColumns(t *testing.T) {
+	if !hasEditableColumns("shards") {
+		t.Error("shards should have editable columns (priority/state/attempt)")
+	}
+	if !hasEditableColumns("agents") {
+		t.Error("agents should have editable columns (enabled)")
+	}
+	for _, table := range []string{"shard_counts", "chunk_groups", "splits", "journal_cursors", "nonexistent_table"} {
+		if hasEditableColumns(table) {
+			t.Errorf("%s should have no editable columns", table)
+		}
+	}
+}
+
+func TestEditableColumnNames(t *testing.T) {
+	got := editableColumnNames("shards")
+	want := []string{"attempt", "priority", "state"} // sorted
+	if len(got) != len(want) {
+		t.Fatalf("editableColumnNames(shards) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("editableColumnNames(shards) = %v, want %v", got, want)
+		}
+	}
+	if editableColumnNames("shard_counts") != nil {
+		t.Errorf("editableColumnNames(shard_counts) = %v, want nil", editableColumnNames("shard_counts"))
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 
 	_ "modernc.org/sqlite"
 )
@@ -34,6 +35,30 @@ var editableColumns = map[string]map[string]bool{
 
 func isEditable(table, col string) bool {
 	return editableColumns[table] != nil && editableColumns[table][col]
+}
+
+// hasEditableColumns reports whether a table has any allowlisted column at
+// all, independent of any particular row's values. Used to decide whether a
+// row-detail view needs Save/Cancel (or a bulk-edit affordance) in the first
+// place, versus tables like shard_counts/chunk_groups/splits/
+// journal_cursors that are never editable.
+func hasEditableColumns(table string) bool {
+	return len(editableColumns[table]) > 0
+}
+
+// editableColumnNames returns the allowlisted columns for a table, sorted for
+// stable display (e.g. in a bulk-edit column picker).
+func editableColumnNames(table string) []string {
+	cols := editableColumns[table]
+	if len(cols) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cols))
+	for c := range cols {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // openDB opens the coordinator's SQLite file with the same WAL/busy_timeout

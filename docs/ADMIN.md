@@ -595,8 +595,29 @@ arbitrary cells:
 Selecting a row opens every column; only allowlisted columns render as
 editable fields (everything else is read-only). Saving always shows a
 before/after diff in a confirmation modal — nothing is written until you
-confirm. There is no raw-SQL escape hatch; every write goes through this same
-allowlist and confirmation path.
+confirm. If a row has nothing editable at all (read-only mode, or a table with
+no allowlisted columns, e.g. `shard_counts`/`chunk_groups`/`splits`/
+`journal_cursors`), the row view is a pure viewer with a single **Close**
+button — there is no Save/Cancel pair implying a change is possible when
+there isn't one. There is no raw-SQL escape hatch; every write goes through
+this same allowlist and confirmation path.
+
+**Bulk editing** many rows at once (e.g. re-prioritizing every `PARKED` shard
+after fixing the cause) doesn't require opening each row individually:
+1. Filter down to the rows you want (`/`, e.g. `state=PARKED`).
+2. `Space` checks the highlighted row; `a` checks/unchecks every row currently
+   loaded (respecting the filter and the same row cap that guards `shards` at
+   PB scale).
+3. `e` opens a bulk-edit dialog: pick one allowlisted column and one new
+   value, applied to every checked row.
+4. Confirmation is a single grouped summary, not one line per row — e.g.
+   "247 row(s): `0` -> `30`, 3 row(s): `5` -> `30`" — followed by a per-row
+   write, with a final count of how many succeeded if any individual row
+   failed partway through.
+
+Changing the filter clears the current checkbox selection (row positions just
+changed under the new result set, so stale checkboxes could otherwise silently
+bulk-edit the wrong rows).
 
 **Colour**: the `default` theme avoids a red/green-only contrast (the most
 common colour-blind confusion) in favour of blue/orange/amber; `high-contrast`

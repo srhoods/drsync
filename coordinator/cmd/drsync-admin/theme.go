@@ -149,6 +149,16 @@ func (t Theme) applyTviewDefaults() {
 // StateMarker returns a short text/symbol tag plus the semantic colour for a
 // shard/job/agent state string. The tag is always printed — colour is a
 // reinforcement, never the sole carrier of meaning.
+//
+// These tags start with '[', which tview's TableCell tag parser also treats
+// as the start of a style/region tag (no per-cell opt-out) — the checkbox
+// column in tables.go hit exactly this, rendering "[ ]"/"[x]" as blank
+// instead of a checkbox once tview's parser swallowed them. "[OK]"/"[..]"/
+// "[!!]"/"[--]" render correctly today (verified live in the running app),
+// but that depends on their exact contents failing to parse as a valid tag —
+// it is not a property of "starts with '[' and is short" in general. Prefer
+// a non-'[' marker (as tables.go's checkbox now does) for anything new,
+// rather than adding another tag here and re-verifying by hand.
 func (t Theme) StateMarker(state string) (tag string, color tcell.Color) {
 	switch state {
 	case "DONE", "COMPLETE", "COMPLETED", "connected", "true":
