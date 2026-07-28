@@ -553,6 +553,60 @@ anything you need first (`drsync report <name> --json`, `drsync journal cat
 
 ---
 
+## 6b. `drsync-admin` — direct database console
+
+`drsync-admin` is a standalone, full-screen console for browsing and editing
+the coordinator's SQLite state file directly. It opens the DB with the same
+WAL/`busy_timeout` settings the coordinator itself uses, so it is safe to run
+**against a live `drsyncd`** — reads never block the grant hot path, and a
+write simply waits (up to 5s) if the writer is momentarily busy. It needs no
+running coordinator, no network access, and no REST/API credentials — just a
+path to the state file.
+
+```bash
+bin/drsync-admin -db /var/lib/drsync/state.db              # browse, read-only
+bin/drsync-admin -db /var/lib/drsync/state.db -write        # allow field edits
+bin/drsync-admin -db /var/lib/drsync/state.db -theme mono   # colour-blind-safe / NO_COLOR-style
+```
+
+**What it shows:**
+- Every table (`jobs`, `passes`, `shards`, `agents`, `shard_counts`,
+  `chunk_groups`, `splits`, `journal_cursors`) with live row counts, full
+  schema, and filterable row browsing (`/` to filter: `col=val`, `col!=val`,
+  `col>val`, `col<val`, `col~substring`, comma-joined as AND). `shards` can be
+  millions of rows at PB scale (§3 of `DESIGN-coordinator.md`), so browsing
+  without a filter is capped (a truncation notice tells you to narrow it).
+- A **Database info** screen: PRAGMA configuration (`journal_mode`,
+  `auto_vacuum`, `page_size`, `synchronous`, `foreign_keys`, `busy_timeout`),
+  on-disk file and WAL size, and summary counts by job/agent state.
+
+**Editing** is opt-in (`-write`) and restricted to a small, explicit allowlist
+of columns the coordinator itself already treats as operator-mutable — the
+same fields `drsync agent disable`/`queue retry`/`job cancel` touch, not
+arbitrary cells:
+
+| Table | Column | Same effect as |
+|---|---|---|
+| `shards` | `priority` | manually re-ranking a stuck or urgent shard ahead of the queue (`shards_sched` orders by `priority DESC, id`) |
+| `shards` | `state`, `attempt` | manually requeuing a `PARKED` shard (like `drsync queue retry`, but hand-editable) |
+| `agents` | `enabled` | `drsync agent disable`/administrative drain |
+| `jobs` | `state` | forcing a stuck job to `CANCELLED` |
+
+Selecting a row opens every column; only allowlisted columns render as
+editable fields (everything else is read-only). Saving always shows a
+before/after diff in a confirmation modal — nothing is written until you
+confirm. There is no raw-SQL escape hatch; every write goes through this same
+allowlist and confirmation path.
+
+**Colour**: the `default` theme avoids a red/green-only contrast (the most
+common colour-blind confusion) in favour of blue/orange/amber; `high-contrast`
+maximizes luminance separation; `mono` carries all meaning through text
+markers alone (`[OK]`/`[..]`/`[!!]`/`[--]`) and is used automatically when
+`NO_COLOR` is set. State colour is always paired with one of those markers, so
+meaning never depends on colour alone.
+
+---
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause & fix |
@@ -690,4 +744,8 @@ drsync ca issue --type agent  --cn agent-01
 
 # HTTP(S) listener cert (WebUI/API; dev/test — see §8)
 drsync cert generate-self-signed --cn coord --dns coord --ip 10.0.0.10 --out /etc/drsync
+
+# direct DB console (browse/edit state.db; see §6b) — safe alongside a live drsyncd
+drsync-admin -db /var/lib/drsync/state.db
+drsync-admin -db /var/lib/drsync/state.db -write
 ```
