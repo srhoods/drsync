@@ -311,16 +311,41 @@ func (s *Scheduler) RunSweeper(ctx context.Context, every time.Duration) {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			requeued, parked, err := s.st.ExpireLeases(now)
+			expired, err := s.st.ExpireLeases(now)
 			if err != nil {
 				slog.Error("lease sweep failed", "err", err)
 				continue
 			}
-			if requeued > 0 || parked > 0 {
-				slog.Warn("expired leases", "requeued", requeued, "parked", parked)
-				s.met.LeaseExpiries.Add(float64(requeued + parked))
-				s.met.ShardsParked.Add(float64(parked))
+			if len(expired) == 0 {
+				continue
 			}
+			var requeued, parked int
+			for _, e := range expired {
+				outcome := "requeued"
+				if e.Parked {
+					outcome = "parked"
+					parked++
+				} else {
+					requeued++
+				}
+				agent := e.Agent
+				if agent == "" {
+					agent = "unknown"
+				}
+				s.met.LeaseExpiriesByAgent.WithLabelValues(agent, string(e.Kind), outcome).Inc()
+				// Per-shard detail (job/pass/kind/path/agent/attempt), not just an
+				// aggregate count: this is what lets "is it one flaky agent or
+				// fleet-wide" be answered by grepping logs for one job/timeframe
+				// instead of correlating heartbeat gaps against timestamps after
+				// the fact — lease_agent does not survive the shard's next grant,
+				// so this line is the only durable record of who held it.
+				slog.Warn("lease expired", "job", e.Job, "pass", e.PassNo,
+					"shard", e.ShardID, "kind", e.Kind, "path", e.RelPath,
+					"agent", agent, "attempt", e.Attempt, "outcome", outcome)
+			}
+			slog.Warn("expired leases", "requeued", requeued, "parked", parked)
+			s.met.LeaseExpiries.Add(float64(requeued + parked))
+			s.met.ShardsParked.Add(float64(parked))
 		}
 	}
 }

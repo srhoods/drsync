@@ -1360,26 +1360,78 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 	}
 }
 
+// ExpiredLease is one shard whose lease aged out, captured at the moment
+// ExpireLeases acts on it — the detail an operator needs to tell "one flaky
+// agent" from "fleet-wide" apart, which the UPDATE alone can't preserve:
+// lease_agent is overwritten by the very next grant, so by the time a
+// re-queued shard completes there is no durable record of which agent held
+// the expired lease. See docs/DESIGN-coordinator.md §7 (Metrics).
+type ExpiredLease struct {
+	ShardID int64
+	Job     string
+	PassNo  int
+	Kind    model.ShardKind
+	RelPath string
+	Agent   string // lease_agent at expiry time; "" if the shard was never leased (shouldn't happen)
+	Attempt int    // attempt count at expiry, before any further re-grant
+	Parked  bool   // true if this expiry hit the attempt ceiling (parked, not requeued)
+}
+
 // ExpireLeases re-queues shards whose lease TTL passed; shards at the attempt
-// ceiling park instead. Returns (requeued, parked).
-func (s *Store) ExpireLeases(now time.Time) (int64, int64, error) {
+// ceiling park instead. Returns the full detail of every shard acted on —
+// see ExpiredLease — captured before the requeue/park UPDATE, since lease_agent
+// does not survive a re-grant.
+func (s *Store) ExpireLeases(now time.Time) ([]ExpiredLease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ms := now.UnixMilli()
-	requeued, err := s.execCount(`UPDATE shards SET state = ?, lease_id = NULL, updated_at = ?
-		WHERE state = ? AND lease_expiry < ? AND attempt < ?`,
-		string(model.ShardQueued), nowMS(), string(model.ShardLeased), ms, MaxShardAttempts)
+
+	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
-	parked, err := s.execCount(`UPDATE shards SET state = ?, lease_id = NULL,
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT s.id, j.name, p.pass_no, s.kind, s.rel_path,
+		COALESCE(s.lease_agent, ''), s.attempt, (s.attempt >= ?)
+		FROM shards s
+		JOIN passes p ON p.id = s.pass_id
+		JOIN jobs   j ON j.id = p.job_id
+		WHERE s.state = ? AND s.lease_expiry < ?
+		ORDER BY s.id`, MaxShardAttempts, string(model.ShardLeased), ms)
+	if err != nil {
+		return nil, err
+	}
+	var expired []ExpiredLease
+	for rows.Next() {
+		var e ExpiredLease
+		if err := rows.Scan(&e.ShardID, &e.Job, &e.PassNo, &e.Kind, &e.RelPath,
+			&e.Agent, &e.Attempt, &e.Parked); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		expired = append(expired, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if len(expired) == 0 {
+		return nil, tx.Commit()
+	}
+
+	if _, err := execCountTx(tx, `UPDATE shards SET state = ?, lease_id = NULL, updated_at = ?
+		WHERE state = ? AND lease_expiry < ? AND attempt < ?`,
+		string(model.ShardQueued), nowMS(), string(model.ShardLeased), ms, MaxShardAttempts); err != nil {
+		return nil, err
+	}
+	if _, err := execCountTx(tx, `UPDATE shards SET state = ?, lease_id = NULL,
 		error = COALESCE(error, 'attempt ceiling after lease expiry'), updated_at = ?
 		WHERE state = ? AND lease_expiry < ?`,
-		string(model.ShardParked), nowMS(), string(model.ShardLeased), ms)
-	if err != nil {
-		return 0, 0, err
+		string(model.ShardParked), nowMS(), string(model.ShardLeased), ms); err != nil {
+		return nil, err
 	}
-	return requeued, parked, nil
+	return expired, tx.Commit()
 }
 
 func (s *Store) execCount(q string, args ...any) (int64, error) {

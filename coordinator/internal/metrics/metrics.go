@@ -32,6 +32,15 @@ type Metrics struct {
 	JournalFsyncErr prometheus.Counter
 	Grants          prometheus.Counter
 	ShardsReaped    prometheus.Counter
+
+	// LeaseExpiriesByAgent is LeaseExpiries broken out by which agent held the
+	// lease at expiry (not who it re-grants to) and shard kind, so "is this one
+	// flaky host or fleet-wide" is answerable from /metrics directly instead of
+	// grepping connect/disconnect log lines and eyeballing timestamps. Requeued
+	// and parked are both counted here (label "outcome") — a shard that expires
+	// repeatedly on the same agent before finally parking is exactly the pattern
+	// this exists to surface.
+	LeaseExpiriesByAgent *prometheus.CounterVec
 }
 
 func New() *Metrics {
@@ -77,9 +86,14 @@ func New() *Metrics {
 		ShardsReaped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "drsync_shards_reaped_total",
 			Help: "DONE shard rows deleted by the Shard Reaper once their phase drains."}),
+		LeaseExpiriesByAgent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "drsync_lease_expiries_by_agent_total",
+			Help: "Expired shard leases by the agent that held the lease, shard kind, and outcome (requeued|parked)."},
+			[]string{"agent", "kind", "outcome"}),
 	}
 	reg.MustRegister(m.ScanEntries, m.CopyFiles, m.CopyBytes, m.AgentUp, m.AgentRSS,
 		m.ShardDuration, m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked,
-		m.JournalBatches, m.JournalFsyncErr, m.Grants, m.ShardsReaped)
+		m.JournalBatches, m.JournalFsyncErr, m.Grants, m.ShardsReaped,
+		m.LeaseExpiriesByAgent)
 	return m
 }

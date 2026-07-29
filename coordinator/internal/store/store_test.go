@@ -43,7 +43,7 @@ func TestConcurrentReadsDuringWrites(t *testing.T) {
 					errCh <- err
 					return
 				}
-				if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+				if _, err := s.ExpireLeases(time.Now()); err != nil {
 					errCh <- err
 					return
 				}
@@ -665,12 +665,21 @@ func TestRenewLeasesByIDOnlyHeld(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Sweep: exactly the un-renewed lease requeues; the renewed one survives.
-	requeued, parked, err := s.ExpireLeases(time.Now())
+	expired, err := s.ExpireLeases(time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requeued != 1 || parked != 0 {
-		t.Fatalf("want 1 requeued (the unheld lease), got requeued=%d parked=%d", requeued, parked)
+	if len(expired) != 1 || expired[0].Parked {
+		t.Fatalf("want 1 requeued (the unheld lease), got %+v", expired)
+	}
+	// The detail must attribute the expiry to the agent that actually held it —
+	// this is the whole point of returning it: lease_agent is gone once the
+	// shard is re-granted, so this is the only place that identity survives.
+	if expired[0].Agent != "agent-a" {
+		t.Fatalf("expired lease attributed to %q, want agent-a", expired[0].Agent)
+	}
+	if expired[0].ShardID != rows[1].ID {
+		t.Fatalf("expired shard = %d, want the unheld one (%d)", expired[0].ShardID, rows[1].ID)
 	}
 	counts, _ := s.ShardStateCounts(passID)
 	if counts[model.ShardLeased] != 1 || counts[model.ShardQueued] != 1 {
@@ -730,15 +739,15 @@ func TestLeaseExpiryRequeuesThenParks(t *testing.T) {
 				t.Fatalf("attempt %d: rows=%v err=%v", i, rows, err)
 			}
 		}
-		requeued, parked, err := s.ExpireLeases(time.Now())
+		expired, err := s.ExpireLeases(time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if i < MaxShardAttempts-1 && requeued != 1 {
-			t.Fatalf("attempt %d: requeued=%d parked=%d", i, requeued, parked)
+		if i < MaxShardAttempts-1 && (len(expired) != 1 || expired[0].Parked) {
+			t.Fatalf("attempt %d: expired=%+v, want 1 requeued", i, expired)
 		}
-		if i == MaxShardAttempts-1 && parked != 1 {
-			t.Fatalf("final attempt: requeued=%d parked=%d (want park)", requeued, parked)
+		if i == MaxShardAttempts-1 && (len(expired) != 1 || !expired[0].Parked) {
+			t.Fatalf("final attempt: expired=%+v, want 1 parked", expired)
 		}
 	}
 }
@@ -868,7 +877,7 @@ func TestSoleAgentRequeuedShardNotStranded(t *testing.T) {
 			t.Fatal(err)
 		}
 		granted += len(rows)
-		if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+		if _, err := s.ExpireLeases(time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -899,7 +908,7 @@ func TestSoftAffinityPrefersFreshWork(t *testing.T) {
 	if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+	if _, err := s.ExpireLeases(time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -994,7 +1003,7 @@ func parkShard(t *testing.T, s *Store) {
 		if _, err := s.LeaseShards("agent-a", 1, -time.Second); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := s.ExpireLeases(time.Now()); err != nil {
+		if _, err := s.ExpireLeases(time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1014,7 +1023,7 @@ func (s *Store) ExpireLeasesForce(t *testing.T) error {
 		}
 		// A far-future "now" expires any outstanding lease, including one still
 		// held under a normal ttl from a prior grant.
-		if _, _, err := s.ExpireLeases(time.Now().Add(time.Hour)); err != nil {
+		if _, err := s.ExpireLeases(time.Now().Add(time.Hour)); err != nil {
 			return err
 		}
 	}
