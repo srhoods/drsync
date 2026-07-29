@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/klauspost/compress/zstd"
 	"google.golang.org/protobuf/proto"
@@ -89,6 +90,26 @@ func forEachRecord(raw []byte, fn func(*drsyncpb.JournalRecord) error) error {
 		}
 	}
 	return nil
+}
+
+// Summary returns the per-type record histogram across every pass in passNos
+// — the same aggregation `drsync journal cat --summary` and the API's
+// ?summary=true query serve, factored out here so callers that need the
+// job-wide histogram (the completion email, the WebUI's journal-summary
+// panel) don't re-scan the journal with their own copy of the loop.
+func Summary(root string, jobID int64, passNos []int) (byType map[string]int64, total int64, err error) {
+	byType = map[string]int64{}
+	for _, pn := range passNos {
+		err := ReadRecords(root, jobID, pn, func(r *drsyncpb.JournalRecord) error {
+			byType[strings.TrimPrefix(r.Type.String(), "JR_")]++
+			total++
+			return nil
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return byType, total, nil
 }
 
 // Orphans returns the deduplicated orphan rel-paths recorded in a pass —

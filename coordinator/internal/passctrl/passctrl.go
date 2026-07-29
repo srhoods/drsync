@@ -826,6 +826,20 @@ func (c *Controller) buildJobReport(job *store.Job) (notify.JobReport, error) {
 		return notify.JobReport{}, err
 	}
 	rep.ParkedShards = len(parked)
+
+	passNos := make([]int, len(passes))
+	for i, p := range passes {
+		passNos[i] = p.PassNo
+	}
+	summary, _, err := journal.Summary(c.journalRoot, job.ID, passNos)
+	if err != nil {
+		// The journal is a nice-to-have breakdown on top of the store-backed
+		// totals above; a read error here (e.g. a since-purged journal) should
+		// not sink the whole completion email.
+		slog.Warn("notify: journal summary failed", "job", job.Name, "err", err)
+	} else {
+		rep.JournalSummary = summary
+	}
 	return rep, nil
 }
 

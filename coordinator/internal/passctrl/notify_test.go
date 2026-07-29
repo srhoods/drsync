@@ -2,16 +2,70 @@ package passctrl
 
 import (
 	"bufio"
+	"encoding/binary"
 	"net"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+	"google.golang.org/protobuf/proto"
+
+	"drsync/coordinator/internal/journal"
 	"drsync/coordinator/internal/model"
 	"drsync/coordinator/internal/notify"
 	"drsync/coordinator/internal/store"
+	drsyncpb "drsync/proto/gen/drsyncpb"
 )
+
+// writeMixedJournal seeds (jobID, passNo) with one record per (type, relPath)
+// pair — unlike seedverify_test.go's writeJournal (JR_COPIED only), this lets
+// a test build a journal with several record types to check the type
+// histogram buildJobReport derives from it.
+func writeMixedJournal(t *testing.T, root string, jobID int64, passNo int, byType map[drsyncpb.JournalRecord_Type]int) {
+	t.Helper()
+	w, err := journal.NewWriter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw []byte
+	var count int
+	i := 0
+	for typ, n := range byType {
+		for j := 0; j < n; j++ {
+			rec := &drsyncpb.JournalRecord{Type: typ, RelPath: []byte(strconv.Itoa(i))}
+			i++
+			b, err := proto.Marshal(rec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var hdr [binary.MaxVarintLen64]byte
+			hn := binary.PutUvarint(hdr[:], uint64(len(b)))
+			raw = append(raw, hdr[:hn]...)
+			raw = append(raw, b...)
+			count++
+		}
+	}
+	if count > 0 {
+		if err := w.Append(&drsyncpb.JournalBatch{
+			JobId: uint64(jobID), PassNo: uint32(passNo),
+			RecordCount: uint32(count), RecordsZstd: enc.EncodeAll(raw, nil),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // mockSMTP speaks just enough SMTP (no TLS, no auth) to accept messages and
 // hand each one's raw DATA back over the returned channel. A local copy
@@ -456,4 +510,61 @@ func baseSpec2(name string) []byte {
 	s := strings.ReplaceAll(baseSpec, "name: t1", "name: "+name)
 	s = strings.ReplaceAll(s, "destination: { path: /dst }", "destination: { path: /dst-"+name+" }")
 	return []byte(s)
+}
+
+// buildJobReport's JournalSummary must be the type histogram across every
+// pass of the job — the same figures `drsync journal cat <name> --summary`
+// reports — not just the store-column totals already covered by the rest of
+// the report.
+func TestBuildJobReportJournalSummary(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	p1, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := c.st.CreatePass(job.ID, 2, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMixedJournal(t, c.journalRoot, job.ID, p1.PassNo, map[drsyncpb.JournalRecord_Type]int{
+		drsyncpb.JournalRecord_JR_COPIED: 5,
+		drsyncpb.JournalRecord_JR_ORPHAN: 2,
+	})
+	writeMixedJournal(t, c.journalRoot, job.ID, p2.PassNo, map[drsyncpb.JournalRecord_Type]int{
+		drsyncpb.JournalRecord_JR_COPIED: 3,
+		drsyncpb.JournalRecord_JR_ERROR:  1,
+	})
+
+	rep, err := c.buildJobReport(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"COPIED": 8, "ORPHAN": 2, "ERROR": 1}
+	for k, v := range want {
+		if rep.JournalSummary[k] != v {
+			t.Errorf("JournalSummary[%q] = %d, want %d (full: %+v)", k, rep.JournalSummary[k], v, rep.JournalSummary)
+		}
+	}
+	if len(rep.JournalSummary) != len(want) {
+		t.Errorf("JournalSummary has extra/missing types: %+v", rep.JournalSummary)
+	}
+}
+
+// A job with no journal on disk yet (e.g. cancelled before any pass wrote
+// records) must not fail the whole report — JournalSummary just comes back
+// empty.
+func TestBuildJobReportNoJournalIsEmptySummary(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	if _, err := c.st.CreatePass(job.ID, 1, model.PassScanning); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := c.buildJobReport(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.JournalSummary) != 0 {
+		t.Errorf("expected empty JournalSummary for a pass with no journal records, got %+v", rep.JournalSummary)
+	}
 }

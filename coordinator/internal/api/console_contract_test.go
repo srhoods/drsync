@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"drsync/coordinator/internal/journal"
 	"drsync/coordinator/internal/metrics"
 	"drsync/coordinator/internal/model"
 	"drsync/coordinator/internal/store"
@@ -176,6 +177,55 @@ func TestReportParkedCarriesParkTime(t *testing.T) {
 	}
 	if got.ParkedShards[0].ParkedAtMs < before {
 		t.Errorf("parked_at_ms = %d, want >= %d", got.ParkedShards[0].ParkedAtMs, before)
+	}
+}
+
+// The report's journal_summary is the per-type histogram across every pass
+// (the same figures `drsync journal cat --summary` and the completion email
+// show), and the WebUI's journal-summary panel binds to these exact field
+// names — pin the shape so a rename shows up here instead of as a blank panel.
+func TestReportCarriesJournalSummary(t *testing.T) {
+	srv := consoleSrv(t)
+	job, err := srv.st.CreateJob("jsum", []byte(specFor("jsum", "/src/j", "/dst/j")), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, err := srv.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jw, err := journal.NewWriter(srv.journalRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournal(t, jw, job.ID, p1.PassNo,
+		rec(drsyncpb.JournalRecord_JR_COPIED, "a", "", 0),
+		rec(drsyncpb.JournalRecord_JR_COPIED, "b", "", 0),
+		rec(drsyncpb.JournalRecord_JR_ORPHAN, "c", "", 0),
+	)
+	if err := jw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var got struct {
+		JournalSummary      map[string]int64 `json:"journal_summary"`
+		JournalSummaryTotal int64            `json:"journal_summary_total"`
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/jsum/report", nil)
+	r.SetPathValue("name", "jsum")
+	srv.getReport(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report: status %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.JournalSummary["COPIED"] != 2 || got.JournalSummary["ORPHAN"] != 1 {
+		t.Errorf("journal_summary = %+v, want COPIED:2 ORPHAN:1", got.JournalSummary)
+	}
+	if got.JournalSummaryTotal != 3 {
+		t.Errorf("journal_summary_total = %d, want 3", got.JournalSummaryTotal)
 	}
 }
 

@@ -69,8 +69,20 @@ test("fleet table renders agents with rates and drain controls", () => {
 
 test("job detail renders the ledger and convergence curve", () => {
   assert.match(c.$("#detail").textContent, /alpha/);
-  assert.equal(c.$$("#detail table.pt tbody tr").length, 3, "2 passes + total row");
+  assert.equal(c.$$("#pass-ledger tbody tr").length, 3, "2 passes + total row");
   assert.equal(c.$$("#detail .cbar").length, 2);
+});
+
+test("job detail renders the journal summary from the report endpoint", () => {
+  const jt = c.$("#journal-summary");
+  assert.ok(jt, "no journal summary table rendered");
+  const text = jt.textContent;
+  assert.match(text, /copied/);
+  assert.match(text, /912,000/, "copied count not rendered");
+  assert.match(text, /orphans observed/, "ORPHAN should use its display label");
+  assert.match(text, /verify failed/);
+  assert.doesNotMatch(text, /dir meta/, "a zero-count type should be omitted");
+  assert.match(c.$("#detail").textContent, /912,054 records?/);
 });
 
 test("job controls are live, not disabled stubs", () => {

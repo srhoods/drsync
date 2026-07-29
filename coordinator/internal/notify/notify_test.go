@@ -218,6 +218,47 @@ func TestRenderJobSummaryShowsPassDuration(t *testing.T) {
 	}
 }
 
+// The completion email's journal-summary section is the per-type histogram
+// (drsync journal cat --summary) attached to the job report; it must render
+// only the types actually seen, in the CLI's fixed display order, and stay
+// absent entirely when there is no journal to summarize.
+func TestRenderJobJournalSummary(t *testing.T) {
+	_, htmlBody, textBody := renderJob(JobReport{
+		Job: "prod-cutover", State: "COMPLETED", Converged: true,
+		JournalSummary: map[string]int64{
+			"COPIED": 1_200_000, "ORPHAN": 42, "ERROR": 3, "DIR_META": 0,
+		},
+	})
+	if !strings.Contains(htmlBody, "Journal summary") {
+		t.Error("html should include a Journal summary section")
+	}
+	if !strings.Contains(htmlBody, "1,200,000") || !strings.Contains(textBody, "1,200,000") {
+		t.Errorf("expected grouped copied count in both bodies:\nhtml:%s\ntext:%s", htmlBody, textBody)
+	}
+	if !strings.Contains(htmlBody, "orphans observed") {
+		t.Error("html should label ORPHAN with its display name")
+	}
+	if strings.Contains(htmlBody, "dir meta") {
+		t.Error("a zero-count type (DIR_META) should be omitted, not shown as 0")
+	}
+	copiedIdx := strings.Index(textBody, "copied")
+	orphanIdx := strings.Index(textBody, "orphans observed")
+	errorIdx := strings.Index(textBody, "errors")
+	if copiedIdx < 0 || orphanIdx < 0 || errorIdx < 0 || !(copiedIdx < orphanIdx && orphanIdx < errorIdx) {
+		t.Errorf("journal summary rows should follow the fixed display order:\n%s", textBody)
+	}
+}
+
+func TestRenderJobNoJournalSummary(t *testing.T) {
+	_, htmlBody, textBody := renderJob(JobReport{Job: "prod-cutover", State: "COMPLETED"})
+	if strings.Contains(htmlBody, "Journal summary") {
+		t.Error("html should omit the Journal summary section when there is no data")
+	}
+	if strings.Contains(textBody, "Journal summary") {
+		t.Error("text should omit the Journal summary section when there is no data")
+	}
+}
+
 func TestRenderParkedShardsAlert(t *testing.T) {
 	subject, htmlBody, textBody := renderParkedShards(ParkedShardsReport{
 		Job: "prod-cutover", Src: "/mnt/gpfs/home", Dst: "/mnt/weka/home",

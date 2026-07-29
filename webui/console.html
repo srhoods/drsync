@@ -1498,11 +1498,49 @@
       <div class="sect-l">convergence — Δfiles per pass (fixpoint = 0)</div>
       <div class="conv">${bars}</div>
       <div class="sect-l">per-pass ledger</div>
-      <div class="tbl-wrap"><table class="pt">
+      <div class="tbl-wrap"><table class="pt" id="pass-ledger">
         <thead><tr><th class="l">pass</th><th class="l">phase</th><th>duration</th><th>Δ files</th><th>Δ bytes</th><th>orphans</th><th>verify</th><th>errors</th></tr></thead>
         <tbody>${rows}
           <tr class="tot"><td>total</td><td></td><td>${humanMS(sum("duration_ms"))}</td><td>${comma(sum("delta_files"))}</td><td>${humanBytes(sum("delta_bytes"))}</td><td>—</td><td>${verifyCol(sum("verify_ok"), sum("verify_fail"))}</td><td class="${sum("errors") ? "cell-warn" : ""}">${comma(sum("errors"))}</td></tr>
-        </tbody></table></div>`;
+        </tbody></table></div>
+      ${journalSummarySection(r)}`;
+  }
+
+  // Record types in the same fixed display order as the CLI's `drsync
+  // journal cat --summary` (cli/drsync journalCats): nominal work (green),
+  // informational/dry-run/duplication notes (amber), failures (red).
+  const JOURNAL_TYPES = [
+    ["COPIED", "copied", "good"], ["META_FIXED", "meta fixed", "good"],
+    ["DELETED", "deleted", "good"], ["DIR_META", "dir meta", "good"],
+    ["SKIPPED_CLEAN", "skipped (clean)", "good"], ["VERIFY_OK", "verify ok", "good"],
+    ["WOULD_COPY", "would copy (dry-run)", "warn"], ["WOULD_DELETE", "would delete (dry-run)", "warn"],
+    ["NLINK_DUP", "hardlink duplicates", "warn"], ["ORPHAN", "orphans observed", "warn"],
+    ["SRC_CHANGED", "source changed mid-copy", "warn"],
+    ["ERROR", "errors", "crit"], ["FIDELITY_EXCEPTION", "fidelity exceptions", "crit"],
+    ["VERIFY_FAIL", "verify failed", "crit"],
+  ];
+  // journal_summary is the record-type histogram across every pass (the same
+  // data `drsync journal cat <name> --summary` and the completion email
+  // show) — this is journal-derived ground truth, distinct from the
+  // store-column deltas in the per-pass ledger above.
+  function journalSummarySection(r) {
+    const counts = r.journal_summary || {};
+    const total = +r.journal_summary_total || 0;
+    if (!total) return "";
+    const rows = JOURNAL_TYPES.filter(([k]) => +counts[k] > 0).map(([k, label, tone]) =>
+      `<tr><td class="l">${esc(label)}</td><td class="${tone === "crit" ? "cell-crit" : tone === "warn" ? "cell-warn" : "cell-good"}">${comma(counts[k])}</td></tr>`
+    ).join("");
+    // Forward-compat: an unrecognized type (older console vs newer coordinator)
+    // still counts toward the total and is shown, uncolored, rather than silently
+    // dropped from the sum the header displays.
+    const known = new Set(JOURNAL_TYPES.map(t => t[0]));
+    const extra = Object.keys(counts).filter(k => !known.has(k) && +counts[k] > 0)
+      .sort().map(k => `<tr><td class="l">${esc(k.toLowerCase())}</td><td>${comma(counts[k])}</td></tr>`).join("");
+    return `
+      <div class="sect-l">journal summary — all passes · ${comma(total)} record${total === 1 ? "" : "s"}</div>
+      <div class="tbl-wrap"><table class="pt" id="journal-summary">
+        <thead><tr><th class="l">type</th><th>count</th></tr></thead>
+        <tbody>${rows}${extra}</tbody></table></div>`;
   }
 
   const fleet = $("#fleet"), fleetHb = $("#fleet-hb");
