@@ -359,12 +359,25 @@ Per-job and fleet-aggregated, the load-bearing ones:
 ```
 drsync_scan_entries_total{job,agent}          drsync_copy_bytes_total{job,agent}
 drsync_copy_files_total{job,agent}            drsync_verify_fail_total{job}
-drsync_shard_queue_depth{job,state}           drsync_lease_expiries_total{agent}
+drsync_shard_queue_depth{job,state}           drsync_lease_expiries_total
 drsync_errors_total{job,class}                drsync_orphans_total{job}
 drsync_pass_delta_files{job,pass}             drsync_pass_delta_bytes{job,pass}
 drsync_mount_latency_seconds{agent,mount,op}  (histogram: stat/read/write/readdir)
 drsync_agent_up{agent}                        drsync_eta_seconds{job}
 ```
+
+`drsync_lease_expiries_total` is the fleet-wide aggregate (what the WebUI's
+"retry pressure" tile divides by `drsync_work_grants_total`). As of
+2026-07-30, `drsync_lease_expiries_by_agent_total{agent,kind,outcome}` breaks
+the same events out by which agent held the expired lease, the shard kind,
+and outcome (`requeued`|`parked`) — added because `lease_agent` (see "Leases"
+above) does not survive a shard's next grant, so without this the coordinator
+had no durable record of which agent a given expiry belonged to once the
+re-granted shard completed. Use it (or the matching per-shard `slog.Warn
+("lease expired", ...)` line the sweeper now emits, which additionally
+carries job/pass/shard-id/path) to tell "one flaky agent" from "fleet-wide"
+apart — see `passctrl` → `scheduler.RunSweeper` → `store.ExpireLeases`
+(`store.ExpiredLease`).
 
 `drsync_pass_delta_*` per pass is the **convergence curve** — the single most important
 migration-management signal (flattening curve = ready for cutover window planning).
