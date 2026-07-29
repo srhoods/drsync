@@ -433,6 +433,7 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassComplete); err != nil {
 			return err
 		}
+		c.recordJournalTypeCounts(job, pass)
 		c.reapPhase(job, pass, model.KindVerify)
 		jobDone, converged, err := c.decideNextPass(job, pass)
 		if err != nil {
@@ -449,6 +450,7 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassComplete); err != nil {
 			return err
 		}
+		c.recordJournalTypeCounts(job, pass)
 		c.reapPhase(job, pass, model.KindDelete)
 		// A delete pass never auto-seeds another pass: back to COMPLETED,
 		// further passes are explicit operator triggers.
@@ -761,6 +763,27 @@ func (c *Controller) notifyPassComplete(job *store.Job, pass *store.Pass, isDele
 	})
 }
 
+// recordJournalTypeCounts computes and persists the per-type journal
+// histogram for a pass that has just reached COMPLETE. This is the one point
+// in the pass lifecycle where a full scan of that pass's journal is safe to
+// do inline: every record for the pass is already durably written (that is
+// what COMPLETE means), and it happens once per pass rather than once per
+// /report request — the store rollup (store.JournalTypeCounts) is what keeps
+// the read side (WebUI job selection, the completion email) off the journal
+// files entirely. Best-effort: a scan failure here must not block the phase
+// transition that already committed; the summary is just missing until the
+// next pass (if any) recomputes it.
+func (c *Controller) recordJournalTypeCounts(job *store.Job, pass *store.Pass) {
+	counts, _, err := journal.Summary(c.journalRoot, job.ID, []int{pass.PassNo})
+	if err != nil {
+		slog.Warn("journal summary: scan failed", "job", job.Name, "pass", pass.PassNo, "err", err)
+		return
+	}
+	if err := c.st.SetJournalTypeCounts(pass.ID, counts); err != nil {
+		slog.Warn("journal summary: persist failed", "job", job.Name, "pass", pass.PassNo, "err", err)
+	}
+}
+
 // notifyJobComplete emails the end-of-job summary when the spec opts in.
 func (c *Controller) notifyJobComplete(job *store.Job) {
 	if c.notifier == nil {
@@ -826,6 +849,19 @@ func (c *Controller) buildJobReport(job *store.Job) (notify.JobReport, error) {
 		return notify.JobReport{}, err
 	}
 	rep.ParkedShards = len(parked)
+
+	// From the SQLite rollup (store.JournalTypeCounts), not a journal scan:
+	// recordJournalTypeCounts already computed this once when each pass
+	// completed, so buildJobReport — called synchronously from the pass-complete
+	// path itself — never re-reads the journal files it just finished with.
+	summary, _, err := c.st.JournalTypeCounts(job.ID)
+	if err != nil {
+		// A nice-to-have breakdown on top of the store-backed totals above; a
+		// read error here should not sink the whole completion email.
+		slog.Warn("notify: journal type counts failed", "job", job.Name, "err", err)
+	} else {
+		rep.JournalSummary = summary
+	}
 	return rep, nil
 }
 

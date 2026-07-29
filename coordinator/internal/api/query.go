@@ -285,7 +285,21 @@ func (s *Server) getJournal(w http.ResponseWriter, r *http.Request) {
 
 	// Summary mode: count matching records by type across every requested pass
 	// (no paging), returning the histogram instead of the records themselves.
+	// A plain (untyped/unpathed) request is served by journal.Summary directly
+	// — the same aggregation the completion email and WebUI summary panel use
+	// — since it doesn't need scanJournal's per-record match/emit plumbing.
 	if r.URL.Query().Get("summary") == "true" {
+		if typeFilter == "" && pathPrefix == "" {
+			byType, total, err := journal.Summary(s.journalRoot, job.ID, passes)
+			if err != nil {
+				httpErr(w, http.StatusInternalServerError, "read journal: %v", err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"job": job.Name, "summary": byType, "total": total,
+			})
+			return
+		}
 		byType := map[string]int64{}
 		var total int64
 		_, err := s.scanJournal(job, passes, scanAll, 0, match,
@@ -389,6 +403,18 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// From the SQLite rollup (store.JournalTypeCounts), not a journal scan: the
+	// report is fetched on every WebUI job selection, and journal files can run
+	// to gigabytes of zstd-compressed segments for a long migration — reading
+	// and decompressing them on every click is the request-latency regression
+	// this rollup exists to avoid. passctrl.recordJournalTypeCounts computes
+	// this once, in the background, when each pass completes.
+	journalSummary, journalTotal, err := s.st.JournalTypeCounts(job.ID)
+	if err != nil {
+		httpErr(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+
 	converged := job.State == model.JobCompleted
 	writeJSON(w, http.StatusOK, map[string]any{
 		"job": job.Name, "state": job.State, "dry_run": job.DryRun,
@@ -400,11 +426,13 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 			"fidelity_exceptions": totals.FidelityExc,
 			"verify_ok":           totals.VerifyOK, "verify_fail": totals.VerifyFail,
 		},
-		"converged":          converged,
-		"orphans_remaining":  orphans,
-		"delete_pass_ran":    deletePd,
-		"parked_shards":      parkedHere,
-		"parked_shard_count": len(parkedHere),
+		"converged":             converged,
+		"orphans_remaining":     orphans,
+		"delete_pass_ran":       deletePd,
+		"parked_shards":         parkedHere,
+		"parked_shard_count":    len(parkedHere),
+		"journal_summary":       journalSummary,
+		"journal_summary_total": journalTotal,
 	})
 }
 

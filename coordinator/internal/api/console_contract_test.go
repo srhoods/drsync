@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -176,6 +177,107 @@ func TestReportParkedCarriesParkTime(t *testing.T) {
 	}
 	if got.ParkedShards[0].ParkedAtMs < before {
 		t.Errorf("parked_at_ms = %d, want >= %d", got.ParkedShards[0].ParkedAtMs, before)
+	}
+}
+
+// The report's journal_summary is the per-type histogram across every pass
+// (the same figures `drsync journal cat --summary` and the completion email
+// show), and the WebUI's journal-summary panel binds to these exact field
+// names — pin the shape so a rename shows up here instead of as a blank panel.
+// journal_summary comes from the store.JournalTypeCounts rollup, not a live
+// journal read — passctrl.recordJournalTypeCounts is what populates it, once,
+// when a pass completes (that's what the WebUI-navigation slowdown fix
+// depends on: /report must never touch journal files on the request path).
+// So this seeds the rollup the same way that code path would, rather than
+// writing journal segments getReport would have to scan.
+func TestReportCarriesJournalSummary(t *testing.T) {
+	srv := consoleSrv(t)
+	job, err := srv.st.CreateJob("jsum", []byte(specFor("jsum", "/src/j", "/dst/j")), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, err := srv.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.st.SetJournalTypeCounts(p1.ID, map[string]int64{"COPIED": 2, "ORPHAN": 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got struct {
+		JournalSummary      map[string]int64 `json:"journal_summary"`
+		JournalSummaryTotal int64            `json:"journal_summary_total"`
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/jsum/report", nil)
+	r.SetPathValue("name", "jsum")
+	srv.getReport(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report: status %d: %s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.JournalSummary["COPIED"] != 2 || got.JournalSummary["ORPHAN"] != 1 {
+		t.Errorf("journal_summary = %+v, want COPIED:2 ORPHAN:1", got.JournalSummary)
+	}
+	if got.JournalSummaryTotal != 3 {
+		t.Errorf("journal_summary_total = %d, want 3", got.JournalSummaryTotal)
+	}
+}
+
+// This is the regression the store-backed rollup exists to prevent: /report is
+// fetched on every WebUI job selection, so if it ever falls back to scanning
+// journal segments it reintroduces a per-click cost proportional to the whole
+// job's journal (gigabytes of zstd-compressed records on a long migration).
+// Point journalRoot at a path holding a segment file getJournal would error on
+// if it tried to read it (garbage, not valid zstd/proto) — /report must still
+// succeed, using only the SQLite rollup, and never touch that file.
+func TestReportNeverReadsJournalFiles(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	journalRoot := filepath.Join(dir, "journals")
+	srv := New(st, nil, metrics.New(), nil, journalRoot, "")
+
+	job, err := srv.st.CreateJob("noscan", []byte(specFor("noscan", "/src/n", "/dst/n")), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pass, err := srv.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.st.SetJournalTypeCounts(pass.ID, map[string]int64{"COPIED": 9}); err != nil {
+		t.Fatal(err)
+	}
+
+	segDir := filepath.Join(journalRoot, "1", "pass-1")
+	if err := os.MkdirAll(segDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(segDir, "segment-000000.drj"), []byte("not valid zstd/proto"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	var got struct {
+		JournalSummary map[string]int64 `json:"journal_summary"`
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/noscan/report", nil)
+	r.SetPathValue("name", "noscan")
+	srv.getReport(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report: status %d: %s (a journal-scan fallback would fail on the garbage segment)", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.JournalSummary["COPIED"] != 9 {
+		t.Errorf("journal_summary = %+v, want the rollup's COPIED:9 (not derived from the garbage segment)", got.JournalSummary)
 	}
 }
 

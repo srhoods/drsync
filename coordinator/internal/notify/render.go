@@ -65,6 +65,11 @@ type JobReport struct {
 	OrphansRemaining int64
 	DeletePassRan    bool
 	ParkedShards     int
+	// JournalSummary is the per-type record histogram across every pass of the
+	// job (the same aggregation as `drsync journal cat <name> --summary`),
+	// keyed by record type with the "JR_" prefix stripped (e.g. "COPIED",
+	// "DELETED", "WOULD_COPY"). Nil/empty is valid — a job with no journal yet.
+	JournalSummary map[string]int64
 }
 
 // ParkedShardRow is one shard sidelined at its attempt ceiling, as listed in
@@ -190,10 +195,74 @@ func renderJob(r JobReport) (subject, htmlBody, textBody string) {
 		note = "The job stopped without reaching a zero-delta fixpoint (pass ceiling reached)."
 	}
 
+	extra := passTrajectoryHTML(r.Passes) + journalSummaryHTML(r.JournalSummary)
 	htmlBody = htmlDoc(r.Job, r.Src, r.Dst, "Migration complete", statusText, statusColor, r.DryRun, note,
-		metricsTable(rows), passTrajectoryHTML(r.Passes))
-	textBody = textDoc(r.Job, r.Src, r.Dst, "Migration complete", statusText, r.DryRun, note, rows, r.Passes)
+		metricsTable(rows), extra)
+	textBody = textDoc(r.Job, r.Src, r.Dst, "Migration complete", statusText, r.DryRun, note, rows, r.Passes) +
+		journalSummaryText(r.JournalSummary)
 	return
+}
+
+// journalTypes lists journal record types in display order with their
+// category (mirrors the CLI's `drsync journal cat --summary`, cli/drsync
+// journalCats): nominal work, informational/dry-run/duplication notes, and
+// failures. Kept as a plain ordered list (not shared code) since notify must
+// not depend on the cli package.
+var journalTypes = []struct{ key, label string }{
+	{"COPIED", "copied"},
+	{"META_FIXED", "meta fixed"},
+	{"DELETED", "deleted"},
+	{"DIR_META", "dir meta"},
+	{"SKIPPED_CLEAN", "skipped (clean)"},
+	{"VERIFY_OK", "verify ok"},
+	{"WOULD_COPY", "would copy (dry-run)"},
+	{"WOULD_DELETE", "would delete (dry-run)"},
+	{"NLINK_DUP", "hardlink duplicates"},
+	{"ORPHAN", "orphans observed"},
+	{"SRC_CHANGED", "source changed mid-copy"},
+	{"ERROR", "errors"},
+	{"FIDELITY_EXCEPTION", "fidelity exceptions"},
+	{"VERIFY_FAIL", "verify failed"},
+}
+
+func journalSummaryRows(counts map[string]int64) [][2]string {
+	var rows [][2]string
+	for _, t := range journalTypes {
+		if c, ok := counts[t.key]; ok && c > 0 {
+			rows = append(rows, [2]string{t.label, commas(c)})
+		}
+	}
+	return rows
+}
+
+func journalSummaryHTML(counts map[string]int64) string {
+	rows := journalSummaryRows(counts)
+	if len(rows) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, `<div style="font-size:13px;font-weight:600;color:%s;padding:10px 0 8px 0;">Journal summary (all passes)</div>`, colInk)
+	b.WriteString(metricsTable(rows))
+	return b.String()
+}
+
+func journalSummaryText(counts map[string]int64) string {
+	rows := journalSummaryRows(counts)
+	if len(rows) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nJournal summary (all passes):\n")
+	width := 0
+	for _, r := range rows {
+		if len(r[0]) > width {
+			width = len(r[0])
+		}
+	}
+	for _, r := range rows {
+		fmt.Fprintf(&b, "  %-*s  %s\n", width, r[0], r[1])
+	}
+	return b.String()
 }
 
 func jobStatus(r JobReport) (string, string) {

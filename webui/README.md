@@ -124,7 +124,7 @@ are written to be read by an operator.
 | Panel | Source |
 |-------|--------|
 | Jobs list, state, per-row pass rollup | `GET /api/v1/jobs` (one request for all rows) |
-| Job detail, convergence, pass ledger, `orphans_remaining` | `GET /api/v1/jobs/{name}/report` (selected job only) |
+| Job detail, convergence, pass ledger, `orphans_remaining`, journal summary | `GET /api/v1/jobs/{name}/report` (selected job only) |
 | Job settings dialog (view / resubmit prefill) | `GET /api/v1/jobs/{name}/spec` — the stored raw YAML, verbatim |
 | Live per-pass counters between polls | `GET /api/v1/events` (WebSocket, 1 Hz `stats` frames) |
 | Throughput / files·s⁻¹ / scan rate, agent RSS | `GET /metrics` — `rate()` over `drsync_scan_entries_total`, `drsync_copy_files_total`, `drsync_copy_bytes_total`, plus `drsync_agent_rss_bytes`, `drsync_agent_up` |

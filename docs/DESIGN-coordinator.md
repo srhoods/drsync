@@ -291,7 +291,14 @@ Append-only, per (job, pass), the system of record for per-file outcomes:
 - Every record: rel_path, record type, src/dst stat essentials, timestamps, agent id,
   and type-specific payload (e.g. checksum, errno, ACL blob that failed translation).
 - Consumers: `DIRFIX`/`VERIFY`/`DELETE` task generation, `drsync journal cat`,
-  `drsync report`, the WebUI error browser, and the final migration audit report.
+  the WebUI error browser, and — once, per pass, at the moment it reaches
+  COMPLETE — `passctrl.recordJournalTypeCounts`, which persists the per-type
+  histogram into `journal_type_counts` (store.go). `drsync report`, the
+  WebUI's job detail panel, and the completion email all read that SQLite
+  rollup (`store.JournalTypeCounts`), never the journal files directly: those
+  are on a request/click path, and a live per-type scan there would cost
+  proportional to the whole job's journal (potentially gigabytes of
+  zstd-compressed segments) on every fetch.
 - Retention: journals are the audit trail — kept until job deletion; segments are
   immutable and rsync-able for archival.
 - **Durability / ack gating:** an incoming `JournalBatch` is written, but the

@@ -66,6 +66,11 @@ export const REPORT = {
   ],
   totals: { files_copied: 912000, bytes_copied: 8.04e11, meta_fixed: 30,
             errors: 3, fidelity_exceptions: 1, verify_ok: 910000, verify_fail: 4 },
+  // A DIR_META count of 0 is included deliberately: the panel must omit
+  // zero-count types rather than rendering them as a row of "0".
+  journal_summary: { COPIED: 912000, META_FIXED: 30, ORPHAN: 17, ERROR: 3,
+                     VERIFY_FAIL: 4, DIR_META: 0 },
+  journal_summary_total: 912054,
 };
 
 export const ERRORS = {
