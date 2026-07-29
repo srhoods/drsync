@@ -168,6 +168,75 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	_ = passID
 }
 
+// JournalTypeCounts sums per-type across every pass of a job, from the rollup
+// SetJournalTypeCounts writes — the whole point being that /report (and the
+// completion email) read this instead of scanning journal files on every
+// request. This pins: cross-pass summing, and that a second SetJournalTypeCounts
+// call for the same pass replaces rather than adds (the source is always a full
+// recount of that pass's journal, never a delta).
+func TestJournalTypeCountsSumsAcrossPassesAndReplaces(t *testing.T) {
+	s := openTest(t)
+	jobID, pass1ID, _ := seed(t, s)
+	pass2, err := s.CreatePass(jobID, 2, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetJournalTypeCounts(pass1ID, map[string]int64{"COPIED": 5, "ORPHAN": 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetJournalTypeCounts(pass2.ID, map[string]int64{"COPIED": 3, "ERROR": 1}); err != nil {
+		t.Fatal(err)
+	}
+	got, total, err := s.JournalTypeCounts(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int64{"COPIED": 8, "ORPHAN": 2, "ERROR": 1}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("[%q] = %d, want %d (full: %+v)", k, got[k], v, got)
+		}
+	}
+	if total != 11 { // COPIED 8 + ORPHAN 2 + ERROR 1
+		t.Errorf("total = %d, want 11", total)
+	}
+
+	// Re-set pass 1 (as if its journal were rescanned): the new counts must
+	// replace, not add to, the old ones.
+	if err := s.SetJournalTypeCounts(pass1ID, map[string]int64{"COPIED": 5, "ORPHAN": 2, "ERROR": 4}); err != nil {
+		t.Fatal(err)
+	}
+	got, total, err = s.JournalTypeCounts(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["ERROR"] != 5 { // 4 (re-set pass 1) + 1 (pass 2, untouched)
+		t.Errorf("ERROR after re-set = %d, want 5 (full: %+v)", got["ERROR"], got)
+	}
+	if total != 15 { // pass 1 COPIED 5 + ORPHAN 2 + ERROR 4, plus pass 2 COPIED 3 + ERROR 1
+		t.Errorf("total after re-set = %d, want 15 (full: %+v)", total, got)
+	}
+}
+
+// A zero count for a type must not be written as a row (so it doesn't show up
+// as a spurious zero-count line in a caller that lists map keys) — mirrors the
+// omission behavior the WebUI/email rendering already relies on.
+func TestJournalTypeCountsOmitsZeroCounts(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, _ := seed(t, s)
+	if err := s.SetJournalTypeCounts(passID, map[string]int64{"COPIED": 5, "DIR_META": 0}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.JournalTypeCounts(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["DIR_META"]; ok {
+		t.Errorf("expected DIR_META omitted (zero count), got %+v", got)
+	}
+}
+
 // TestReapDoneShards checks the core Shard Reaper contract: only DONE shards
 // of the requested kinds are deleted, everything else (other kinds, other
 // states, other passes) is untouched, and the shard_counts rollup stays exact

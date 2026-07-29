@@ -516,6 +516,11 @@ func baseSpec2(name string) []byte {
 // pass of the job — the same figures `drsync journal cat <name> --summary`
 // reports — not just the store-column totals already covered by the rest of
 // the report.
+// buildJobReport's JournalSummary comes from the store.JournalTypeCounts
+// rollup, not a live journal scan — recordJournalTypeCounts is what populates
+// that rollup (tested separately below), so this seeds it directly the same
+// way that code path would have, and checks buildJobReport reads it back
+// correctly summed across passes.
 func TestBuildJobReportJournalSummary(t *testing.T) {
 	c := newController(t)
 	job := makeJob(t, c, []byte(baseSpec))
@@ -527,14 +532,12 @@ func TestBuildJobReportJournalSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeMixedJournal(t, c.journalRoot, job.ID, p1.PassNo, map[drsyncpb.JournalRecord_Type]int{
-		drsyncpb.JournalRecord_JR_COPIED: 5,
-		drsyncpb.JournalRecord_JR_ORPHAN: 2,
-	})
-	writeMixedJournal(t, c.journalRoot, job.ID, p2.PassNo, map[drsyncpb.JournalRecord_Type]int{
-		drsyncpb.JournalRecord_JR_COPIED: 3,
-		drsyncpb.JournalRecord_JR_ERROR:  1,
-	})
+	if err := c.st.SetJournalTypeCounts(p1.ID, map[string]int64{"COPIED": 5, "ORPHAN": 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.st.SetJournalTypeCounts(p2.ID, map[string]int64{"COPIED": 3, "ERROR": 1}); err != nil {
+		t.Fatal(err)
+	}
 
 	rep, err := c.buildJobReport(job)
 	if err != nil {
@@ -551,9 +554,9 @@ func TestBuildJobReportJournalSummary(t *testing.T) {
 	}
 }
 
-// A job with no journal on disk yet (e.g. cancelled before any pass wrote
-// records) must not fail the whole report — JournalSummary just comes back
-// empty.
+// A pass whose journal-type-counts rollup was never written (e.g. a pass that
+// never reached COMPLETE) must not fail the whole report — JournalSummary
+// just comes back empty.
 func TestBuildJobReportNoJournalIsEmptySummary(t *testing.T) {
 	c := newController(t)
 	job := makeJob(t, c, []byte(baseSpec))
@@ -565,6 +568,56 @@ func TestBuildJobReportNoJournalIsEmptySummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rep.JournalSummary) != 0 {
-		t.Errorf("expected empty JournalSummary for a pass with no journal records, got %+v", rep.JournalSummary)
+		t.Errorf("expected empty JournalSummary for a pass with no rollup written, got %+v", rep.JournalSummary)
+	}
+}
+
+// recordJournalTypeCounts is what actually scans the journal — once, when a
+// pass reaches COMPLETE — and persists the histogram store.JournalTypeCounts
+// later reads. This is the one place a real writeMixedJournal fixture belongs
+// now: everything downstream (buildJobReport, /report) reads the rollup, not
+// the journal.
+func TestRecordJournalTypeCountsPersistsRollup(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMixedJournal(t, c.journalRoot, job.ID, pass.PassNo, map[drsyncpb.JournalRecord_Type]int{
+		drsyncpb.JournalRecord_JR_COPIED: 5,
+		drsyncpb.JournalRecord_JR_ORPHAN: 2,
+	})
+
+	c.recordJournalTypeCounts(job, pass)
+
+	got, total, err := c.st.JournalTypeCounts(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["COPIED"] != 5 || got["ORPHAN"] != 2 || total != 7 {
+		t.Errorf("JournalTypeCounts = %+v (total %d), want COPIED:5 ORPHAN:2 (total 7)", got, total)
+	}
+}
+
+// A scan failure (e.g. a segment read error) must not propagate — the phase
+// transition that already committed (SetPassState) must not be undone or
+// blocked by a best-effort summary failing to compute.
+func TestRecordJournalTypeCountsToleratesMissingJournal(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No writeMixedJournal call: this pass's journal directory never existed.
+	c.recordJournalTypeCounts(job, pass) // must not panic
+
+	got, total, err := c.st.JournalTypeCounts(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || total != 0 {
+		t.Errorf("JournalTypeCounts = %+v (total %d), want empty", got, total)
 	}
 }

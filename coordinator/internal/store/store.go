@@ -186,6 +186,21 @@ CREATE TABLE IF NOT EXISTS chunk_groups (
   state     TEXT NOT NULL DEFAULT 'copying',  -- copying | done | aborted
   PRIMARY KEY (pass_id, rel_path)
 ) WITHOUT ROWID;
+
+-- journal_type_counts is the per-(pass, journal record type) histogram —
+-- what "drsync journal cat --summary" reports — computed once by
+-- SetJournalTypeCounts when a pass reaches COMPLETE (passctrl.advancePhase)
+-- and read thereafter by /report and the completion email. Written once per
+-- pass rather than incrementally: unlike shard_counts, nothing needs this
+-- number *during* a pass, only after, so there is no hot path to keep exact
+-- with triggers — a single INSERT after the one full journal scan a
+-- completed pass ever needs is simpler and just as correct.
+CREATE TABLE IF NOT EXISTS journal_type_counts (
+  pass_id INTEGER NOT NULL,
+  type    TEXT NOT NULL,
+  n       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (pass_id, type)
+) WITHOUT ROWID;
 `
 
 func Open(path string) (*Store, error) {
@@ -707,6 +722,64 @@ func (s *Store) AccumulatePassCounters(passID int64, c *drsyncpb.ShardCounters) 
 		c.Orphans, c.Errors, c.NlinkDupFiles, c.NlinkDupBytes,
 		c.FidelityExceptions, c.VerifyOk, c.VerifyFail, passID)
 	return err
+}
+
+// SetJournalTypeCounts persists the per-type journal record histogram for one
+// pass, computed once (by the caller, from a single full scan of that pass's
+// journal — see journal.Summary) at the point the pass reaches COMPLETE. A
+// second call for the same pass_id (there should not be one — a pass
+// completes exactly once) replaces rather than adds, since the source is a
+// full recount, not a delta.
+func (s *Store) SetJournalTypeCounts(passID int64, counts map[string]int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM journal_type_counts WHERE pass_id = ?`, passID); err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO journal_type_counts (pass_id, type, n) VALUES (?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for typ, n := range counts {
+		if n == 0 {
+			continue
+		}
+		if _, err := stmt.Exec(passID, typ, n); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// JournalTypeCounts sums the per-type journal histogram across every pass of
+// a job — the same aggregation `drsync journal cat <name> --summary` reports
+// — from the SQLite rollup rather than reading journal files, so callers on
+// the request path (the /report endpoint) never pay for a journal scan.
+func (s *Store) JournalTypeCounts(jobID int64) (byType map[string]int64, total int64, err error) {
+	rows, err := s.rdb.Query(`SELECT jtc.type, SUM(jtc.n)
+		FROM journal_type_counts jtc JOIN passes p ON p.id = jtc.pass_id
+		WHERE p.job_id = ? GROUP BY jtc.type`, jobID)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	byType = map[string]int64{}
+	for rows.Next() {
+		var typ string
+		var n int64
+		if err := rows.Scan(&typ, &n); err != nil {
+			return nil, 0, err
+		}
+		byType[typ] = n
+		total += n
+	}
+	return byType, total, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

@@ -193,8 +193,10 @@ with `-smtp-config`); the spec only names recipients and which events fire:
   summary — the per-type record histogram across every pass (the same figures `drsync journal
   cat <name> --summary` reports: `copied`, `orphans observed`, `errors`, …), so the email is a
   self-contained record of the migration without a follow-up CLI call. The same figures are
-  available in the WebUI's job detail panel (journal summary section) for as long as the
-  journal is retained.
+  available in the WebUI's job detail panel (journal summary section). Both read a per-pass
+  histogram computed once, when the pass completes, and persisted to SQLite
+  (`journal_type_counts`) rather than re-scanning the journal on every request — see
+  DESIGN-coordinator.md §5.
 
 **Parked-shard alerts are independent of both flags above** — sent to `recipients`
 regardless of `on_pass_complete`/`on_job_complete` (but still only when `recipients` is

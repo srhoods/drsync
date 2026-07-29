@@ -403,13 +403,15 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	passNos := make([]int, len(passes))
-	for i, p := range passes {
-		passNos[i] = p.PassNo
-	}
-	journalSummary, journalTotal, err := journal.Summary(s.journalRoot, job.ID, passNos)
+	// From the SQLite rollup (store.JournalTypeCounts), not a journal scan: the
+	// report is fetched on every WebUI job selection, and journal files can run
+	// to gigabytes of zstd-compressed segments for a long migration — reading
+	// and decompressing them on every click is the request-latency regression
+	// this rollup exists to avoid. passctrl.recordJournalTypeCounts computes
+	// this once, in the background, when each pass completes.
+	journalSummary, journalTotal, err := s.st.JournalTypeCounts(job.ID)
 	if err != nil {
-		httpErr(w, http.StatusInternalServerError, "read journal: %v", err)
+		httpErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 
