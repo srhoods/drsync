@@ -183,7 +183,7 @@ static int ring_statx(struct ring *r, struct statx_req *reqs,
             sqe->fd = reqs[done + k].dirfd;
             sqe->addr = (uint64_t)(uintptr_t)reqs[done + k].name;
             sqe->len = STATX_BASIC_STATS;
-            sqe->statx_flags = AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC;
+            sqe->statx_flags = AT_SYMLINK_NOFOLLOW | AT_STATX_SYNC_AS_STAT;
             sqe->off = (uint64_t)(uintptr_t)&bufs[k];
             sqe->user_data = k;
             r->sq_array[idx] = idx;
