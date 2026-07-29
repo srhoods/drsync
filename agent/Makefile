@@ -2,11 +2,11 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wshadow -D_GNU_SOURCE -Ivendor
 LDFLAGS ?= -pthread -lzstd -lssl -lcrypto
 
-SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/tempname.c src/walker.c src/main.c
+SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/poolsize.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/tempname.c src/walker.c src/main.c
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -62,5 +62,14 @@ bin/tempname_test: src/tempname.c test/tempname_test.c
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ src/tempname.c test/tempname_test.c
 
+# Copy-pool reserve sizing under work-stealing: the throughput fix for the
+# lease-requeue-under-stealing bug (see poolsize.c).
+poolsize-test: bin/poolsize_test
+	./bin/poolsize_test
+
+bin/poolsize_test: src/poolsize.c test/poolsize_test.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ src/poolsize.c test/poolsize_test.c
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test

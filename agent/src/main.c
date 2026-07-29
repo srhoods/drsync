@@ -556,10 +556,7 @@ int main(int argc, char **argv)
         LOGE("outbox init failed");
         return 1;
     }
-    /* Reserve one copy thread as a pure drainer when stealing is on (and there
-     * are >= 2), so shard-stealing copy threads can never starve their own
-     * copies. Stealing off (or a lone copy thread) => all pure drainers. */
-    int cp_reserve = (g_steal_enabled && cfg.copy_threads >= 2) ? 1 : cfg.copy_threads;
+    int cp_reserve = cp_reserve_for(cfg.copy_threads, g_steal_enabled);
     if (cp_init(cfg.copy_threads, cfg.copy_threads * 8, cp_reserve) < 0) {
         LOGE("copy pool init failed");
         return 1;

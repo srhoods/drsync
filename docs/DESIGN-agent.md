@@ -302,6 +302,39 @@ Per copy task (one file, or one chunk of a large file):
   saturates ~12 GB/s combined read+write for large files; small-file regimes are
   IOPS/latency-bound and scale with copy-thread count and NFS slot tables instead.
 
+### 3.1 Cross-pool work-stealing
+
+The fixed `-w`/`-C` split is a starting allocation, not a ceiling: an idle walker
+drains the copy backlog, and — when a job's mostly-metadata convergence pass leaves
+the copy queue empty — an idle copy thread steals a queued walk shard and crawls it
+(`g_steal_enabled`, default on; `-S` pins the pools to their fixed sizes instead).
+Mechanically: non-blocking `wq_trypop`/`cq_trypop` plus short-timeout waits so an
+idle thread rechecks the other pool's queue, a shared `process_item()` dispatch
+runnable from either pool, and a shard-prefetch credit sized to the *whole* pool
+(`(workers + copy_threads) * 2`, not just `workers`) so the extra crawl capacity has
+shards to pull.
+
+**Copy-pool reserve.** A stolen walk shard that fans out into files re-enters the
+copy engine (§3) from whichever thread stole it — a copy-pool thread producing into
+its own pool's queue via `cp_submit`, which blocks that thread on a full queue
+(`agent/src/poolsize.c` `cp_reserve_for`). Some number of copy threads must therefore
+stay pure drainers (never steal), or the pool can starve itself of the throughput
+needed to drain what its own stealing thread just queued. The original sizing
+(`cp_init`'s introducing commit) reserved a flat 1 thread — enough to guarantee
+liveness (the drain side always makes *some* progress, so the pool cannot deadlock)
+but not enough to guarantee *throughput*: with the default 8 copy threads, 7 could
+simultaneously become stealing producers against a single drainer. Under real fleet
+contention this let a stolen shard's `dpend_wait` (waiting on its own submitted
+copies) stall long enough to blow past the coordinator's lease TTL — the shard would
+expire, requeue, and then complete almost instantly once contention eased, since the
+underlying work was small or already done. Confirmed by fleet A/B testing: `-S`
+(stealing off, every copy thread a pure drainer) held the lease-requeue rate at 0%;
+re-enabling stealing with the flat reserve reproduced it immediately. The reserve now
+scales at 25% of `copy_threads` (floored at 1, so the deadlock-freedom guarantee is
+never lost) — matching the codebase's existing 25/75 walker/copy design ratio
+(`ansible/roles/drsync_agent`) — so the drain side keeps real throughput at any pool
+size instead of degrading to one thread as the pool grows.
+
 ## 4. Special Entry Types
 
 | Type | Handling |

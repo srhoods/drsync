@@ -277,6 +277,10 @@ bool xattr_equal_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *na
  * A reserve >= 1 guarantees a drainer always exists, so walkers blocked in
  * dpend_wait on their copies can never deadlock the pool. */
 int  cp_init(int threads, int queue_cap, int reserve);
+/* Picks that reserve count for a pool of copy_threads under stealing policy
+ * steal_enabled — see the definition in poolsize.c for the throughput
+ * rationale (not just deadlock-freedom) behind the 25% figure. */
+int  cp_reserve_for(int copy_threads, bool steal_enabled);
 void cp_shutdown(void);
 int  cp_depth(void);
 /* Executes one queued copy task if one is available (non-blocking). Returns
