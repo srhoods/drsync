@@ -604,6 +604,59 @@ static void queue_bigfile(struct walk_ctx *ctx, const char *dir_rel,
         flush_bigfiles(ctx);
 }
 
+/* ---- hardlink-sighting queue (docs/DESIGN-hardlinks.md §3.1) ---- */
+/* Same batch size as big files: an nlink>1 sighting is a handful of scalars
+ * plus a path, so a batch is small next to one round trip's worth of value. */
+#define LINKSIGHTING_BATCH 256
+
+static void flush_linksightings(struct walk_ctx *ctx)
+{
+    if (!ctx->n_linksightings)
+        return;
+    pb_buf b;
+    pb_init(&b);
+    enc_linksighting_split(&b, ctx->it->shard_id, ctx->split_seq,
+                           ctx->linksightings, ctx->n_linksightings);
+    ship_split(ctx, &b);
+    for (size_t i = 0; i < ctx->n_linksightings; i++)
+        free(ctx->linksightings[i].rel);
+    ctx->n_linksightings = 0;
+}
+
+/* Reports an nlink>1 file's (dev,ino) group for coordinator correlation
+ * (docs/DESIGN-hardlinks.md). Sent unconditionally alongside the existing
+ * NLINK_DUP journal emit — whether the coordinator acts on it depends on the
+ * job's metadata.hardlinks spec option, which the agent never sees. */
+static void queue_linksighting(struct walk_ctx *ctx, const char *dir_rel,
+                               const char *name, const struct estat *ss)
+{
+    if (ctx->n_linksightings == ctx->cap_linksightings) {
+        size_t cap = ctx->cap_linksightings ? ctx->cap_linksightings * 2 : 64;
+        struct linksighting *nv = realloc(ctx->linksightings, cap * sizeof *nv);
+        if (!nv) {
+            CTR_ADD(ctx->c.errors, 1);
+            return;
+        }
+        ctx->linksightings = nv;
+        ctx->cap_linksightings = cap;
+    }
+    char *rel;
+    if (asprintf(&rel, "%s%s%s", dir_rel, dir_rel[0] ? "/" : "", name) < 0) {
+        CTR_ADD(ctx->c.errors, 1);
+        return;
+    }
+    struct linksighting *ls = &ctx->linksightings[ctx->n_linksightings];
+    ls->dev = ss->dev;
+    ls->ino = ss->ino;
+    ls->rel = rel;
+    ls->nlink = ss->nlink;
+    ls->size = ss->size;
+    ls->mtime_ns = (int64_t)ss->mtim.tv_sec * 1000000000 + ss->mtim.tv_nsec;
+    ctx->n_linksightings++;
+    if (ctx->n_linksightings >= LINKSIGHTING_BATCH)
+        flush_linksightings(ctx);
+}
+
 /* A regular file big enough to copy across the fleet rather than on this agent:
  * at/above chunk_threshold AND larger than one chunk, so it yields ≥2 ranges. */
 static bool should_chunk(const struct job_options *o, uint64_t size)
@@ -715,6 +768,7 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
             char nrel[PATH_MAX];
             snprintf(nrel, sizeof nrel, "%s%s%s", rel, rel[0] ? "/" : "", name);
             jrn_emit(ctx, JR_NLINK_DUP, nrel, ss, NULL, 0, NULL);
+            queue_linksighting(ctx, rel, name, ss);
         }
         bool need = !type_match || ds->size != ss->size ||
                     !times_equal(ctx, &ss->mtim, &ds->mtim);
@@ -1021,6 +1075,7 @@ void process_shard(const struct shard_item *it)
         walk_dir(&ctx, it->rel_path, 0);
         flush_splits(&ctx);
         flush_bigfiles(&ctx);
+        flush_linksightings(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
         jrn_flush(&ctx);
         if (!jrn_wait_acked(&ctx)) { /* same ordering invariant for journals */
@@ -1147,6 +1202,7 @@ void process_entrylist(const struct shard_item *it)
         entrylist_walk(&ctx, it->rel_path ? it->rel_path : "", it->paths, it->n_paths);
         flush_splits(&ctx);
         flush_bigfiles(&ctx);
+        flush_linksightings(&ctx);
         drain_splits(&ctx); /* all splits acked before the result (protocol §4.2) */
         jrn_flush(&ctx);
         if (!jrn_wait_acked(&ctx)) {
