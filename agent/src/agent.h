@@ -69,6 +69,13 @@ struct outmsg {
 void out_push(uint16_t type, pb_buf *b);
 struct outmsg *out_drain(void);
 int  outbox_init(void);
+/* Single-slot priority mailbox (heartbeat only): out_push_priority replaces
+ * any not-yet-sent previous message rather than queuing alongside it, and
+ * out_take_priority is checked by the writer thread before the bulk FIFO
+ * above on every wakeup, so a heartbeat can never wait behind a burst of
+ * queued shard results/journal batches. See the rationale in state.c. */
+void out_push_priority(uint16_t type, pb_buf *b);
+struct outmsg *out_take_priority(void);
 
 /* ---- held leases (heartbeat renewal + in-flight reporting) ----
  * Registry slots are index-stable for the life of a lease (freed in place, never

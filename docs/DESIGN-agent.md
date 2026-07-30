@@ -339,12 +339,20 @@ size instead of degrading to one thread as the pool grows.
 
 ### 3.2 Writer thread — outbound frames off the heartbeat path
 
-**Root cause of the lease-requeue bug** (§6's `RunSweeper`/`ExpiredLease` in
+A step toward the lease-requeue bug's cause (§6's `RunSweeper`/`ExpiredLease` in
 DESIGN-coordinator.md exists to diagnose this class of symptom: a shard expires its
 lease, requeues, and completes almost instantly on retry, with no obvious cause).
 Confirmed live on the reporting fleet: `ss -tn` on an agent's control connection
 showed **Send-Q at 1657 bytes at the exact moment a burst of leases expired** —
 direct proof the socket's outbound buffer was backed up when the requeues happened.
+
+> **This fix alone was also insufficient** — see §3.3. Moving the outbox drain off
+> the control thread stops a full send buffer from blocking the *thread that owns
+> the heartbeat timer*, but a heartbeat queued behind a large batch of already-queued
+> traffic still has to wait for the writer thread's plain FIFO to reach it — which,
+> at `-w 14 -C 42`, can be long enough on its own to reproduce the same symptom. The
+> fleet that reported this fix didn't resolve the issue confirmed exactly that: after
+> deploying it, Send-Q still spiked at requeue time.
 
 Before this fix, one thread — the control thread — did three things on a single
 blocking socket/TLS connection: read incoming frames (`FR_HEARTBEAT_ACK`,
@@ -391,6 +399,43 @@ matching OpenSSL's supported one-reader/one-writer-thread threading model for a
 single `SSL*`. The writer is started after a successful `dial()` and stopped
 (signaled, joined) before `session_teardown()` closes the connection, on every exit
 path from the per-session loop.
+
+### 3.3 Heartbeat priority mailbox
+
+§3.2's writer thread removed the *control-thread-blocks* mechanism but not
+*head-of-line delay*: `out_push`/`out_drain` (the bulk outbox) is a strict FIFO
+with no priority field. At `-w 14 -C 42`, the volume of shard results and journal
+batches queued between one heartbeat interval and the next can be large enough
+that a heartbeat appended to the tail still has to wait for the writer thread to
+work through everything queued ahead of it — a `wire_write` per message, each
+capable of blocking on the same send-buffer pressure §3.2 was written to route
+around. Confirmed on the reporting fleet: Send-Q still spiked at requeue time with
+the §3.2 fix deployed.
+
+**Fix:** a second, single-slot mailbox (`out_push_priority`/`out_take_priority`,
+state.c) used only for `FR_HEARTBEAT`. A new heartbeat *replaces* whatever
+not-yet-sent one is already in the slot rather than queuing alongside it — correct,
+not just an optimization, since only the newest lease-renewal snapshot is ever
+useful to send. The writer thread checks this slot ahead of the bulk FIFO on every
+wakeup, **and again between every individual message inside a bulk-drain batch** —
+not just once per wakeup, since a single `out_drain()` call can return hundreds of
+queued messages and checking only at the top would let a heartbeat queued mid-batch
+wait behind the rest of that same batch, reproducing the same delay one level down.
+
+**What this does and does not fix.** This guarantees a heartbeat is never delayed by
+*agent-side* queued traffic ahead of it — at most one in-flight `wire_write` (the
+message the writer happened to already be sending) stands between a heartbeat being
+queued and it reaching the wire. It does **not** address a coordinator that is slow
+to read at all: the coordinator's per-agent connection is handled by one goroutine
+running a plain `for { ReadFrame → dispatch → loop }` (agentsrv/server.go), and
+several `dispatch` paths — notably `onWorkRequest` → `Scheduler.Grant` →
+`store.LeaseShards` — take the coordinator's single store-write mutex
+(DESIGN-coordinator.md §3, "the store is the hot path"). If that mutex is heavily
+contended across a large fleet, a coordinator's `ReadFrame` loop for *any one* agent
+can stall behind another agent's slow dispatch, and no amount of agent-side send
+ordering fixes a receiver that temporarily isn't calling `read()` on the socket at
+all. This is the next thing to instrument and rule in or out if §3.3 does not fully
+resolve the reported rate.
 
 ## 4. Special Entry Types
 

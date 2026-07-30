@@ -213,6 +213,19 @@ int g_outbox_eventfd = -1;
 static struct outmsg  *ob_head, *ob_tail;
 static pthread_mutex_t ob_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* Single-slot priority mailbox for the heartbeat. The bulk outbox above is a
+ * strict FIFO with no head-of-line priority: at high worker/copy thread
+ * counts the aggregate result/journal volume between one heartbeat interval
+ * and the next can be large enough that a heartbeat queued at the tail waits
+ * behind all of it before the writer thread's plain FIFO drain ever reaches
+ * it — reproducing the same "heartbeat effectively stalled" symptom the
+ * writer thread was built to fix, just moved from "blocked write" to "stuck
+ * in line". A heartbeat replaces (never queues alongside) whatever's already
+ * in the slot: only the newest lease-renewal snapshot is ever useful to send,
+ * so coalescing here is correct, not just an optimization. */
+static struct outmsg  *pri_msg;
+static pthread_mutex_t pri_mu = PTHREAD_MUTEX_INITIALIZER;
+
 int outbox_init(void)
 {
     g_outbox_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -251,6 +264,41 @@ struct outmsg *out_drain(void)
     ob_head = ob_tail = NULL;
     pthread_mutex_unlock(&ob_mu);
     return head;
+}
+
+void out_push_priority(uint16_t type, pb_buf *b)
+{
+    struct outmsg *m = calloc(1, sizeof *m);
+    if (!m || b->oom) {
+        LOGE("oom encoding priority frame type %u", type);
+        free(m);
+        pb_free(b);
+        return;
+    }
+    m->type = type;
+    m->buf = b->p;
+    m->len = b->len;
+    pb_init(b); /* stolen */
+    pthread_mutex_lock(&pri_mu);
+    struct outmsg *old = pri_msg; /* superseded snapshot, if the writer hasn't sent it yet */
+    pri_msg = m;
+    pthread_mutex_unlock(&pri_mu);
+    if (old) {
+        free(old->buf);
+        free(old);
+    }
+    uint64_t one = 1;
+    if (write(g_outbox_eventfd, &one, sizeof one) < 0 && errno != EAGAIN)
+        LOGE("outbox eventfd write: %s", strerror(errno));
+}
+
+struct outmsg *out_take_priority(void)
+{
+    pthread_mutex_lock(&pri_mu);
+    struct outmsg *m = pri_msg;
+    pri_msg = NULL;
+    pthread_mutex_unlock(&pri_mu);
+    return m;
 }
 
 /* ---- leases ----

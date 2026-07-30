@@ -71,7 +71,9 @@ static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to
  * renewal at once, expire together, and get requeued the instant contention
  * eased (a burst that looked like "expires, requeues, completes almost
  * instantly" but was never about which pool did the crawling — see
- * docs/DESIGN-agent.md §3.2 and §3.1 for the two are-not-the-same issues).
+ * docs/DESIGN-agent.md §3.1-§3.3 for the full history — this thread alone
+ * was not sufficient either; see §3.3's priority mailbox (state.c
+ * out_push_priority) for why).
  *
  * g_writer_stop_efd wakes the writer promptly on reconnect/shutdown (poll()
  * on the outbox alone would otherwise block indefinitely with nothing left
@@ -82,6 +84,31 @@ static int g_writer_stop_efd = -1;
 static int g_writer_err_efd = -1;
 static pthread_t g_writer_thread;
 static bool g_writer_running;
+
+/* Writes one message, freeing it either way. On a send failure, reports it
+ * via g_writer_err_efd once and returns false — callers stop attempting
+ * further writes for the rest of the current pass (the control thread is
+ * about to tear the connection down) but keep draining and freeing whatever
+ * is left, so nothing is leaked. */
+static bool writer_send_one(struct outmsg *m, bool *failed)
+{
+    bool ok = true;
+    if (!*failed) {
+        /* A frame lost to a mid-write drop is re-derived after the shard's
+         * lease expires and it is redone (at-least-once). */
+        if (wire_write(&g_conn, m->type, m->buf, m->len) < 0) {
+            LOGW("frame write failed (%s); reconnecting", strerror(errno));
+            uint64_t one = 1;
+            if (write(g_writer_err_efd, &one, sizeof one) < 0 && errno != EAGAIN)
+                LOGE("writer error eventfd write: %s", strerror(errno));
+            *failed = true;
+            ok = false;
+        }
+    }
+    free(m->buf);
+    free(m);
+    return ok;
+}
 
 static void *writer_main(void *arg)
 {
@@ -102,24 +129,30 @@ static void *writer_main(void *arg)
             while (read(g_outbox_eventfd, &v, sizeof v) > 0)
                 ;
         }
+        bool failed = false;
+        struct outmsg *pm;
+        /* Priority mailbox (heartbeat) first, ahead of anything queued in the
+         * bulk FIFO — see state.c's out_push_priority for why. */
+        pm = out_take_priority();
+        if (pm)
+            writer_send_one(pm, &failed);
         struct outmsg *m = out_drain();
         while (m) {
             struct outmsg *next = m->next;
-            /* A frame lost to a mid-write drop is re-derived after the
-             * shard's lease expires and it is redone (at-least-once). */
-            if (wire_write(&g_conn, m->type, m->buf, m->len) < 0) {
-                LOGW("frame write failed (%s); reconnecting", strerror(errno));
-                uint64_t one = 1;
-                if (write(g_writer_err_efd, &one, sizeof one) < 0 && errno != EAGAIN)
-                    LOGE("writer error eventfd write: %s", strerror(errno));
-                /* Keep draining and freeing the rest of this batch (no more
-                 * writes attempted — the control thread is about to tear the
-                 * connection down) rather than leaking it; new frames queued
-                 * after this point wait for the next session's writer. */
-            }
-            free(m->buf);
-            free(m);
+            writer_send_one(m, &failed);
             m = next;
+            /* Recheck the priority slot between every bulk message, not just
+             * once per wakeup: a single out_drain() batch can hold hundreds
+             * of queued results, and wire_write for each is itself a
+             * blocking call — checking only at the top of this loop would
+             * let a heartbeat queued mid-batch wait behind the rest of that
+             * same batch, reproducing the exact head-of-line delay this
+             * priority path exists to avoid. */
+            if (!failed) {
+                pm = out_take_priority();
+                if (pm)
+                    writer_send_one(pm, &failed);
+            }
         }
         if (pfds[1].revents & POLLIN)
             return NULL; /* stop requested: drain loop above already ran once more */
@@ -347,6 +380,20 @@ static int queue_pb(uint16_t type, pb_buf *b)
     return 0;
 }
 
+/* Like queue_pb, but via the priority mailbox (out_push_priority) instead of
+ * the bulk FIFO — used only for FR_HEARTBEAT. See state.c for why the
+ * heartbeat needs this and the bulk queue alone is not enough. */
+static int queue_pb_priority(uint16_t type, pb_buf *b)
+{
+    if (b->oom) {
+        pb_free(b);
+        errno = ENOMEM;
+        return -1;
+    }
+    out_push_priority(type, b);
+    return 0;
+}
+
 static void maybe_request_work(bool from_timer)
 {
     if (g_pause || g_drain || g_request_pending)
@@ -386,7 +433,7 @@ static int send_heartbeat(void)
     pb_init(&b);
     enc_heartbeat(&b, ++g_hb_seq, held, n, (uint32_t)wq_depth(),
                   (uint32_t)cp_depth(), read_rss(), inflight, n_inflight);
-    return queue_pb(FR_HEARTBEAT, &b);
+    return queue_pb_priority(FR_HEARTBEAT, &b);
 }
 
 static int send_stats(void)
