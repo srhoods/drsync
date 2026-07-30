@@ -93,6 +93,41 @@ func TestListJobsCarriesPassRollup(t *testing.T) {
 	}
 }
 
+// The console shows how long a RUNNING job has been running, computed
+// server-side from running_since_ms rather than a client-tracked wall clock.
+// A job that never started must omit the field; one that's running must
+// report a positive elapsed time; one that's paused must still carry the
+// timestamp of its last run so the console can show it froze rather than
+// reset (renderDetail/renderJobs don't show it, but the value must survive
+// the read path either way).
+func TestListJobsCarriesDurationRunning(t *testing.T) {
+	srv := consoleSrv(t)
+	job, err := srv.st.CreateJob("dur", []byte(specFor("dur", "/src/d", "/dst/d")), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []struct {
+		Name              string `json:"name"`
+		State             string `json:"state"`
+		DurationRunningMs int64  `json:"duration_running_ms"`
+	}
+	getJSON(t, srv.listJobs, "/api/v1/jobs", &got)
+	if len(got) != 1 || got[0].DurationRunningMs != 0 {
+		t.Fatalf("job never started: duration_running_ms = %d, want 0", got[0].DurationRunningMs)
+	}
+
+	if err := srv.st.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	getJSON(t, srv.listJobs, "/api/v1/jobs", &got)
+	if got[0].State != string(model.JobRunning) || got[0].DurationRunningMs <= 0 {
+		t.Fatalf("running job: state=%s duration_running_ms=%d, want RUNNING and > 0",
+			got[0].State, got[0].DurationRunningMs)
+	}
+}
+
 // A job with no passes yet must still list cleanly — the LEFT JOINs have to
 // yield zeroes rather than dropping the row or erroring on NULLs.
 func TestListJobsWithNoPasses(t *testing.T) {

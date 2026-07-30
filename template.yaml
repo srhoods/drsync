@@ -39,7 +39,7 @@ spec:
       delta_bytes_below: 0           # e.g. 50GiB to stop while a small delta remains
 
   copy:
-    chunk_threshold: 8GiB            # files >= this are eligible to split into chunk tasks
+    chunk_threshold: 24GiB           # files >= this are eligible to split into chunk tasks
     chunk_size: 8GiB                 # bytes per chunk; a file > this fans out across agents
     buffer_size: 1MiB                # copy buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA, with zero-detect fallback

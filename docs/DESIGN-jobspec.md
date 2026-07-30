@@ -51,7 +51,7 @@ spec:
     schedule: continuous             # continuous | manual (operator triggers each pass)
 
   copy:
-    chunk_threshold: 8GiB            # files >= this are split into chunk tasks
+    chunk_threshold: 24GiB           # files >= this are split into chunk tasks
     chunk_size: 8GiB                 # size of each chunk task (file > this fans out)
     buffer_size: 1MiB                # io_uring buffer unit
     preserve_sparse: true            # SEEK_HOLE/DATA; auto-fallback to zero-detect

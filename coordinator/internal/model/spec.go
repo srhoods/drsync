@@ -179,7 +179,7 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Passes.Schedule = "continuous"
 	}
 	if sp.Copy.ChunkThreshold == 0 {
-		sp.Copy.ChunkThreshold = 8 << 30 // 8 GiB
+		sp.Copy.ChunkThreshold = 24 << 30 // 24 GiB
 	}
 	if sp.Copy.ChunkSize == 0 {
 		sp.Copy.ChunkSize = 8 << 30 // 8 GiB

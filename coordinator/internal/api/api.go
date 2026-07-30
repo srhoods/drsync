@@ -265,6 +265,25 @@ type jobListView struct {
 	Errors        int64           `json:"errors"`
 	CreatedAtMs   int64           `json:"created_at_ms"`
 	UpdatedAtMs   int64           `json:"updated_at_ms"`
+	// DurationRunningMs is elapsed time since the job's most recent
+	// READY/PAUSED→RUNNING transition, for as long as it stays RUNNING (a
+	// pause does not stop this clock — it only stops once the job leaves
+	// RUNNING). Omitted if the job has never run.
+	DurationRunningMs int64 `json:"duration_running_ms,omitempty"`
+}
+
+// durationRunning computes elapsed time since runningSince for a job
+// currently RUNNING, mirroring passViewOf's now-started elapsed-so-far
+// calculation for an in-progress pass. Returns 0 (omitted in JSON) if the
+// job isn't running or has never run.
+func durationRunning(state model.JobState, runningSince sql.NullInt64) int64 {
+	if state != model.JobRunning || !runningSince.Valid {
+		return 0
+	}
+	if d := time.Now().UnixMilli() - runningSince.Int64; d > 0 {
+		return d
+	}
+	return 0
 }
 
 type passView struct {
@@ -360,6 +379,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 			PassState: j.LatestPassState, EntriesWalked: j.LatestEntriesWalked,
 			FilesCopied: j.FilesCopied, BytesCopied: j.BytesCopied,
 			Errors: j.Errors, CreatedAtMs: j.CreatedAt, UpdatedAtMs: j.UpdatedAt,
+			DurationRunningMs: durationRunning(j.State, j.RunningSinceMs),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

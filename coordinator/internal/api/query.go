@@ -418,8 +418,9 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 	converged := job.State == model.JobCompleted
 	writeJSON(w, http.StatusOK, map[string]any{
 		"job": job.Name, "state": job.State, "dry_run": job.DryRun,
-		"created_at_ms": job.CreatedAt,
-		"passes":        rep,
+		"created_at_ms":       job.CreatedAt,
+		"duration_running_ms": durationRunning(job.State, job.RunningSinceMs),
+		"passes":              rep,
 		"totals": map[string]any{
 			"files_copied": totals.FilesCopied, "bytes_copied": totals.BytesCopied,
 			"meta_fixed": totals.MetaFixed, "errors": totals.Errors,
