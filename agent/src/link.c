@@ -62,11 +62,14 @@ int do_linkfix(struct walk_ctx *ctx, int dst_fd, const struct linkfix *lf)
         return RES_ERROR;
     }
 
+    bool newly_linked = true;
     if (linkat(anchor_dfd, anchor_leaf, member_dfd, member_leaf, 0) < 0) {
-        /* A prior run of this shard (lease expiry, retry) already created the
-         * link, or a stale destination entry from an earlier pass sits at
-         * this name: remove it and retry once, the same "replace" pattern the
-         * walker uses for a type mismatch (walker.c remove_dst). */
+        /* A prior run of this shard (lease expiry, retry within this pass, or
+         * a fully-converged later pass re-sighting an already-linked group)
+         * already created the link, or a stale destination entry from an
+         * earlier pass sits at this name: remove it and retry once, the same
+         * "replace" pattern the walker uses for a type mismatch
+         * (walker.c remove_dst). */
         if (errno != EEXIST) {
             walk_err(ctx, "linkat", lf->member_rel);
             close(member_dfd);
@@ -79,7 +82,9 @@ int do_linkfix(struct walk_ctx *ctx, int dst_fd, const struct linkfix *lf)
             fstatat(anchor_dfd, anchor_leaf, &anchor_by_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
             existing.st_dev == anchor_by_stat.st_dev &&
             existing.st_ino == anchor_by_stat.st_ino;
-        if (!already_linked) {
+        if (already_linked) {
+            newly_linked = false; /* converged: nothing to count or journal */
+        } else {
             if (unlinkat(member_dfd, member_leaf, 0) < 0 && errno != ENOENT) {
                 walk_err(ctx, "linkfix-replace-unlink", lf->member_rel);
                 close(member_dfd);
@@ -92,10 +97,12 @@ int do_linkfix(struct walk_ctx *ctx, int dst_fd, const struct linkfix *lf)
                 close(anchor_dfd);
                 return RES_ERROR;
             }
-        } /* else: idempotent — this shard already succeeded once */
+        }
     }
-    CTR_ADD(ctx->c.links_created, 1);
-    jrn_emit(ctx, JR_LINK_CREATED, lf->member_rel, NULL, NULL, 0, lf->anchor_rel);
+    if (newly_linked) {
+        CTR_ADD(ctx->c.links_created, 1);
+        jrn_emit(ctx, JR_LINK_CREATED, lf->member_rel, NULL, NULL, 0, lf->anchor_rel);
+    }
     close(member_dfd);
     close(anchor_dfd);
     return RES_OK;

@@ -378,6 +378,9 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 		totals.FidelityExc += p.FidelityExceptions
 		totals.VerifyOK += p.VerifyOK
 		totals.VerifyFail += p.VerifyFail
+		totals.LinksCreated += p.LinksCreated
+		totals.LinkAnchorRaces += p.LinkAnchorRaces
+		totals.LinkFallback += p.LinkFallback
 		if p.EntriesWalked > 0 { // scan pass: orphan census supersedes previous
 			orphans = p.Orphans
 		} else if p.Orphans > 0 { // delete pass reports removals here
@@ -426,6 +429,9 @@ func (s *Server) getReport(w http.ResponseWriter, r *http.Request) {
 			"meta_fixed": totals.MetaFixed, "errors": totals.Errors,
 			"fidelity_exceptions": totals.FidelityExc,
 			"verify_ok":           totals.VerifyOK, "verify_fail": totals.VerifyFail,
+			"links_created":     totals.LinksCreated,
+			"link_anchor_races": totals.LinkAnchorRaces,
+			"link_fallback":     totals.LinkFallback,
 		},
 		"converged":             converged,
 		"orphans_remaining":     orphans,

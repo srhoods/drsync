@@ -118,6 +118,8 @@ jobs:
           - direct_write_e2e       # copy.direct_write: new files no-temp, updates atomic
           - fanout_e2e             # a small volume must still use the whole fleet
           - filter_e2e             # include/exclude filters
+          - hardlink_e2e           # hardlinks: preserve dedups across a multi-agent fleet
+          - hardlink_resilience_e2e # agent dies mid-LINKFIX; oversized group falls back
           - probe_e2e              # per-agent mount probe gates pass start
           - scale_e2e              # pathological shapes: huge dir, huge file
           - temp_reclaim_e2e       # sweep reclaims crash residue, spares live temps
