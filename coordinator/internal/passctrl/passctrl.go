@@ -837,6 +837,9 @@ func (c *Controller) buildJobReport(job *store.Job) (notify.JobReport, error) {
 		rep.FidelityExc += p.FidelityExceptions
 		rep.VerifyOK += p.VerifyOK
 		rep.VerifyFail += p.VerifyFail
+		rep.LinksCreated += p.LinksCreated
+		rep.LinkAnchorRaces += p.LinkAnchorRaces
+		rep.LinkFallback += p.LinkFallback
 		if p.EntriesWalked > 0 { // scan pass: latest orphan census supersedes
 			rep.OrphansRemaining = p.Orphans
 		} else if p.Orphans > 0 { // delete pass reclaimed orphans

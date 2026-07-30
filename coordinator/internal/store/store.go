@@ -128,6 +128,10 @@ CREATE TABLE IF NOT EXISTS passes (
   fidelity_exceptions INTEGER NOT NULL DEFAULT 0,
   verify_ok INTEGER NOT NULL DEFAULT 0,
   verify_fail INTEGER NOT NULL DEFAULT 0,
+  -- Hardlink preservation (docs/DESIGN-hardlinks.md), all pass-scoped.
+  links_created INTEGER NOT NULL DEFAULT 0,
+  link_anchor_races INTEGER NOT NULL DEFAULT 0,
+  link_fallback INTEGER NOT NULL DEFAULT 0,
   -- Historical DONE-shard total the Shard Reaper has deleted for this pass.
   -- ShardStateCounts adds this to the live DONE count from shard_counts, so a
   -- reaped pass still reports the DONE total it actually had — reaping frees
@@ -341,6 +345,9 @@ var migrations = []string{
 	`ALTER TABLE agents ADD COLUMN proto_minor INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE passes ADD COLUMN shards_reaped INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN running_since_ms INTEGER`,
+	`ALTER TABLE passes ADD COLUMN links_created INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE passes ADD COLUMN link_anchor_races INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE passes ADD COLUMN link_fallback INTEGER NOT NULL DEFAULT 0`,
 }
 
 func (s *Store) Close() error {
@@ -661,18 +668,22 @@ type Pass struct {
 	EntriesWalked, FilesCopied, BytesCopied, MetaFixed int64
 	Orphans, Errors, NlinkDupFiles, NlinkDupBytes      int64
 	FidelityExceptions, VerifyOK, VerifyFail           int64
+	// Hardlink preservation (docs/DESIGN-hardlinks.md), all pass-scoped.
+	LinksCreated, LinkAnchorRaces, LinkFallback int64
 }
 
 const passCols = `id, job_id, pass_no, state, started_at, finished_at, entries_walked,
  files_copied, bytes_copied, meta_fixed, orphans, errors, nlink_dup_files,
- nlink_dup_bytes, fidelity_exceptions, verify_ok, verify_fail`
+ nlink_dup_bytes, fidelity_exceptions, verify_ok, verify_fail,
+ links_created, link_anchor_races, link_fallback`
 
 func scanPass(row interface{ Scan(...any) error }) (*Pass, error) {
 	var p Pass
 	if err := row.Scan(&p.ID, &p.JobID, &p.PassNo, &p.State, &p.Started, &p.Finished,
 		&p.EntriesWalked, &p.FilesCopied, &p.BytesCopied, &p.MetaFixed,
 		&p.Orphans, &p.Errors, &p.NlinkDupFiles, &p.NlinkDupBytes,
-		&p.FidelityExceptions, &p.VerifyOK, &p.VerifyFail); err != nil {
+		&p.FidelityExceptions, &p.VerifyOK, &p.VerifyFail,
+		&p.LinksCreated, &p.LinkAnchorRaces, &p.LinkFallback); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -763,11 +774,15 @@ func (s *Store) AccumulatePassCounters(passID int64, c *drsyncpb.ShardCounters) 
 		nlink_dup_bytes = nlink_dup_bytes + ?,
 		fidelity_exceptions = fidelity_exceptions + ?,
 		verify_ok = verify_ok + ?,
-		verify_fail = verify_fail + ?
+		verify_fail = verify_fail + ?,
+		links_created = links_created + ?,
+		link_anchor_races = link_anchor_races + ?,
+		link_fallback = link_fallback + ?
 		WHERE id = ?`,
 		c.EntriesWalked, c.FilesCopied, c.BytesCopied, c.MetaFixed,
 		c.Orphans, c.Errors, c.NlinkDupFiles, c.NlinkDupBytes,
-		c.FidelityExceptions, c.VerifyOk, c.VerifyFail, passID)
+		c.FidelityExceptions, c.VerifyOk, c.VerifyFail,
+		c.LinksCreated, c.LinkAnchorRaces, c.LinkFallback, passID)
 	return err
 }
 

@@ -44,6 +44,11 @@ const (
 	KindVerify    ShardKind = "verify"
 	KindDelete    ShardKind = "delete"
 	KindProbe     ShardKind = "probe"
+	// KindLinkfix: linkat tasks for hardlink-group members once their group's
+	// anchor copy has landed (docs/DESIGN-hardlinks.md). Not yet wired into
+	// phaseOfKind/phaseRank/the pass state machine — that lands with the
+	// LINKFIX phase itself.
+	KindLinkfix ShardKind = "linkfix"
 )
 
 // Scheduling priorities (higher = granted first). Chunk tasks outrank walk
