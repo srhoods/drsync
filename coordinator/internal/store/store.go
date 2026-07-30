@@ -582,9 +582,9 @@ func TerminalJobState(st string) bool {
 }
 
 // DeleteJob removes a terminal job and all its rows (passes, shards, splits,
-// journal cursors) in one transaction. Returns the deleted job's id so the
-// caller can drop its on-disk journal segments. ErrJobActive if not terminal,
-// sql.ErrNoRows if the name is unknown.
+// journal cursors, journal type counts) in one transaction. Returns the
+// deleted job's id so the caller can drop its on-disk journal segments.
+// ErrJobActive if not terminal, sql.ErrNoRows if the name is unknown.
 func (s *Store) DeleteJob(name string) (int64, error) {
 	s.lockTimed("DeleteJob")
 	defer s.mu.Unlock()
@@ -607,6 +607,7 @@ func (s *Store) DeleteJob(name string) (int64, error) {
 	passSel := `SELECT id FROM passes WHERE job_id = ?`
 	stmts := []string{
 		`DELETE FROM journal_cursors WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM journal_type_counts WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM splits WHERE parent_shard_id IN
 		   (SELECT id FROM shards WHERE pass_id IN (` + passSel + `))`,
 		`DELETE FROM shards WHERE pass_id IN (` + passSel + `)`,
@@ -615,7 +616,7 @@ func (s *Store) DeleteJob(name string) (int64, error) {
 		`DELETE FROM passes WHERE job_id = ?`,
 		`DELETE FROM jobs WHERE id = ?`,
 	}
-	args := []any{id, id, id, id, id, id, id}
+	args := []any{id, id, id, id, id, id, id, id}
 	for i, q := range stmts {
 		if _, err := tx.Exec(q, args[i]); err != nil {
 			return 0, err
@@ -1320,6 +1321,12 @@ const ReapBatchSize = 20000
 // pass-level file/byte counters live denormalized on passes
 // (AccumulatePassCounters) rather than derived by re-scanning shards.
 //
+// A reaped shard's row in splits (if it was ever split — KindDir/KindEntryList
+// only) has no other cleanup path: DeleteJob's splits delete is scoped to
+// shards still present at purge time, so once the parent shard itself is gone
+// its splits row would otherwise be orphaned forever. Delete it here, in the
+// same transaction, while parent_shard_id still identifies which row to drop.
+//
 // The DONE *count* itself is not otherwise denormalized anywhere, though, and
 // operator-facing views (the pass-detail API, CLI) read it live from the
 // shard_counts rollup — so deleting the rows the rollup counts would zero out
@@ -1347,14 +1354,40 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 		args = append(args, string(k))
 	}
 	args = append(args, ReapBatchSize)
-	n, err := execCountTx(tx, `DELETE FROM shards WHERE id IN (
-		SELECT id FROM shards WHERE pass_id = ? AND state = ? AND kind IN (`+ph+`)
-		LIMIT ?)`, args...)
+
+	rows, err := tx.Query(`SELECT id FROM shards WHERE pass_id = ? AND state = ? AND kind IN (`+ph+`)
+		LIMIT ?`, args...)
 	if err != nil {
 		return 0, err
 	}
-	if n == 0 {
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	rows.Close()
+	if len(ids) == 0 {
 		return 0, tx.Commit()
+	}
+
+	idPh := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+	idArgs := make([]any, len(ids))
+	for i, id := range ids {
+		idArgs[i] = id
+	}
+	if _, err := tx.Exec(`DELETE FROM splits WHERE parent_shard_id IN (`+idPh+`)`, idArgs...); err != nil {
+		return 0, err
+	}
+	n, err := execCountTx(tx, `DELETE FROM shards WHERE id IN (`+idPh+`)`, idArgs...)
+	if err != nil {
+		return 0, err
 	}
 	if _, err := tx.Exec(`UPDATE passes SET shards_reaped = shards_reaped + ? WHERE id = ?`,
 		n, passID); err != nil {

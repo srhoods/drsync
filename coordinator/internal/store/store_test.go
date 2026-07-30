@@ -219,6 +219,43 @@ func TestJournalTypeCountsSumsAcrossPassesAndReplaces(t *testing.T) {
 	}
 }
 
+// TestDeleteJobRemovesJournalTypeCounts pins the fix for the leak where
+// journal_type_counts (written once per pass by SetJournalTypeCounts, at
+// PassComplete) was never in DeleteJob's cleanup list: purging a job left its
+// rows behind permanently, keyed by a pass_id no live pass would ever reuse.
+func TestDeleteJobRemovesJournalTypeCounts(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, _ := seed(t, s)
+	if err := s.SetJournalTypeCounts(passID, map[string]int64{"COPIED": 5, "ORPHAN": 2}); err != nil {
+		t.Fatal(err)
+	}
+
+	var before int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM journal_type_counts WHERE pass_id = ?`, passID).
+		Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before == 0 {
+		t.Fatal("expected journal_type_counts rows before purge")
+	}
+
+	if err := s.SetJobState(jobID, model.JobCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteJob("t1"); err != nil {
+		t.Fatal(err)
+	}
+
+	var after int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM journal_type_counts WHERE pass_id = ?`, passID).
+		Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != 0 {
+		t.Errorf("journal_type_counts rows survived job purge: %d", after)
+	}
+}
+
 // A zero count for a type must not be written as a row (so it doesn't show up
 // as a spurious zero-count line in a caller that lists map keys) — mirrors the
 // omission behavior the WebUI/email rendering already relies on.
@@ -319,6 +356,83 @@ func TestReapDoneShards(t *testing.T) {
 	n, err = s.ReapDoneShards(passID, nil)
 	if err != nil || n != 0 {
 		t.Fatalf("ReapDoneShards(nil kinds) = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// TestReapDoneShardsDeletesSplits pins the fix for the leak where a DONE
+// dir/entry-list shard that was split gets its shards row reaped but its
+// splits row (parent_shard_id keyed, no FK) survives forever — nothing else
+// ever revisits it, since DeleteJob's own splits cleanup is scoped to shards
+// still present at purge time. The reap must delete both in the same
+// transaction.
+func TestReapDoneShardsDeletesSplits(t *testing.T) {
+	s := openTest(t)
+	_, passID, shardID := seed(t, s) // seed's root shard is QUEUED, kind=dir
+
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	childIDs, err := s.RecordSplit(shardID, 1, []NewShard{
+		{Kind: model.KindEntryList, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(childIDs) != 2 {
+		t.Fatalf("split produced %d children, want 2", len(childIDs))
+	}
+
+	var splitsBefore int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM splits WHERE parent_shard_id = ?`, shardID).
+		Scan(&splitsBefore); err != nil {
+		t.Fatal(err)
+	}
+	if splitsBefore != 1 {
+		t.Fatalf("splits rows before reap = %d, want 1", splitsBefore)
+	}
+
+	if _, err := s.db.Exec(`UPDATE shards SET state = ? WHERE id = ?`,
+		string(model.ShardDone), shardID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A split row belonging to a shard that's still alive (not reaped) must
+	// survive — otherwise this test can't tell "deleted because reaped" apart
+	// from "deleted regardless of state".
+	otherParent, err := s.InsertShards(passID, 0, []NewShard{{Kind: model.KindDir, RelPath: "other"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordSplit(otherParent[0], 1, []NewShard{
+		{Kind: model.KindEntryList, RelPath: "c"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.ReapDoneShards(passID, []model.ShardKind{model.KindDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("reaped %d, want 1 (the DONE root shard)", n)
+	}
+
+	var splitsAfter int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM splits WHERE parent_shard_id = ?`, shardID).
+		Scan(&splitsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if splitsAfter != 0 {
+		t.Errorf("splits row for reaped parent %d survived, want deleted", shardID)
+	}
+
+	var otherSplits int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM splits WHERE parent_shard_id = ?`, otherParent[0]).
+		Scan(&otherSplits); err != nil {
+		t.Fatal(err)
+	}
+	if otherSplits != 1 {
+		t.Errorf("splits row for non-reaped (still QUEUED) parent %d = %d, want 1 (untouched)", otherParent[0], otherSplits)
 	}
 }
 
