@@ -60,20 +60,42 @@ int  wq_drop_job(uint64_t job_id, void (*dispose)(struct shard_item *it));
 /* ---- outbox (workers/control → socket, written by control thread) ---- */
 extern int g_outbox_eventfd;
 struct outmsg {
-    uint16_t       type;
-    uint8_t       *buf;
-    size_t         len;
-    struct outmsg *next;
+    uint16_t        type;
+    uint8_t        *buf;
+    size_t          len;
+    struct timespec queued_at; /* CLOCK_MONOTONIC, set by out_push/out_push_priority;
+                                 * lets the writer thread log queue-to-wire latency —
+                                 * diagnostic for the lease-requeue investigation
+                                 * (docs/DESIGN-agent.md §3.3/§3.4). */
+    struct outmsg  *next;
 };
 /* Steals b's buffer; b is reset. */
 void out_push(uint16_t type, pb_buf *b);
 struct outmsg *out_drain(void);
 int  outbox_init(void);
+/* Single-slot priority mailbox (heartbeat only): out_push_priority replaces
+ * any not-yet-sent previous message rather than queuing alongside it, and
+ * out_take_priority is checked by the writer thread before the bulk FIFO
+ * above on every wakeup, so a heartbeat can never wait behind a burst of
+ * queued shard results/journal batches. See the rationale in state.c. */
+void out_push_priority(uint16_t type, pb_buf *b);
+struct outmsg *out_take_priority(void);
 
 /* ---- held leases (heartbeat renewal + in-flight reporting) ----
  * Registry slots are index-stable for the life of a lease (freed in place, never
  * compacted), so a worker can hold a pointer to its own slot and publish
- * progress into it without re-looking it up. */
+ * progress into it without re-looking it up.
+ *
+ * Internally (state.c) this is a fixed array plus an intrusive free list and
+ * an intrusive active list, so every operation is O(1) instead of the O(table
+ * high-water mark) linear scan an earlier version used — at 30+ walker
+ * threads churning small, fast (nothing-to-copy) shards, that scan, repeated
+ * by every lease_add/lease_start/lease_remove call and contended against
+ * send_heartbeat's own two scans (lease_snapshot, lease_inflight) under the
+ * same lock, could starve the heartbeat long enough to expire leases with no
+ * trace on the network or coordinator side — see docs/DESIGN-agent.md §3.5.
+ * next/prev/free_next below are that internal bookkeeping; every field is
+ * state.c-private in practice (no code outside it reads or writes them). */
 #define LEASE_PATH_MAX 256 /* truncated: enough to identify the subtree */
 
 struct lease_entry {
@@ -84,6 +106,9 @@ struct lease_entry {
     struct timespec granted_at, started_at;  /* CLOCK_MONOTONIC */
     bool            running;                 /* false = queued, not yet picked up */
     atomic_ullong   entries_done;            /* published by the owning worker */
+    int             active_next, active_prev; /* intrusive doubly-linked active list, -1 = none */
+    int             free_next;                 /* intrusive singly-linked free list, -1 = none */
+    int             hash_next;                 /* intrusive singly-linked hash-bucket chain, -1 = none */
 };
 
 /* Control thread: record a granted lease. Copies what it needs from it, so the
@@ -277,6 +302,10 @@ bool xattr_equal_at(struct walk_ctx *ctx, int sdirfd, int ddirfd, const char *na
  * A reserve >= 1 guarantees a drainer always exists, so walkers blocked in
  * dpend_wait on their copies can never deadlock the pool. */
 int  cp_init(int threads, int queue_cap, int reserve);
+/* Picks that reserve count for a pool of copy_threads under stealing policy
+ * steal_enabled — see the definition in poolsize.c for the throughput
+ * rationale (not just deadlock-freedom) behind the 25% figure. */
+int  cp_reserve_for(int copy_threads, bool steal_enabled);
 void cp_shutdown(void);
 int  cp_depth(void);
 /* Executes one queued copy task if one is available (non-blocking). Returns
