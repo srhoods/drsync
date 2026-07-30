@@ -96,13 +96,19 @@ func (s *Store) lockTimed(label string) {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  name       TEXT NOT NULL UNIQUE,
-  spec_yaml  BLOB NOT NULL,
-  state      TEXT NOT NULL,
-  dry_run    INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  name             TEXT NOT NULL UNIQUE,
+  spec_yaml        BLOB NOT NULL,
+  state            TEXT NOT NULL,
+  dry_run          INTEGER NOT NULL DEFAULT 0,
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL,
+  -- Epoch ms of the most recent transition into RUNNING (initial start or
+  -- resume from PAUSED); NULL if the job has never run. We don't track
+  -- cumulative wall time or stop the clock across a pause, only the instant
+  -- the job most recently started running, so "duration running" for a job
+  -- still RUNNING is just now - running_since_ms.
+  running_since_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS passes (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -334,6 +340,7 @@ var migrations = []string{
 	// agent that predates minor negotiation reports — the two are equivalent.
 	`ALTER TABLE agents ADD COLUMN proto_minor INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE passes ADD COLUMN shards_reaped INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN running_since_ms INTEGER`,
 }
 
 func (s *Store) Close() error {
@@ -356,13 +363,14 @@ func newLeaseID() int64 {
 // ---------------------------------------------------------------------------
 
 type Job struct {
-	ID        int64
-	Name      string
-	SpecYAML  []byte
-	State     model.JobState
-	DryRun    bool
-	CreatedAt int64
-	UpdatedAt int64
+	ID             int64
+	Name           string
+	SpecYAML       []byte
+	State          model.JobState
+	DryRun         bool
+	CreatedAt      int64
+	UpdatedAt      int64
+	RunningSinceMs sql.NullInt64
 }
 
 // DestinationConflict returns a *DestinationConflictError if any job in one of
@@ -450,14 +458,14 @@ func boolInt(b bool) int {
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var dry int
-	if err := row.Scan(&j.ID, &j.Name, &j.SpecYAML, &j.State, &dry, &j.CreatedAt, &j.UpdatedAt); err != nil {
+	if err := row.Scan(&j.ID, &j.Name, &j.SpecYAML, &j.State, &dry, &j.CreatedAt, &j.UpdatedAt, &j.RunningSinceMs); err != nil {
 		return nil, err
 	}
 	j.DryRun = dry != 0
 	return &j, nil
 }
 
-const jobCols = `id, name, spec_yaml, state, dry_run, created_at, updated_at`
+const jobCols = `id, name, spec_yaml, state, dry_run, created_at, updated_at, running_since_ms`
 
 func (s *Store) GetJob(name string) (*Job, error) {
 	return scanJob(s.rdb.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE name = ?`, name))
@@ -515,7 +523,7 @@ type JobSummary struct {
 // match instead.
 func (s *Store) JobSummaries() ([]*JobSummary, error) {
 	rows, err := s.rdb.Query(`SELECT j.id, j.name, j.state,
-		  j.dry_run, j.created_at, j.updated_at,
+		  j.dry_run, j.created_at, j.updated_at, j.running_since_ms,
 		  COALESCE(t.npasses, 0), COALESCE(t.files, 0),
 		  COALESCE(t.bytes, 0), COALESCE(t.errors, 0),
 		  COALESCE(lp.pass_no, 0), COALESCE(lp.state, ''),
@@ -536,7 +544,7 @@ func (s *Store) JobSummaries() ([]*JobSummary, error) {
 		var v JobSummary
 		var dry int
 		if err := rows.Scan(&v.ID, &v.Name, &v.State, &dry,
-			&v.CreatedAt, &v.UpdatedAt, &v.Passes, &v.FilesCopied, &v.BytesCopied,
+			&v.CreatedAt, &v.UpdatedAt, &v.RunningSinceMs, &v.Passes, &v.FilesCopied, &v.BytesCopied,
 			&v.Errors, &v.LatestPassNo, &v.LatestPassState,
 			&v.LatestEntriesWalked); err != nil {
 			return nil, err
@@ -562,11 +570,21 @@ func (s *Store) JobSummaries() ([]*JobSummary, error) {
 	return out, rows.Err()
 }
 
+// SetJobState transitions a job's state. Entering RUNNING (initial start or
+// resume from PAUSED) stamps running_since_ms with the current time; the
+// console uses it to show elapsed time running, computed as now minus this
+// timestamp for as long as the job stays RUNNING, so a pause doesn't need its
+// own accounting — only the moment RUNNING was most recently (re)entered.
 func (s *Store) SetJobState(id int64, st model.JobState) error {
 	s.lockTimed("SetJobState")
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE jobs SET state = ?, updated_at = ? WHERE id = ?`,
-		string(st), nowMS(), id)
+	var runningSince any
+	if st == model.JobRunning {
+		runningSince = nowMS()
+	}
+	_, err := s.db.Exec(`UPDATE jobs SET state = ?, updated_at = ?,
+		running_since_ms = COALESCE(?, running_since_ms) WHERE id = ?`,
+		string(st), nowMS(), runningSince, id)
 	return err
 }
 

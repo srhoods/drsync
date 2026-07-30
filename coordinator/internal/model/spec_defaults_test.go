@@ -25,9 +25,10 @@ func TestDefaultsAppliedToMinimalSpec(t *testing.T) {
 	if sp.Copy.Fsync != "batched" {
 		t.Errorf("copy.fsync = %q, want batched", sp.Copy.Fsync)
 	}
+	const twentyFourGiB = 24 << 30
 	const eightGiB = 8 << 30
-	if sp.Copy.ChunkThreshold != eightGiB {
-		t.Errorf("copy.chunk_threshold = %d, want %d (8GiB)", sp.Copy.ChunkThreshold, eightGiB)
+	if sp.Copy.ChunkThreshold != twentyFourGiB {
+		t.Errorf("copy.chunk_threshold = %d, want %d (24GiB)", sp.Copy.ChunkThreshold, twentyFourGiB)
 	}
 	if sp.Copy.ChunkSize != eightGiB {
 		t.Errorf("copy.chunk_size = %d, want %d (8GiB)", sp.Copy.ChunkSize, eightGiB)
@@ -43,9 +44,9 @@ func TestDefaultsAppliedToMinimalSpec(t *testing.T) {
 	if !o.Copy.DirectWrite {
 		t.Error("resolved JobOptions.Copy.DirectWrite = false, want true")
 	}
-	if o.Copy.ChunkThreshold != eightGiB || o.Copy.ChunkSize != eightGiB {
+	if o.Copy.ChunkThreshold != twentyFourGiB || o.Copy.ChunkSize != eightGiB {
 		t.Errorf("resolved JobOptions chunk sizes = %d/%d, want %d/%d",
-			o.Copy.ChunkThreshold, o.Copy.ChunkSize, eightGiB, eightGiB)
+			o.Copy.ChunkThreshold, o.Copy.ChunkSize, twentyFourGiB, eightGiB)
 	}
 }
 

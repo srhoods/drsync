@@ -125,7 +125,7 @@ spec:
       delta_bytes_below: 0
 
   copy:
-    chunk_threshold: 8GiB         # files ≥ this are copied in parallel ranges (huge files)
+    chunk_threshold: 24GiB        # files ≥ this are copied in parallel ranges (huge files)
     chunk_size: 8GiB              # range per chunk task; a file > this fans out across agents
     buffer_size: 1MiB
     preserve_sparse: true         # SEEK_HOLE/SEEK_DATA extent copy
@@ -345,7 +345,7 @@ extreme.
   agent's prefetch window and stall the rest of the tree. The cap yields when
   that directory is the only work left, so it never idles the fleet.
 
-- **Very large files.** A file at/above `copy.chunk_threshold` (default 8 GiB)
+- **Very large files.** A file at/above `copy.chunk_threshold` (default 24 GiB)
   and larger than one `copy.chunk_size` (default 8 GiB) is **copied across the
   fleet**: the agent that walks it hands the file to the coordinator, which fans
   its byte ranges out as chunk tasks to different hosts, all writing one shared

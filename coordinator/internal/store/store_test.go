@@ -970,6 +970,67 @@ func TestSplitIdempotency(t *testing.T) {
 	}
 }
 
+// TestRunningSinceStampedOnEntryToRunning locks down SetJobState's
+// running_since_ms behavior: stamped on the initial READY->RUNNING
+// transition, left untouched across a pause (so a paused job still reports
+// when it last started running), and restamped with a later time on resume.
+func TestRunningSinceStampedOnEntryToRunning(t *testing.T) {
+	s := openTest(t)
+	job, err := s.CreateJob("run-since", []byte(specYAML), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.RunningSinceMs.Valid {
+		t.Fatalf("new job already has running_since_ms = %v, want unset", job.RunningSinceMs)
+	}
+
+	if err := s.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetJobByID(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RunningSinceMs.Valid {
+		t.Fatal("running_since_ms not set after READY->RUNNING")
+	}
+	firstStart := got.RunningSinceMs.Int64
+
+	if err := s.SetJobState(job.ID, model.JobPaused); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetJobByID(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RunningSinceMs.Int64 != firstStart {
+		t.Fatalf("running_since_ms changed on pause: %d, want unchanged %d", got.RunningSinceMs.Int64, firstStart)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := s.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetJobByID(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RunningSinceMs.Int64 <= firstStart {
+		t.Fatalf("running_since_ms not advanced on resume: %d, want > %d", got.RunningSinceMs.Int64, firstStart)
+	}
+
+	if err := s.SetJobState(job.ID, model.JobCompleted); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetJobByID(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RunningSinceMs.Valid {
+		t.Fatal("running_since_ms cleared on completion, want it preserved for duration display")
+	}
+}
+
 func TestPausedJobNotGranted(t *testing.T) {
 	s := openTest(t)
 	jobID, _, _ := seed(t, s)
