@@ -585,14 +585,77 @@ than the table's 8192-slot capacity, the scenario that made the old
 implementation's scan cost climb) followed by a snapshot that correctly shows
 zero held leases, not a leaked or degraded table.
 
-**Not yet confirmed against the reporting fleet as of this writing** — this is
-the strongest hypothesis to date (a concrete O(n) vs O(1) bug, provable by
-inspection, matching every observed property including the two negative
-instrumentation results), but every fix in this investigation looked sound
-until tested live. The `-w 34/35` "8/8 failed, 5/10 clean" noise pattern
-specifically should go away if this is right — a real remaining race would
-still show *some* signal correlated with `n_used`'s growth, not this random
-of a split.
+**Result: also insufficient.** Deployed and re-tested — same issue. The
+`lease_mu` scan cost was a real bug, worth fixing regardless, but it was not
+(or not solely) the mechanism behind the residual requeue rate.
+
+### 3.6 Ruled out: spread mode; confirmed: every timing signal is clean
+
+**Spread mode ruled out.** `tuning.spread_target_per_agent` defaults to 32 —
+matching the reported "~32 combined thread count" threshold closely enough to
+be worth checking directly. Tested `spread_mode: off` and independently
+reduced shard counts: **no material difference**. Whatever the mechanism is,
+it is not spread-driven shard fan-out or `FR_SHARD_SPLIT` frequency — the
+default's numeric coincidence with the observed threshold was exactly that, a
+coincidence.
+
+**Every timing signal now checks out end-to-end**, confirmed live against a
+build with the full §3.1–§3.5 diagnostics deployed:
+- The control loop's own poll cadence is on schedule — `"control loop poll
+  stall"` (the direct test for the control thread being delayed for *any*
+  reason, including plain OS scheduling contention) never fires.
+- `"heartbeat queued"`/`"heartbeat sent"` keep firing every ~5s straight
+  through a requeue event, with consistently low queue and write latency —
+  the agent is not failing to build, queue, or transmit heartbeats on time.
+- `held` counts are sane (bounded near the expected `(workers+copy_threads)*2`
+  ceiling, not stuck or degenerate) and **match exactly** between the agent's
+  "heartbeat queued" line and the coordinator's "heartbeat received" line for
+  the same `seq` — the frame is not being corrupted, truncated, or
+  misparsed in transit.
+- Neither `"dispatch took unusually long"` nor `"store: long wait for write
+  lock"` fires — the coordinator is not slow to process what it receives, and
+  not lock-contended when it tries to renew.
+
+With delivery, timing, and aggregate content all provably correct, the only
+remaining unverified dimension is **identity**: does the specific lease that
+later expires actually appear in `held_lease_ids` for the heartbeat(s)
+immediately before it does? A correct *count* does not guarantee a correct
+*membership list* — the count could be right while the wrong ids are in it (a
+different, currently-untested lease-table bug from the one just fixed) or
+right by coincidence while one specific id is silently missing every time.
+
+**Diagnostics added to test this directly:**
+- Agent, `send_heartbeat`: the `"heartbeat queued"` line now includes the
+  full id list (`ids=[...]`), not just the count — truncated safely (never
+  mid-number) with a `"...(N more)"` marker if it would overflow the log
+  buffer, so a huge held-set never silently drops ids without saying so.
+- Coordinator, `onHeartbeat`: `"heartbeat received"` likewise now logs
+  `held_ids` (the full slice), plus a new `"heartbeat renewal did not match
+  every held lease"` `WARN` whenever `store.RenewLeasesByID`'s `matched`
+  return (rows actually updated) is less than the number of ids requested.
+  This is **not automatically a bug on its own** — a listed lease legitimately
+  stops matching the instant its shard completes via a separate, faster
+  `ShardResult` frame that can race a heartbeat built moments earlier; an
+  isolated one-beat gap right before that shard's own result arrives is
+  expected. A *sustained* gap for the same id across consecutive heartbeats is
+  the real signal.
+- `store.ExpiredLease` (returned by `ExpireLeases`, logged by
+  `scheduler.RunSweeper`'s `"lease expired"` line) now carries the shard's
+  `lease_id` directly, captured before the requeue/park `UPDATE` clears it —
+  previously only `Agent` survived that far. This is the id to grep backward
+  through both sides' heartbeat logs: was it ever reported held, and if so,
+  did the coordinator's renewal for it ever come back `matched`?
+
+Reading these together for one specific expired lease id should finally
+distinguish "the agent silently stopped reporting a lease it still held" (a
+membership bug in the rewritten lease table, or upstream of it) from "the
+coordinator received a correct report but the renewal still didn't stick" (a
+different, not-yet-identified coordinator-side issue) from "something not
+captured by any of this instrumentation" (at which point a packet capture of
+one specific heartbeat's payload, decoded and diffed against what
+`lease_snapshot` should have produced, is the next escalation).
+
+**Not yet run against the reporting fleet as of this writing.**
 
 ## 4. Special Entry Types
 

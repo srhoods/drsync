@@ -339,8 +339,12 @@ func (s *Scheduler) RunSweeper(ctx context.Context, every time.Duration) {
 				// instead of correlating heartbeat gaps against timestamps after
 				// the fact — lease_agent does not survive the shard's next grant,
 				// so this line is the only durable record of who held it.
+				// lease_id is included so this exact expiry can be grepped back
+				// through the agent's "heartbeat queued ids=[...]" lines
+				// (docs/DESIGN-agent.md §3.6) — was this lease ever reported held,
+				// and if so, in the heartbeat(s) immediately before it expired?
 				slog.Warn("lease expired", "job", e.Job, "pass", e.PassNo,
-					"shard", e.ShardID, "kind", e.Kind, "path", e.RelPath,
+					"shard", e.ShardID, "lease_id", e.LeaseID, "kind", e.Kind, "path", e.RelPath,
 					"agent", agent, "attempt", e.Attempt, "outcome", outcome)
 			}
 			slog.Warn("expired leases", "requeued", requeued, "parked", parked)

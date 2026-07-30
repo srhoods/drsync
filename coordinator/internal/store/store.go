@@ -1264,9 +1264,18 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 // reaches 0 and the pass stalls until the agent is stopped. Honouring the held
 // list lets such a lease expire, so the sweeper requeues it and it is re-granted
 // (re-execution is idempotent) — the stall self-heals within one TTL.
-func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Duration) error {
+// RenewLeasesByID extends lease_expiry for leaseIDs, restricted to rows still
+// LEASED and still owned by agentID. Returns how many of the requested IDs
+// actually matched a row (RowsAffected) — diagnostic for the lease-requeue
+// investigation (docs/DESIGN-agent.md §3.6): a heartbeat can list a lease id
+// that legitimately no longer matches (state != LEASED because the shard
+// already completed via a separate, faster ShardResult frame — not a bug,
+// just a stale-by-a-beat snapshot), so the caller logs matched vs requested
+// rather than treating any gap as automatically wrong; a *sustained* gap for
+// one specific id across consecutive heartbeats is the real signal.
+func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Duration) (matched int64, err error) {
 	if len(leaseIDs) == 0 {
-		return nil
+		return 0, nil
 	}
 	s.lockTimed("RenewLeasesByID")
 	defer s.mu.Unlock()
@@ -1280,9 +1289,13 @@ func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Durat
 		ph = append(ph, '?')
 		args = append(args, id)
 	}
-	_, err := s.db.Exec(`UPDATE shards SET lease_expiry = ?
+	res, err := s.db.Exec(`UPDATE shards SET lease_expiry = ?
 		WHERE state = ? AND lease_agent = ? AND lease_id IN (`+string(ph)+`)`, args...)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	matched, err = res.RowsAffected()
+	return matched, err
 }
 
 // ReapBatchSize bounds how many DONE shards ReapDoneShards deletes per call.
@@ -1396,6 +1409,11 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 // the expired lease. See docs/DESIGN-coordinator.md §7 (Metrics).
 type ExpiredLease struct {
 	ShardID int64
+	LeaseID int64 // the lease_id this shard held at expiry — id_lease is cleared by
+	// the requeue/park UPDATE below, so like Agent this is the only place it survives.
+	// Diagnostic use: grep this against an agent's "heartbeat queued ids=[...]" log
+	// lines to see whether the expiring lease was ever actually reported held
+	// (docs/DESIGN-agent.md §3.6).
 	Job     string
 	PassNo  int
 	Kind    model.ShardKind
@@ -1420,7 +1438,7 @@ func (s *Store) ExpireLeases(now time.Time) ([]ExpiredLease, error) {
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT s.id, j.name, p.pass_no, s.kind, s.rel_path,
+	rows, err := tx.Query(`SELECT s.id, COALESCE(s.lease_id, 0), j.name, p.pass_no, s.kind, s.rel_path,
 		COALESCE(s.lease_agent, ''), s.attempt, (s.attempt >= ?)
 		FROM shards s
 		JOIN passes p ON p.id = s.pass_id
@@ -1433,7 +1451,7 @@ func (s *Store) ExpireLeases(now time.Time) ([]ExpiredLease, error) {
 	var expired []ExpiredLease
 	for rows.Next() {
 		var e ExpiredLease
-		if err := rows.Scan(&e.ShardID, &e.Job, &e.PassNo, &e.Kind, &e.RelPath,
+		if err := rows.Scan(&e.ShardID, &e.LeaseID, &e.Job, &e.PassNo, &e.Kind, &e.RelPath,
 			&e.Agent, &e.Attempt, &e.Parked); err != nil {
 			rows.Close()
 			return nil, err

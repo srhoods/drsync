@@ -646,6 +646,68 @@ func TestLeaseShardsIndexOrdered(t *testing.T) {
 	}
 }
 
+// TestRenewLeasesByIDMatchedCount pins the diagnostic RenewLeasesByID exists
+// for (docs/DESIGN-agent.md §3.6): matched must equal exactly how many of the
+// requested ids matched a still-LEASED row this agent owns, not just "err ==
+// nil" — a completed/reassigned/foreign-agent lease id must count as
+// unmatched (0) individually, distinguishable from the all-matched case, so
+// agentsrv's "heartbeat renewal did not match every held lease" warning has
+// an honest signal to fire on.
+func TestRenewLeasesByIDMatchedCount(t *testing.T) {
+	s := openTest(t)
+	_, passID, shardID := seed(t, s)
+
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("lease: rows=%v err=%v", rows, err)
+	}
+	leaseID := rows[0].LeaseID
+
+	// A lease id that was never granted (agent misreports, or a stale id from
+	// a prior session) matches nothing.
+	matched, err := s.RenewLeasesByID("agent-a", []int64{999999}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched != 0 {
+		t.Fatalf("unknown lease id matched %d, want 0", matched)
+	}
+
+	// A real, currently-LEASED lease reported by the *wrong* agent matches
+	// nothing — lease_agent must be checked, not just lease_id.
+	matched, err = s.RenewLeasesByID("agent-b", []int64{leaseID}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched != 0 {
+		t.Fatalf("lease renewed by the wrong agent matched %d, want 0", matched)
+	}
+
+	// The genuine owner renewing it matches exactly 1.
+	matched, err = s.RenewLeasesByID("agent-a", []int64{leaseID}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched != 1 {
+		t.Fatalf("genuine renewal matched %d, want 1", matched)
+	}
+
+	// Once the shard completes (state != LEASED), the same lease id no longer
+	// matches — this is the "not a bug, the shard just finished" case the
+	// agentsrv warning comment documents, not a data-loss signal on its own.
+	if err := s.CompleteShard(shardID, leaseID, nil); err != nil {
+		t.Fatal(err)
+	}
+	matched, err = s.RenewLeasesByID("agent-a", []int64{leaseID}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matched != 0 {
+		t.Fatalf("renewal after completion matched %d, want 0", matched)
+	}
+	_ = passID
+}
+
 // TestRenewLeasesByIDOnlyHeld is the end-of-scan stall regression: a heartbeat
 // renews only the leases the agent still holds; a lease the agent no longer
 // holds (lost grant / dropped result) is left to expire and requeue.
@@ -661,8 +723,12 @@ func TestRenewLeasesByIDOnlyHeld(t *testing.T) {
 		t.Fatalf("want 2 leased, got %v err=%v", rows, err)
 	}
 	// The agent's heartbeat reports holding only the first lease.
-	if err := s.RenewLeasesByID("agent-a", []int64{rows[0].LeaseID}, time.Hour); err != nil {
+	matched, err := s.RenewLeasesByID("agent-a", []int64{rows[0].LeaseID}, time.Hour)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if matched != 1 {
+		t.Fatalf("RenewLeasesByID matched %d, want 1", matched)
 	}
 	// Sweep: exactly the un-renewed lease requeues; the renewed one survives.
 	expired, err := s.ExpireLeases(time.Now())
@@ -681,13 +747,23 @@ func TestRenewLeasesByIDOnlyHeld(t *testing.T) {
 	if expired[0].ShardID != rows[1].ID {
 		t.Fatalf("expired shard = %d, want the unheld one (%d)", expired[0].ShardID, rows[1].ID)
 	}
+	// LeaseID must be captured before the requeue UPDATE clears it — the
+	// diagnostic (docs/DESIGN-agent.md §3.6) depends on this surviving so an
+	// expired lease can be grepped back through an agent's heartbeat logs.
+	if expired[0].LeaseID != rows[1].LeaseID {
+		t.Fatalf("expired lease_id = %d, want %d", expired[0].LeaseID, rows[1].LeaseID)
+	}
 	counts, _ := s.ShardStateCounts(passID)
 	if counts[model.ShardLeased] != 1 || counts[model.ShardQueued] != 1 {
 		t.Fatalf("counts=%+v, want 1 LEASED (renewed) + 1 QUEUED (expired)", counts)
 	}
 	// Empty held list must renew nothing (never fall back to renew-all).
-	if err := s.RenewLeasesByID("agent-a", nil, time.Hour); err != nil {
+	matched, err = s.RenewLeasesByID("agent-a", nil, time.Hour)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if matched != 0 {
+		t.Fatalf("RenewLeasesByID with an empty held list matched %d, want 0", matched)
 	}
 }
 

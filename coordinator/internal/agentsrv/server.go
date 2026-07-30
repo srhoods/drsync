@@ -377,14 +377,20 @@ func (s *Server) dispatch(ac *agentConn, ft drsyncpb.FrameType, payload []byte) 
 
 func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
 	// Diagnostic for the lease-requeue investigation (docs/DESIGN-agent.md
-	// §3.4): the receive-side timestamp + seq, to correlate against the
+	// §3.4/§3.6): the receive-side timestamp + seq, to correlate against the
 	// agent's own "heartbeat sent" log line (same seq) and see whether a gap
 	// opens up between agent-send and coordinator-receive/process time, vs.
 	// heartbeats simply not being sent often enough. Clocks need not be
 	// synced for this — what matters is the *interval* between consecutive
 	// onHeartbeat log lines for one agent, same as the agent-side interval
 	// between its own "heartbeat sent" lines.
-	slog.Info("heartbeat received", "agent", ac.id, "seq", hb.Seq, "held", len(hb.HeldLeaseIds))
+	//
+	// held_ids (the full list, not just the count) lets a specific expired
+	// lease id be grepped back through every heartbeat that did or didn't
+	// list it — everything else checked out (timing, count, sequence all
+	// match end-to-end), so identity, not timing, is what's left to verify.
+	slog.Info("heartbeat received", "agent", ac.id, "seq", hb.Seq,
+		"held", len(hb.HeldLeaseIds), "held_ids", hb.HeldLeaseIds)
 
 	// Latest in-flight snapshot for the fleet view. Kept even when empty: for a
 	// minor >= MinorInflight agent, empty genuinely means "holding nothing".
@@ -400,8 +406,20 @@ func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
 	for i, id := range hb.HeldLeaseIds {
 		held[i] = int64(id)
 	}
-	if err := s.st.RenewLeasesByID(ac.id, held, s.cfg.LeaseTTL); err != nil {
+	matched, err := s.st.RenewLeasesByID(ac.id, held, s.cfg.LeaseTTL)
+	if err != nil {
 		return err
+	}
+	// A gap here (matched < len(held)) is not automatically a bug: a listed
+	// lease legitimately stops matching (state != LEASED) the instant its
+	// shard completes via a separate ShardResult frame, which can race a
+	// heartbeat built moments earlier. Logged so a *sustained* gap for the
+	// same id across consecutive heartbeats — the real signal — is visible;
+	// an isolated one-beat gap right before that shard's own result arrives
+	// is expected and not a cause for concern on its own.
+	if matched < int64(len(held)) {
+		slog.Warn("heartbeat renewal did not match every held lease",
+			"agent", ac.id, "seq", hb.Seq, "requested", len(held), "matched", matched)
 	}
 	if err := s.st.TouchAgent(ac.id); err != nil {
 		return err

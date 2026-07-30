@@ -71,10 +71,11 @@ static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to
  * renewal at once, expire together, and get requeued the instant contention
  * eased (a burst that looked like "expires, requeues, completes almost
  * instantly" but was never about which pool did the crawling — see
- * docs/DESIGN-agent.md §3.1-§3.5 for the full history — this thread alone
+ * docs/DESIGN-agent.md §3.1-§3.6 for the full history — this thread alone
  * was not sufficient either; see §3.3's priority mailbox (state.c
- * out_push_priority) and §3.5 for the actual root cause (an O(n) lease-table
- * scan under lease_mu, unrelated to anything this thread does).
+ * out_push_priority), §3.5's O(n) lease-table fix (also insufficient alone),
+ * and §3.6 (current: every timing signal checks out, tracing by lease
+ * identity next).
  *
  * g_writer_stop_efd wakes the writer promptly on reconnect/shutdown (poll()
  * on the outbox alone would otherwise block indefinitely with nothing left
@@ -463,6 +464,26 @@ static void maybe_request_work(bool from_timer)
  * has gone badly wrong — and the renewal list (held) is never truncated. */
 #define HB_INFLIGHT_MAX 256
 
+/* Formats held[0..n) as a comma-separated list into buf, truncating with a
+ * trailing "...(N more)" if it would overflow — never silently cuts an id in
+ * half (that would look like a logging bug, not a truncation marker) and
+ * never overflows buf. Diagnostic-only formatting; see send_heartbeat. */
+static void fmt_lease_ids(char *buf, size_t cap, const uint64_t *held, size_t n)
+{
+    size_t off = 0;
+    for (size_t i = 0; i < n; i++) {
+        char one[24];
+        int len = snprintf(one, sizeof one, "%s%llu", i ? "," : "", (unsigned long long)held[i]);
+        if (off + (size_t)len + 24 >= cap) { /* leave room for the "...(N more)" marker */
+            snprintf(buf + off, cap - off, ",...(%zu more)", n - i);
+            return;
+        }
+        memcpy(buf + off, one, (size_t)len);
+        off += (size_t)len;
+        buf[off] = '\0';
+    }
+}
+
 static int send_heartbeat(void)
 {
     uint64_t held[1024];
@@ -474,13 +495,19 @@ static int send_heartbeat(void)
     enc_heartbeat(&b, ++g_hb_seq, held, n, (uint32_t)wq_depth(),
                   (uint32_t)cp_depth(), read_rss(), inflight, n_inflight);
     /* Diagnostic for the lease-requeue investigation (docs/DESIGN-agent.md
-     * §3.4): the queue-time seq, correlated by seq against the coordinator's
-     * "heartbeat received" log line for the same agent, and by timing
-     * against this thread's own next "heartbeat sent" line (writer_send_one)
-     * to see whether a gap opens on the send side (control thread not
-     * calling send_heartbeat often enough) vs. the wire/receive side (queued
-     * promptly but delayed reaching or being processed by the coordinator). */
-    LOGI("heartbeat queued: seq=%llu held=%zu", (unsigned long long)g_hb_seq, n);
+     * §3.4/§3.6): the queue-time seq, correlated by seq against the
+     * coordinator's "heartbeat received" log line for the same agent, and by
+     * timing against this thread's own next "heartbeat sent" line
+     * (writer_send_one) to see whether a gap opens on the send side (control
+     * thread not calling send_heartbeat often enough) vs. the wire/receive
+     * side (queued promptly but delayed reaching or being processed by the
+     * coordinator). The full id list (not just the count) lets one specific
+     * expired lease be grepped back through every heartbeat that did or
+     * didn't include it — everything timing-related already checked out, so
+     * identity is what's left to verify. */
+    static char ids[900]; /* control thread only; static keeps this off the stack */
+    fmt_lease_ids(ids, sizeof ids, held, n);
+    LOGI("heartbeat queued: seq=%llu held=%zu ids=[%s]", (unsigned long long)g_hb_seq, n, ids);
     return queue_pb_priority(FR_HEARTBEAT, &b);
 }
 
