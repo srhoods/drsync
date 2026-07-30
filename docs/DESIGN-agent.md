@@ -655,7 +655,85 @@ captured by any of this instrumentation" (at which point a packet capture of
 one specific heartbeat's payload, decoded and diffed against what
 `lease_snapshot` should have produced, is the next escalation).
 
-**Not yet run against the reporting fleet as of this writing.**
+**Result: the trace answered it.** Grepping an expired lease's id
+(from `"lease expired" lease_id=...`) against every agent's own
+`"heartbeat queued"`/`"heartbeat sent"` logs found **no record of it on any
+host, ever**. Not a delayed report, not a membership bug in the lease
+table — the lease was never added to any agent's held-lease table at all,
+on any machine, despite the coordinator's own database recording it as
+`LEASED` and granted.
+
+### 3.7 Root cause: `WorkGrant` exceeding the agent's fixed receive buffer — fixed
+
+`dec_work_grant` (`agent/src/msgs.c`) decodes each `WorkItem` in an incoming
+grant into a fixed-size array, `struct work_grant { struct shard_item
+items[GRANT_MAX_ITEMS]; ... }`, `GRANT_MAX_ITEMS = 64`
+(`agent/src/msgs.h`). Once that array is full, `dec_work_item` silently
+`shard_item_free`s any further item — **never calling `lease_add`, never
+queuing it** — and `dec_work_grant` still returns `true`: no error frame, no
+rejection, no log line that actually fires for this path (the
+`n_unsupported`/"skipped %zu unsupported work items" counter exists for a
+different, currently-dead code path — every work item kind the coordinator
+emits decodes successfully; this is a pure *count* overflow, not a
+kind-support one).
+
+The coordinator's `Scheduler.Grant` had no knowledge of this ceiling at
+all: `s.st.LeaseShards(agentID, fairShare(credits, counts.Queued, agents),
+...)` leased up to the agent's requested credit count with no upper bound
+beyond `fairShare`'s own cross-agent fairness cap — which does not apply to
+a single connected agent (`fairShare` returns `credits` unmodified whenever
+`agents < 2`). `maybe_request_work` (agent-side) sizes its credit request to
+`(workers + copy_threads) * 2` — 112 at the reported `-w 14 -C 42`. So a
+single busy agent, in steady state with a deep walk queue (exactly what a
+real convergence pass looks like), regularly requested more than 64 credits,
+the coordinator leased and granted all of them, and everything past the
+64th was **committed `LEASED` in the database and then silently discarded
+on arrival** — a lease with no corresponding `WorkItem` the agent would
+ever see, and therefore never added to `lease_add`'s table, never appearing
+in any heartbeat, on any host, exactly matching the trace. Nothing renews a
+lease the agent never knew it held; it simply sat until the sweeper's TTL
+expired it.
+
+This also resolves the "~32 combined thread count" threshold precisely: the
+credit request is `(workers+copy_threads) * 2`, so it first exceeds
+`GRANT_MAX_ITEMS` (64) exactly when `workers+copy_threads` exceeds 32 — not
+`spread_target_per_agent`'s coincidentally-identical default (§3.6, already
+ruled out directly), but `GRANT_MAX_ITEMS` divided by the agent's own
+credit-request multiplier. The noisy, non-monotonic `-w 34` "8/8 failed"
+vs. `-w 35` "5/10 clean" split fits too: whether any *particular* grant
+actually exceeds 64 items depends on how deep the queue is and how many
+credits are outstanding at that exact moment, not on `-w` alone — a
+borderline thread count is right at the edge of "does this request's
+`fairShare`-uncapped size land above or below 64 this time," which is
+sensitive to timing, not a hard wall.
+
+**Fix:** `Scheduler.Grant` now caps the lease request at `grantMaxItems`
+(=64, `coordinator/internal/scheduler/scheduler.go`, documented as
+mirroring the agent's fixed buffer) in addition to `fairShare`'s existing
+cap — `min(fairShare(credits, counts.Queued, agents), grantMaxItems)` — so
+the coordinator can never lease more than one `WorkGrant` can carry, on any
+fleet size. Shards beyond the cap simply stay `QUEUED` for the agent's next
+`WorkRequest`, which credit-based pull already handles correctly (this is
+exactly the same "ask again when idle" pattern that already governs normal
+credit exhaustion). No protocol change, no agent rebuild required — the fix
+is entirely coordinator-side.
+
+A structurally identical, smaller-blast-radius gap exists for
+`WorkGrant.options` (`GRANT_MAX_OPTIONS = 8`, keyed per distinct job in one
+grant batch, not per item) — left unaddressed here since it would need 9+
+concurrent uncached jobs granted to one agent in a single batch to trigger,
+far outside anything reported, but worth remembering if a future symptom
+looks similar and involves many concurrently-running jobs on one fleet.
+
+Unit tested (`coordinator/internal/scheduler/grant_test.go`):
+`TestGrantNeverExceedsAgentReceiveBuffer` reproduces the exact fleet
+scenario (112 requested credits, a queue far deeper than the cap, a single
+agent so `fairShare` does not itself bind) and asserts the grant never
+exceeds 64 items, that leased-but-ungranted shards is impossible (LEASED
+count matches granted count exactly, nothing orphaned), and confirms the
+test fails without the fix (verified by hand: reverting the `min()` call
+reproduces a 112-item grant and a failing test). `TestGrantBelowCapIsUnaffected`
+pins that a request already under the cap is untouched.
 
 ## 4. Special Entry Types
 

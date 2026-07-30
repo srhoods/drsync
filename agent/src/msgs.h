@@ -216,6 +216,17 @@ struct shard_item {
 };
 void shard_item_free(struct shard_item *it);
 
+/* Coordinator-side invariant (coordinator/internal/scheduler/scheduler.go
+ * grantMaxItems): Grant() must never lease more shards than fit in one
+ * WorkGrant of GRANT_MAX_ITEMS, or the excess is leased (committed LEASED in
+ * the store) but silently dropped right here on decode — freed, never
+ * queued, no error, no rejection sent back — leaving a lease no agent ever
+ * knows it holds until the coordinator's TTL sweeper expires it. This was a
+ * real, shipped bug (docs/DESIGN-agent.md §3.7): a busy single agent
+ * requesting more than GRANT_MAX_ITEMS credits (workers+copy_threads > 32,
+ * since maybe_request_work asks for (workers+copy_threads)*2) hit this
+ * silently on every affected grant. If GRANT_MAX_ITEMS ever changes here,
+ * grantMaxItems must change with it. */
 #define GRANT_MAX_ITEMS   64
 #define GRANT_MAX_OPTIONS 8
 

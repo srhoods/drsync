@@ -71,11 +71,13 @@ static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to
  * renewal at once, expire together, and get requeued the instant contention
  * eased (a burst that looked like "expires, requeues, completes almost
  * instantly" but was never about which pool did the crawling — see
- * docs/DESIGN-agent.md §3.1-§3.6 for the full history — this thread alone
+ * docs/DESIGN-agent.md §3.1-§3.7 for the full history — this thread alone
  * was not sufficient either; see §3.3's priority mailbox (state.c
  * out_push_priority), §3.5's O(n) lease-table fix (also insufficient alone),
- * and §3.6 (current: every timing signal checks out, tracing by lease
- * identity next).
+ * and §3.7 for the actual root cause: WorkGrant exceeding the agent's fixed
+ * GRANT_MAX_ITEMS receive buffer (msgs.h/msgs.c), fixed coordinator-side in
+ * Scheduler.Grant — nothing in this file, keeping this section's history for
+ * context on what was and wasn't the cause.
  *
  * g_writer_stop_efd wakes the writer promptly on reconnect/shutdown (poll()
  * on the outbox alone would otherwise block indefinitely with nothing left

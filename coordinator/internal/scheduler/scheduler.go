@@ -24,6 +24,24 @@ import (
 // and normal budgets; both states are self-correcting.
 const countsTTL = 250 * time.Millisecond
 
+// grantMaxItems mirrors the agent's fixed-size receive buffer
+// (GRANT_MAX_ITEMS, agent/src/msgs.h — struct work_grant { struct shard_item
+// items[GRANT_MAX_ITEMS]; ... }). dec_work_grant silently drops (frees, never
+// calls lease_add, never queues) any WorkItem past the 64th in one frame,
+// and returns success regardless — no error, no rejection sent back. Before
+// this cap existed, Grant leased up to fairShare(credits, ...) shards with
+// no reference to this ceiling at all: an agent requesting more than 64
+// credits (workers+copy_threads > 32, since maybe_request_work sizes the
+// request to (workers+copy_threads)*2 — agent/src/main.c) got every shard
+// past the 64th leased and committed LEASED in the store, then silently
+// dropped on arrival. Nothing renews a lease the agent never knew it held,
+// so those rows just sat until the sweeper expired them — invisible to every
+// timing/lock diagnostic (the drop is a decode-time buffer-size mismatch,
+// not a timing problem), and explaining why an expired lease id was absent
+// from every agent's own heartbeat logs: lease_add was never called for it,
+// on any host. See docs/DESIGN-agent.md §3.7.
+const grantMaxItems = 64
+
 // spreadSplitThreshold is the per-shard dir_split_threshold used while fanning
 // out. It matches the agent's ENTRYLIST_BATCH (agent/src/walker.c) so that a
 // flat directory splits into whole entry-list shards rather than one shard plus
@@ -154,7 +172,12 @@ func fairShare(credits int, queued, agents int64) int {
 func (s *Scheduler) Grant(agentID string, req *drsyncpb.WorkRequest) (*drsyncpb.WorkGrant, error) {
 	credits := int(req.GetShardCredits()) + int(req.GetTaskCredits())
 	agents, counts := s.fleet()
-	rows, err := s.st.LeaseShards(agentID, fairShare(credits, counts.Queued, agents),
+	// Never lease more than one grant can carry (grantMaxItems) — leasing
+	// past that would commit rows LEASED that the agent's fixed-size receive
+	// buffer silently drops on arrival, orphaning them until the sweeper
+	// expires them. fairShare's own cap is about queue fairness across
+	// agents, not this wire-format ceiling, so both apply.
+	rows, err := s.st.LeaseShards(agentID, min(fairShare(credits, counts.Queued, agents), grantMaxItems),
 		s.LeaseTTL)
 	if err != nil {
 		return nil, err
