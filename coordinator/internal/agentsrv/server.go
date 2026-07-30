@@ -389,7 +389,11 @@ func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
 	// lease id be grepped back through every heartbeat that did or didn't
 	// list it — everything else checked out (timing, count, sequence all
 	// match end-to-end), so identity, not timing, is what's left to verify.
-	slog.Info("heartbeat received", "agent", ac.id, "seq", hb.Seq,
+	// Debug level: fires every heartbeat interval per connected agent, which
+	// at fleet scale is real journalctl volume for a line only needed while
+	// actively tracing a lease-identity issue — run with -log-level debug to
+	// see it (docs/DESIGN-agent.md §3.6).
+	slog.Debug("heartbeat received", "agent", ac.id, "seq", hb.Seq,
 		"held", len(hb.HeldLeaseIds), "held_ids", hb.HeldLeaseIds)
 
 	// Latest in-flight snapshot for the fleet view. Kept even when empty: for a

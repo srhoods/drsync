@@ -735,6 +735,36 @@ test fails without the fix (verified by hand: reverting the `min()` call
 reproduces a 112-item grant and a failing test). `TestGrantBelowCapIsUnaffected`
 pins that a request already under the cap is untouched.
 
+**Confirmed live: 4 jobs, ~15,000 grants, 0% requeue rate.** Investigation
+closed.
+
+### 3.8 Post-mortem: gating the diagnostic logging
+
+Every fix from §3.1 onward is being kept (see the branch summary for the full
+per-change rationale) — none of it was dead weight, even the steps that turned
+out not to be the cause. But three log lines added along the way fire on every
+heartbeat interval, forever, per agent: real `journalctl` volume for
+information only useful while actively tracing a lease-identity issue.
+
+- Agent `"heartbeat queued"` (`send_heartbeat`) and `"heartbeat sent"`
+  (`writer_send_one`, the routine case) are now gated behind a new `-v` flag
+  (`g_verbose_lease_trace`) — off by default. The `WARN` variants (queue-to-wire
+  latency exceeding threshold) are unconditional, since they only fire when
+  something is already wrong and are therefore cheap at steady state.
+- Coordinator `"heartbeat received"` (`onHeartbeat`) changed from `slog.Info`
+  to `slog.Debug` — silent at the default `-log-level info`, visible with
+  `-log-level debug` (an existing, already-wired flag; no new coordinator flag
+  needed).
+- `"control loop poll stall"`, `"dispatch took unusually long"`, `"store: long
+  wait for write lock"`, and `"heartbeat renewal did not match every held
+  lease"` all stay unconditional — every one only logs on an actual anomaly
+  (a real stall, a slow dispatch, real lock contention, a genuine renewal
+  mismatch), so their steady-state cost is already zero.
+
+Verified live: a fresh coordinator+agent pair produces zero heartbeat-related
+log lines with no flags set, and both lines reappear correctly with `-v`
+(agent) / `-log-level debug` (coordinator).
+
 ## 4. Special Entry Types
 
 | Type | Handling |

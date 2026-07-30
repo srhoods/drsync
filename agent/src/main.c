@@ -39,6 +39,16 @@ static struct agent_cfg cfg = { .workers = 4, .copy_threads = 8 };
 
 /* Adaptive cross-pool work-stealing: on by default, -S pins the pools. */
 bool g_steal_enabled = true;
+
+/* Lease-identity tracing (-v): logs every heartbeat's full queue-to-wire
+ * timing and held lease id list (send_heartbeat, writer_send_one). Off by
+ * default — at fleet scale this is real journalctl volume for a line only
+ * needed while actively chasing a lease-requeue-style issue
+ * (docs/DESIGN-agent.md §3.1-§3.7). Anomaly warnings (control loop poll
+ * stalls, high queue-to-wire latency) are unaffected by this flag and
+ * always log — they're cheap because they only fire when something is
+ * already wrong. */
+static bool g_verbose_lease_trace;
 atomic_ullong g_steal_shards; /* shards a copy thread crawled */
 atomic_ullong g_steal_copies; /* copies a walker drained */
 
@@ -130,15 +140,16 @@ static bool writer_send_one(struct outmsg *m, bool *failed)
             *failed = true;
             ok = false;
         } else if (m->type == FR_HEARTBEAT) {
-            /* Always logged (not just over-threshold): this is the direct
-             * queue-to-wire latency measurement for the frame the lease TTL
-             * depends on — with it we don't have to infer delay from Send-Q
-             * or requeue timing after the fact. */
-            LOGI("heartbeat sent: queued %lldms, write took %lldms",
-                 (long long)queue_ms, (long long)write_ms);
+            /* Unconditional part: this is the anomaly signal, cheap because
+             * it only logs when something is already wrong. The routine
+             * "sent on time" line below every heartbeat is opt-in (-v) —
+             * see g_verbose_lease_trace's comment. */
             if (queue_ms + write_ms > HB_LATENCY_WARN_MS)
                 LOGW("heartbeat queue-to-wire latency %lldms exceeds %dms",
                      (long long)(queue_ms + write_ms), HB_LATENCY_WARN_MS);
+            if (g_verbose_lease_trace)
+                LOGI("heartbeat sent: queued %lldms, write took %lldms",
+                     (long long)queue_ms, (long long)write_ms);
         } else if (queue_ms + write_ms > FRAME_LATENCY_WARN_MS) {
             /* Any other frame type that took unusually long: candidate for
              * "this is what was blocking the priority slot from being
@@ -497,19 +508,20 @@ static int send_heartbeat(void)
     enc_heartbeat(&b, ++g_hb_seq, held, n, (uint32_t)wq_depth(),
                   (uint32_t)cp_depth(), read_rss(), inflight, n_inflight);
     /* Diagnostic for the lease-requeue investigation (docs/DESIGN-agent.md
-     * §3.4/§3.6): the queue-time seq, correlated by seq against the
-     * coordinator's "heartbeat received" log line for the same agent, and by
-     * timing against this thread's own next "heartbeat sent" line
-     * (writer_send_one) to see whether a gap opens on the send side (control
-     * thread not calling send_heartbeat often enough) vs. the wire/receive
-     * side (queued promptly but delayed reaching or being processed by the
-     * coordinator). The full id list (not just the count) lets one specific
-     * expired lease be grepped back through every heartbeat that did or
-     * didn't include it — everything timing-related already checked out, so
-     * identity is what's left to verify. */
-    static char ids[900]; /* control thread only; static keeps this off the stack */
-    fmt_lease_ids(ids, sizeof ids, held, n);
-    LOGI("heartbeat queued: seq=%llu held=%zu ids=[%s]", (unsigned long long)g_hb_seq, n, ids);
+     * §3.1-§3.7, resolved — kept behind -v since a related issue could
+     * recur): the queue-time seq, correlated by seq against the
+     * coordinator's "heartbeat received" debug line for the same agent, and
+     * by timing against this thread's own next "heartbeat sent" line
+     * (writer_send_one). The full id list (not just the count) lets one
+     * specific expired lease be grepped back through every heartbeat that
+     * did or didn't include it. Off by default: fires every heartbeat
+     * interval forever, which at fleet scale is real journalctl volume for
+     * a line only useful while actively tracing an identity issue. */
+    if (g_verbose_lease_trace) {
+        static char ids[900]; /* control thread only; static keeps this off the stack */
+        fmt_lease_ids(ids, sizeof ids, held, n);
+        LOGI("heartbeat queued: seq=%llu held=%zu ids=[%s]", (unsigned long long)g_hb_seq, n, ids);
+    }
     return queue_pb_priority(FR_HEARTBEAT, &b);
 }
 
@@ -747,7 +759,7 @@ int main(int argc, char **argv)
     default_agent_id(cfg.agent_id, sizeof cfg.agent_id);
 
     int opt;
-    while ((opt = getopt(argc, argv, "c:i:w:C:USA:E:K:h")) != -1) {
+    while ((opt = getopt(argc, argv, "c:i:w:C:USvA:E:K:h")) != -1) {
         switch (opt) {
         case 'c':
             snprintf(cfg.coordinator, sizeof cfg.coordinator, "%s", optarg);
@@ -784,11 +796,15 @@ int main(int argc, char **argv)
         case 'S':
             g_steal_enabled = false; /* pin the walker/copy pools to fixed sizes */
             break;
+        case 'v':
+            g_verbose_lease_trace = true; /* log every heartbeat's timing + held lease ids */
+            break;
         default:
             fprintf(stderr,
                     "usage: drsync-agent [-c host:port] [-i agent-id] [-w walkers]"
                     " [-C copy-threads] [-U(no io_uring)] [-S(no work-stealing)]\n"
-                    "                    [-A ca.crt -E agent.crt -K agent.key (mTLS)]\n");
+                    "                    [-v(verbose lease tracing)]"
+                    " [-A ca.crt -E agent.crt -K agent.key (mTLS)]\n");
             return 2;
         }
     }
