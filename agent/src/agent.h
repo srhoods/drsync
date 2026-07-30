@@ -60,10 +60,14 @@ int  wq_drop_job(uint64_t job_id, void (*dispose)(struct shard_item *it));
 /* ---- outbox (workers/control → socket, written by control thread) ---- */
 extern int g_outbox_eventfd;
 struct outmsg {
-    uint16_t       type;
-    uint8_t       *buf;
-    size_t         len;
-    struct outmsg *next;
+    uint16_t        type;
+    uint8_t        *buf;
+    size_t          len;
+    struct timespec queued_at; /* CLOCK_MONOTONIC, set by out_push/out_push_priority;
+                                 * lets the writer thread log queue-to-wire latency —
+                                 * diagnostic for the lease-requeue investigation
+                                 * (docs/DESIGN-agent.md §3.3/§3.4). */
+    struct outmsg  *next;
 };
 /* Steals b's buffer; b is reset. */
 void out_push(uint16_t type, pb_buf *b);

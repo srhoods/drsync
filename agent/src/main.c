@@ -71,9 +71,9 @@ static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to
  * renewal at once, expire together, and get requeued the instant contention
  * eased (a burst that looked like "expires, requeues, completes almost
  * instantly" but was never about which pool did the crawling — see
- * docs/DESIGN-agent.md §3.1-§3.3 for the full history — this thread alone
+ * docs/DESIGN-agent.md §3.1-§3.4 for the full history — this thread alone
  * was not sufficient either; see §3.3's priority mailbox (state.c
- * out_push_priority) for why).
+ * out_push_priority) and §3.4's open follow-up for why).
  *
  * g_writer_stop_efd wakes the writer promptly on reconnect/shutdown (poll()
  * on the outbox alone would otherwise block indefinitely with nothing left
@@ -90,19 +90,58 @@ static bool g_writer_running;
  * further writes for the rest of the current pass (the control thread is
  * about to tear the connection down) but keep draining and freeing whatever
  * is left, so nothing is leaked. */
+/* Milliseconds from t0 to now (CLOCK_MONOTONIC). */
+static int64_t ms_elapsed(const struct timespec *t0)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)(now.tv_sec - t0->tv_sec) * 1000 +
+           (now.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+/* Diagnostic thresholds for the lease-requeue investigation (queue-to-wire
+ * latency shouldn't approach these under healthy conditions: the lease TTL
+ * is typically 30s and the heartbeat interval 5s). Logged, not acted on —
+ * this is purely to find out where the time goes when a requeue burst
+ * happens. Safe to remove once the investigation concludes either way. */
+#define HB_LATENCY_WARN_MS   2000
+#define FRAME_LATENCY_WARN_MS 5000
+
 static bool writer_send_one(struct outmsg *m, bool *failed)
 {
     bool ok = true;
+    int64_t queue_ms = ms_elapsed(&m->queued_at); /* time this frame sat queued before this write started */
     if (!*failed) {
         /* A frame lost to a mid-write drop is re-derived after the shard's
          * lease expires and it is redone (at-least-once). */
-        if (wire_write(&g_conn, m->type, m->buf, m->len) < 0) {
+        struct timespec write_start;
+        clock_gettime(CLOCK_MONOTONIC, &write_start);
+        int wrc = wire_write(&g_conn, m->type, m->buf, m->len);
+        int64_t write_ms = ms_elapsed(&write_start); /* time the write() call itself took */
+        if (wrc < 0) {
             LOGW("frame write failed (%s); reconnecting", strerror(errno));
             uint64_t one = 1;
             if (write(g_writer_err_efd, &one, sizeof one) < 0 && errno != EAGAIN)
                 LOGE("writer error eventfd write: %s", strerror(errno));
             *failed = true;
             ok = false;
+        } else if (m->type == FR_HEARTBEAT) {
+            /* Always logged (not just over-threshold): this is the direct
+             * queue-to-wire latency measurement for the frame the lease TTL
+             * depends on — with it we don't have to infer delay from Send-Q
+             * or requeue timing after the fact. */
+            LOGI("heartbeat sent: queued %lldms, write took %lldms",
+                 (long long)queue_ms, (long long)write_ms);
+            if (queue_ms + write_ms > HB_LATENCY_WARN_MS)
+                LOGW("heartbeat queue-to-wire latency %lldms exceeds %dms",
+                     (long long)(queue_ms + write_ms), HB_LATENCY_WARN_MS);
+        } else if (queue_ms + write_ms > FRAME_LATENCY_WARN_MS) {
+            /* Any other frame type that took unusually long: candidate for
+             * "this is what was blocking the priority slot from being
+             * rechecked promptly" — len tells us if it was a large journal
+             * batch specifically. */
+            LOGW("frame type=%u len=%zu queue-to-wire latency %lldms exceeds %dms",
+                 m->type, m->len, (long long)(queue_ms + write_ms), FRAME_LATENCY_WARN_MS);
         }
     }
     free(m->buf);
@@ -433,6 +472,14 @@ static int send_heartbeat(void)
     pb_init(&b);
     enc_heartbeat(&b, ++g_hb_seq, held, n, (uint32_t)wq_depth(),
                   (uint32_t)cp_depth(), read_rss(), inflight, n_inflight);
+    /* Diagnostic for the lease-requeue investigation (docs/DESIGN-agent.md
+     * §3.4): the queue-time seq, correlated by seq against the coordinator's
+     * "heartbeat received" log line for the same agent, and by timing
+     * against this thread's own next "heartbeat sent" line (writer_send_one)
+     * to see whether a gap opens on the send side (control thread not
+     * calling send_heartbeat often enough) vs. the wire/receive side (queued
+     * promptly but delayed reaching or being processed by the coordinator). */
+    LOGI("heartbeat queued: seq=%llu held=%zu", (unsigned long long)g_hb_seq, n);
     return queue_pb_priority(FR_HEARTBEAT, &b);
 }
 
@@ -827,13 +874,36 @@ int main(int argc, char **argv)
                     g_want_exit = true;
                     break;
                 }
-                tick++;
+                /* expiries is how many 1 Hz intervals actually elapsed since
+                 * this fd was last read, which can be > 1 if the control
+                 * thread was busy elsewhere (e.g. draining a burst of
+                 * incoming frames) for more than a second. The old code did a
+                 * flat tick++ regardless — under-advancing tick relative to
+                 * real wall-clock time, which could silently stretch the
+                 * *effective* heartbeat interval past what tick % hb_interval
+                 * appeared to show. Diagnostic for the ~30s-later lease
+                 * expiries observed on a live fleet at -w 14 -C 42: a
+                 * multi-second poll stall here is exactly the kind of gap
+                 * that would produce it, and unlike Send-Q pulsing (a
+                 * symptom on the wire) this is direct evidence of where the
+                 * time actually went, if it went here. */
+                if (expiries > 1)
+                    LOGW("control loop poll stall: %llu timer intervals elapsed "
+                         "since last checked (missed ~%llus)",
+                         (unsigned long long)expiries, (unsigned long long)(expiries - 1));
+                uint64_t prev_tick = tick;
+                tick += expiries;
                 /* send_stats/send_heartbeat only queue now (queue_pb): a
                  * failure here means out-of-memory encoding the frame, not a
                  * socket problem — an actual send failure is reported
                  * asynchronously by the writer thread via pfds[2] below. */
                 send_stats();
-                if (tick % g_hb_interval_s == 0)
+                /* Crossed a heartbeat boundary since we last checked (whether
+                 * by one tick or several caught up at once) — send exactly
+                 * one heartbeat either way; the state it reports is current,
+                 * not historical, so there is nothing to catch up on beyond
+                 * making sure at least one goes out. */
+                if (tick / g_hb_interval_s != prev_tick / g_hb_interval_s)
                     send_heartbeat();
                 maybe_request_work(true);
             }

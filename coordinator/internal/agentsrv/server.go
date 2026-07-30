@@ -293,7 +293,22 @@ func (s *Server) handle(conn net.Conn) {
 			}
 			return
 		}
-		if err := s.dispatch(ac, ft, payload); err != nil {
+		// Diagnostic for the lease-requeue investigation (docs/DESIGN-agent.md
+		// §3.4): this read loop is single-threaded per agent, and several
+		// dispatch paths (onWorkRequest -> Scheduler.Grant -> store.LeaseShards)
+		// take the coordinator's single store-write mutex. If that mutex is
+		// contended across a large fleet, dispatch for one frame can stall long
+		// enough to delay reading the *next* frame from this same agent —
+		// including its next heartbeat — regardless of anything the agent does.
+		// dispatchWarnThreshold is generous: this must never fire under healthy
+		// load, only when hunting the requeue cause.
+		start := time.Now()
+		err = s.dispatch(ac, ft, payload)
+		if d := time.Since(start); d > dispatchWarnThreshold {
+			slog.Warn("dispatch took unusually long; may have delayed this agent's next read",
+				"agent", ac.id, "frame", ft, "duration_ms", d.Milliseconds())
+		}
+		if err != nil {
 			slog.Error("dispatch failed; closing session", "agent", ac.id, "frame", ft, "err", err)
 			ac.send(drsyncpb.FrameType_FRAME_ERROR,
 				&drsyncpb.ProtocolError{Code: 1, Message: err.Error()})
@@ -301,6 +316,10 @@ func (s *Server) handle(conn net.Conn) {
 		}
 	}
 }
+
+// dispatchWarnThreshold is logged, not acted on: diagnostic-only for the
+// lease-requeue investigation. Safe to remove once it concludes either way.
+const dispatchWarnThreshold = 500 * time.Millisecond
 
 func (s *Server) dispatch(ac *agentConn, ft drsyncpb.FrameType, payload []byte) error {
 	switch ft {
@@ -357,6 +376,16 @@ func (s *Server) dispatch(ac *agentConn, ft drsyncpb.FrameType, payload []byte) 
 }
 
 func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
+	// Diagnostic for the lease-requeue investigation (docs/DESIGN-agent.md
+	// §3.4): the receive-side timestamp + seq, to correlate against the
+	// agent's own "heartbeat sent" log line (same seq) and see whether a gap
+	// opens up between agent-send and coordinator-receive/process time, vs.
+	// heartbeats simply not being sent often enough. Clocks need not be
+	// synced for this — what matters is the *interval* between consecutive
+	// onHeartbeat log lines for one agent, same as the agent-side interval
+	// between its own "heartbeat sent" lines.
+	slog.Info("heartbeat received", "agent", ac.id, "seq", hb.Seq, "held", len(hb.HeldLeaseIds))
+
 	// Latest in-flight snapshot for the fleet view. Kept even when empty: for a
 	// minor >= MinorInflight agent, empty genuinely means "holding nothing".
 	ac.ifMu.Lock()

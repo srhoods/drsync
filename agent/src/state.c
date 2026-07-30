@@ -244,6 +244,7 @@ void out_push(uint16_t type, pb_buf *b)
     m->type = type;
     m->buf = b->p;
     m->len = b->len;
+    clock_gettime(CLOCK_MONOTONIC, &m->queued_at);
     pb_init(b); /* stolen */
     pthread_mutex_lock(&ob_mu);
     if (ob_tail)
@@ -278,6 +279,7 @@ void out_push_priority(uint16_t type, pb_buf *b)
     m->type = type;
     m->buf = b->p;
     m->len = b->len;
+    clock_gettime(CLOCK_MONOTONIC, &m->queued_at);
     pb_init(b); /* stolen */
     pthread_mutex_lock(&pri_mu);
     struct outmsg *old = pri_msg; /* superseded snapshot, if the writer hasn't sent it yet */

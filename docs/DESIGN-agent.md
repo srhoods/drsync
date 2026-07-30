@@ -422,20 +422,76 @@ not just once per wakeup, since a single `out_drain()` call can return hundreds 
 queued messages and checking only at the top would let a heartbeat queued mid-batch
 wait behind the rest of that same batch, reproducing the same delay one level down.
 
-**What this does and does not fix.** This guarantees a heartbeat is never delayed by
-*agent-side* queued traffic ahead of it — at most one in-flight `wire_write` (the
-message the writer happened to already be sending) stands between a heartbeat being
-queued and it reaching the wire. It does **not** address a coordinator that is slow
-to read at all: the coordinator's per-agent connection is handled by one goroutine
-running a plain `for { ReadFrame → dispatch → loop }` (agentsrv/server.go), and
-several `dispatch` paths — notably `onWorkRequest` → `Scheduler.Grant` →
-`store.LeaseShards` — take the coordinator's single store-write mutex
-(DESIGN-coordinator.md §3, "the store is the hot path"). If that mutex is heavily
-contended across a large fleet, a coordinator's `ReadFrame` loop for *any one* agent
-can stall behind another agent's slow dispatch, and no amount of agent-side send
-ordering fixes a receiver that temporarily isn't calling `read()` on the socket at
-all. This is the next thing to instrument and rule in or out if §3.3 does not fully
-resolve the reported rate.
+**Result on the reporting fleet (`-w 14 -C 42`): a large improvement, not full
+resolution.** Requeue rate 8.5% → 1.68%; peak Send-Q 1657 bytes → low 300s. A
+second-order pattern remains: Send-Q pulses into the hundreds, and a requeue fires
+roughly one lease TTL (~30s) later. §3.4 hypothesizes why and adds the
+instrumentation to confirm it.
+
+### 3.4 Open: residual requeues after the priority mailbox (under investigation)
+
+The ~30s gap between a Send-Q pulse and the resulting requeue is too close to the
+lease TTL to be coincidental — a *single* delayed heartbeat wouldn't cause an
+expiry (the coordinator resets `lease_expiry` on every renewal, so one late
+heartbeat just renews a bit late and the clock resets again); an actual expiry
+needs a sustained window with **no** renewal reaching the coordinator for that
+lease, roughly the length of the TTL itself. Two candidate mechanisms, not yet
+distinguished:
+
+- **Agent-side, within one `wire_write`.** §3.3's priority check runs *between*
+  messages, not within one — if the writer thread is mid-way through a single large
+  in-flight write when a heartbeat is queued, the heartbeat waits for that one write
+  to finish regardless of priority. Journal batches flush at ~1 MiB uncompressed
+  (`jrn.c` `JRN_FLUSH_RAW`) and `WIRE_MAX_FRAME` allows up to 16 MiB — a large
+  enough single frame, on a sufficiently contended link, could plausibly take
+  long enough to matter, though it would need to be unusually large or the link
+  unusually slow to approach a meaningful fraction of 30s.
+- **Coordinator-side.** The per-agent read loop is single-threaded
+  (`for { ReadFrame → dispatch → loop }`, agentsrv/server.go); `onWorkRequest` →
+  `Scheduler.Grant` → `store.LeaseShards` takes the coordinator's single
+  store-write mutex (DESIGN-coordinator.md §3, "the store is the hot path"). If
+  that mutex is contended across a large fleet, one agent's `dispatch` call — and
+  therefore its next `ReadFrame`, heartbeat included — can stall independent of
+  anything the agent does.
+
+Also fixed alongside this (a genuine bug found on re-reading, independent of either
+hypothesis above): the control loop's 1 Hz `timerfd` read returns an `expiries`
+count — how many 1-second intervals actually elapsed since last read, which can be
+`> 1` if the loop was busy elsewhere — but the code did a flat `tick++` regardless
+of that count, silently under-advancing the heartbeat schedule relative to real
+wall-clock time if the loop was ever stalled for more than a second. Now advances
+`tick` by the real `expiries` and logs a warning whenever `expiries > 1`, which is
+itself direct evidence of a control-loop stall if it fires.
+
+**Diagnostics added** (both sides log at a rate that's fine to run in production
+short-term, but noisy over a long window — safe to remove once this concludes):
+
+- Agent, `send_heartbeat`: `"heartbeat queued: seq=N held=M"` at the moment a
+  heartbeat is handed to the priority mailbox.
+- Agent, `writer_send_one`: `"heartbeat sent: queued Xms, write took Yms"` — the
+  actual queue-to-wire latency, logged for every heartbeat (not just outliers), plus
+  a `WARN` if it exceeds 2s. Any *other* frame type is logged only if its own
+  queue-to-wire latency exceeds 5s (`"frame type=T len=N ... exceeds ..."`) — a
+  candidate for "this is what blocked the priority slot from being rechecked".
+- Agent, control loop: `"control loop poll stall: N timer intervals elapsed"`
+  whenever the fixed `tick++` bug above would have mattered (`expiries > 1`).
+- Coordinator, `onHeartbeat`: `"heartbeat received" agent=... seq=... held=...` —
+  correlates by `seq` against the agent's "heartbeat queued" line for the same
+  agent, and by interval against the agent's own "heartbeat sent" cadence.
+- Coordinator, the per-agent read loop: `"dispatch took unusually long"` whenever
+  one `dispatch` call exceeds 500ms — direct evidence for or against the
+  store-mutex-contention hypothesis, independent of Send-Q (which only reflects
+  the agent's *send* side, not what the coordinator was doing).
+
+Reading the logs together for one agent around a requeue event should show which
+mechanism (if either) is real: a gap between "heartbeat queued" and "heartbeat
+sent" points at the agent-side in-flight-write hypothesis; "heartbeat sent" firing
+roughly on schedule but the matching "heartbeat received" arriving late or a
+"dispatch took unusually long" warning around the same window points at the
+coordinator side instead; and if the agent-side logs show heartbeats queued and
+sent every 5s exactly on schedule with none of the above firing, both hypotheses
+are wrong and the gap is somewhere not yet instrumented (network path itself, most
+likely — worth a packet capture at that point rather than more application logging).
 
 ## 4. Special Entry Types
 
