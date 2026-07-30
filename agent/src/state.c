@@ -9,8 +9,13 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
+
+/* GPFS's f_type from statfs(2) (linux/magic.h GPFS_SUPER_MAGIC); same
+ * constant tools/fsprobe/fsprobe.c reports as "gpfs". */
+#define GPFS_SUPER_MAGIC 0x47504653
 
 /* ---- logging ---- */
 void log_line(const char *level, const char *fmt, ...)
@@ -632,14 +637,32 @@ int opts_store(const struct job_options *o)
         LOGE("open dst root %s: %s", o->dst_root, strerror(errno));
         return -1;
     }
+    /* The io_uring copy engine's WRITE_FIXED silently ignores the submitted
+     * length on GPFS, flushing the whole 1 MiB registered buffer regardless
+     * of file size (ucopy.c); disable it for this job up front rather than
+     * let every file discover the bad write, log a warning, and redo
+     * serially (copy.c's size-mismatch fallback). Checked on whichever root
+     * is the copy destination for real jobs; both roots for dry-run, where
+     * dst_fd is never opened. */
+    struct statfs sfs;
+    bool gpfs = false;
+    if (dfd >= 0 && fstatfs(dfd, &sfs) == 0 && sfs.f_type == GPFS_SUPER_MAGIC)
+        gpfs = true;
+    if (!gpfs && fstatfs(sfd, &sfs) == 0 && sfs.f_type == GPFS_SUPER_MAGIC)
+        gpfs = true;
+
     opts_tab[slot].o = *o;
     opts_tab[slot].src_fd = sfd;
     opts_tab[slot].dst_fd = dfd;
+    opts_tab[slot].no_uring_copy = gpfs;
     if (slot == n_opts)
         n_opts++;
     pthread_mutex_unlock(&opts_mu);
     LOGI("job %llu (%s): %s -> %s%s", (unsigned long long)o->job_id, o->job_name,
          o->src_root, o->dst_root, o->dry_run ? " [dry-run]" : "");
+    if (gpfs)
+        LOGI("job %llu: GPFS detected, io_uring copy engine disabled for this job",
+             (unsigned long long)o->job_id);
     return 0;
 }
 

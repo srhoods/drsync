@@ -765,6 +765,55 @@ Verified live: a fresh coordinator+agent pair produces zero heartbeat-related
 log lines with no flags set, and both lines reappear correctly with `-v`
 (agent) / `-log-level debug` (coordinator).
 
+**Follow-up:** the `-v` `"heartbeat queued"` line printed bare lease ids
+(`ids=[1234,5678,...]`), with no job/shard attribution. A held lease can
+legitimately outlive a job long enough to look alarming — a slow verify or
+DIRFIX shard, or a probe pinned at pass start — and a bare id gives an
+operator nothing to check it against without grepping the coordinator's own
+logs by id first. `fmt_lease_ids` (`main.c`) now looks each id up in the same
+`inflight` view `send_heartbeat` already builds for the wire payload
+(`lease_inflight`, capped at `HB_INFLIGHT_MAX`) and prints
+`lease_id/job=job_id` (`job=?` if the id fell outside that cap). A job that's
+actually still running now reads as unremarkable at a glance; a bare `job=?`
+or one job id repeating well past when it should have finished is the actual
+signal to chase, without needing a second log source to tell the two apart.
+
+### 3.9 GPFS: io_uring copy engine disabled per-job
+
+GPFS's `WRITE_FIXED` silently ignores the submitted length and flushes the
+whole 1 MiB registered buffer regardless of the actual write size
+(`ucopy_disable`'s comment in `ucopy.c`; `tools/fsprobe` independently
+reproduces the metadata-path cost this filesystem imposes). The io_uring
+self-test at
+startup (`uring_probe`) only exercises `READ_FIXED` against a memfd, so it
+never observes this — the only place the bug was visible was per-file, via
+the destination-size mismatch check in `copy_file_task` (`copy.c`): every
+small file on a GPFS destination wrote the wrong length, got caught, logged a
+`WARN`, and was redone with the serial byte copy before the engine finally
+disabled itself for that thread. Correct, but noisy (one bad write + one
+`WARN` per thread's first file) and wasteful (a full 1 MiB write and readback
+thrown away every time).
+
+`opts_store` (`state.c`) now `fstatfs`s the job's destination root fd (and
+source, for `dry_run` jobs that never open a destination) at the same point
+it already opens both roots — before any shard for the job is walked — and
+sets `no_uring_copy` on the job's `opts_entry` (`agent.h`) when either side's
+`f_type` is `GPFS_SUPER_MAGIC` (`0x47504653`, the same constant
+`tools/fsprobe/fsprobe.c` reports as `"gpfs"`). `copy_file_task`'s engine
+selection checks this flag before `ucopy_available()`, so a GPFS job never
+attempts the io_uring path at all — it goes straight to the serial copy,
+which is always correct. This is per-job, not global: `g_uring_enabled`
+(statx batching, a separate ring with a different bug surface) is untouched,
+and a non-GPFS job sharing the same agent process is unaffected. The
+destination-size mismatch check in `copy_file_task` stays as a safety net for
+any other filesystem sharing GPFS's `WRITE_FIXED` behavior that `fstatfs`
+doesn't identify.
+
+Unit tested (`agent/test/opts_test.c`): `no_uring_copy` defaults false on an
+ordinary filesystem (no GPFS mount in CI to exercise the true-positive path)
+and survives a tunables-only options update untouched, proving the flag lives
+outside the embedded `job_options` struct that update path overwrites.
+
 ## 4. Special Entry Types
 
 | Type | Handling |

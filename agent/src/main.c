@@ -477,16 +477,41 @@ static void maybe_request_work(bool from_timer)
  * has gone badly wrong — and the renewal list (held) is never truncated. */
 #define HB_INFLIGHT_MAX 256
 
-/* Formats held[0..n) as a comma-separated list into buf, truncating with a
- * trailing "...(N more)" if it would overflow — never silently cuts an id in
- * half (that would look like a logging bug, not a truncation marker) and
- * never overflows buf. Diagnostic-only formatting; see send_heartbeat. */
-static void fmt_lease_ids(char *buf, size_t cap, const uint64_t *held, size_t n)
+/* held[i]'s job_id, looked up from the inflight view (which caps at
+ * HB_INFLIGHT_MAX and so may not cover every id in a larger held[]); 0 means
+ * "not found in this slice", printed as job=? rather than a misleading 0. */
+static uint64_t job_of(const struct inflight_view *inflight, size_t n_inflight,
+                       uint64_t lease_id)
+{
+    for (size_t i = 0; i < n_inflight; i++)
+        if (inflight[i].lease_id == lease_id)
+            return inflight[i].job_id;
+    return 0;
+}
+
+/* Formats held[0..n) as a comma-separated "lease_id/job=job_id" list (job=?
+ * when the id fell outside the inflight slice) into buf, truncating with a
+ * trailing "...(N more)" if it would overflow — never silently cuts an entry
+ * in half (that would look like a logging bug, not a truncation marker) and
+ * never overflows buf. The job attribution is what lets a lease id in this
+ * line be told apart, at a glance, from stale/leaked state: a live job still
+ * running looks unremarkable, while every id showing job=? or one job
+ * repeated long after that job should have finished is the actual signal.
+ * Diagnostic-only formatting; see send_heartbeat. */
+static void fmt_lease_ids(char *buf, size_t cap, const uint64_t *held, size_t n,
+                          const struct inflight_view *inflight, size_t n_inflight)
 {
     size_t off = 0;
     for (size_t i = 0; i < n; i++) {
-        char one[24];
-        int len = snprintf(one, sizeof one, "%s%llu", i ? "," : "", (unsigned long long)held[i]);
+        uint64_t job = job_of(inflight, n_inflight, held[i]);
+        char one[48];
+        int len;
+        if (job)
+            len = snprintf(one, sizeof one, "%s%llu/job=%llu", i ? "," : "",
+                           (unsigned long long)held[i], (unsigned long long)job);
+        else
+            len = snprintf(one, sizeof one, "%s%llu/job=?", i ? "," : "",
+                           (unsigned long long)held[i]);
         if (off + (size_t)len + 24 >= cap) { /* leave room for the "...(N more)" marker */
             snprintf(buf + off, cap - off, ",...(%zu more)", n - i);
             return;
@@ -518,8 +543,8 @@ static int send_heartbeat(void)
      * interval forever, which at fleet scale is real journalctl volume for
      * a line only useful while actively tracing an identity issue. */
     if (g_verbose_lease_trace) {
-        static char ids[900]; /* control thread only; static keeps this off the stack */
-        fmt_lease_ids(ids, sizeof ids, held, n);
+        static char ids[1400]; /* control thread only; static keeps this off the stack */
+        fmt_lease_ids(ids, sizeof ids, held, n, inflight, n_inflight);
         LOGI("heartbeat queued: seq=%llu held=%zu ids=[%s]", (unsigned long long)g_hb_seq, n, ids);
     }
     return queue_pb_priority(FR_HEARTBEAT, &b);
