@@ -448,22 +448,46 @@ distinguished:
   unusually slow to approach a meaningful fraction of 30s.
 - **Coordinator-side.** The per-agent read loop is single-threaded
   (`for { ReadFrame → dispatch → loop }`, agentsrv/server.go); `onWorkRequest` →
-  `Scheduler.Grant` → `store.LeaseShards` takes the coordinator's single
-  store-write mutex (DESIGN-coordinator.md §3, "the store is the hot path"). If
-  that mutex is contended across a large fleet, one agent's `dispatch` call — and
-  therefore its next `ReadFrame`, heartbeat included — can stall independent of
-  anything the agent does.
+  `Scheduler.Grant` → `store.LeaseShards`, and several other dispatch paths, take
+  the coordinator's single store-write mutex (`store.Store.mu`,
+  DESIGN-coordinator.md §3, "the store is the hot path"). If that mutex is held
+  by something else for long enough, one agent's `dispatch` call — and therefore
+  its next `ReadFrame`, heartbeat included — can stall.
 
-Also fixed alongside this (a genuine bug found on re-reading, independent of either
-hypothesis above): the control loop's 1 Hz `timerfd` read returns an `expiries`
-count — how many 1-second intervals actually elapsed since last read, which can be
-`> 1` if the loop was busy elsewhere — but the code did a flat `tick++` regardless
-of that count, silently under-advancing the heartbeat schedule relative to real
-wall-clock time if the loop was ever stalled for more than a second. Now advances
-`tick` by the real `expiries` and logs a warning whenever `expiries > 1`, which is
-itself direct evidence of a control-loop stall if it fires.
+**Update: reproduced on a single active agent (the other three disabled), same
+`-w`/`-C` thread counts that reproduced it fleet-wide.** This rules out
+cross-agent contention specifically — with only one agent connected, no other
+agent's `WorkRequest`/`ShardResult`/`JournalBatch` traffic is competing for
+`store.Store.mu`. It does **not** rule out the mutex itself: the lock is
+process-wide, so a single agent's own dispatch still contends with the
+coordinator's *internal* background jobs that also write state and share the
+same lock — the lease sweeper (`ExpireLeases`, `scheduler.RunSweeper`), the
+Shard Reaper (`ReapDoneShards`), the passctrl pass-phase advance, and the
+journal flusher. Any of these holding the lock briefly, at the moment this one
+agent's dispatch needs it, reproduces the same stall with zero other agents
+involved. A separate thread-count experiment on the same fleet also narrowed
+things usefully: 14 workers / 14 copy threads (28 total) stayed clean; 24/24
+(48 total) started showing requeues; 14/42 (56 total, the original report)
+showed 1.68%. The common factor is **this one agent's own total thread count**,
+not the walker:copy split (both 14/14 and 24/24 are 1:1) and not fleet size
+(reproduced with only one agent active) — consistent with total output rate
+from one connection being the actual independent variable, which is equally
+consistent with either the agent-side or coordinator-side hypothesis above (more
+producer threads means more frames per second either straining a single
+`wire_write`'s queue position or arriving at the coordinator fast enough to
+matter if something else is holding its lock).
 
-**Diagnostics added** (both sides log at a rate that's fine to run in production
+Also fixed alongside this (a genuine bug found on re-reading, independent of
+either hypothesis above): the control loop's 1 Hz `timerfd` read returns an
+`expiries` count — how many 1-second intervals actually elapsed since last
+read, which can be `> 1` if the loop was busy elsewhere — but the code did a
+flat `tick++` regardless of that count, silently under-advancing the heartbeat
+schedule relative to real wall-clock time if the loop was ever stalled for
+more than a second. Now advances `tick` by the real `expiries` and logs a
+warning whenever `expiries > 1`, which is itself direct evidence of a
+control-loop stall if it fires.
+
+**Diagnostics added** (log at a rate that's fine to run in production
 short-term, but noisy over a long window — safe to remove once this concludes):
 
 - Agent, `send_heartbeat`: `"heartbeat queued: seq=N held=M"` at the moment a
@@ -479,19 +503,31 @@ short-term, but noisy over a long window — safe to remove once this concludes)
   correlates by `seq` against the agent's "heartbeat queued" line for the same
   agent, and by interval against the agent's own "heartbeat sent" cadence.
 - Coordinator, the per-agent read loop: `"dispatch took unusually long"` whenever
-  one `dispatch` call exceeds 500ms — direct evidence for or against the
-  store-mutex-contention hypothesis, independent of Send-Q (which only reflects
-  the agent's *send* side, not what the coordinator was doing).
+  one `dispatch` call exceeds 500ms — direct evidence for or against store-lock
+  contention as the cause, independent of Send-Q (which only reflects the
+  agent's *send* side, not what the coordinator was doing).
+- Coordinator, `store.Store.lockTimed` (every one of the 30 `s.mu.Lock()` call
+  sites in store.go, mechanically replaced with this labeled wrapper):
+  `"store: long wait for write lock" caller=... waited_ms=...` whenever
+  acquiring the write mutex takes over 200ms — the direct test of the
+  refined coordinator-internal-contention hypothesis above. If this fires with
+  `caller` values like `ExpireLeases`/`ReapDoneShards` around the same time as
+  a `dispatch took unusually long` warning for the active agent, that is
+  confirmation: a background job, not another agent, is starving this agent's
+  dispatch by holding the process-wide lock.
 
 Reading the logs together for one agent around a requeue event should show which
-mechanism (if either) is real: a gap between "heartbeat queued" and "heartbeat
-sent" points at the agent-side in-flight-write hypothesis; "heartbeat sent" firing
-roughly on schedule but the matching "heartbeat received" arriving late or a
-"dispatch took unusually long" warning around the same window points at the
-coordinator side instead; and if the agent-side logs show heartbeats queued and
-sent every 5s exactly on schedule with none of the above firing, both hypotheses
-are wrong and the gap is somewhere not yet instrumented (network path itself, most
-likely — worth a packet capture at that point rather than more application logging).
+mechanism is real: a gap between "heartbeat queued" and "heartbeat sent" points
+at the agent-side in-flight-write hypothesis; "heartbeat sent" firing roughly on
+schedule but the matching "heartbeat received" arriving late, alongside a
+"dispatch took unusually long" and/or "long wait for write lock" warning in the
+same window, points at the coordinator side instead — and the lock-wait
+`caller` label says which coordinator-internal job was in the way. If the
+agent-side logs show heartbeats queued and sent every 5s exactly on schedule
+with none of the above firing anywhere, every current hypothesis is wrong and
+the gap is somewhere not yet instrumented (the network path itself, most
+likely — worth a packet capture at that point rather than more application
+logging).
 
 ## 4. Special Entry Types
 
