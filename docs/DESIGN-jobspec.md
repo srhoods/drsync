@@ -75,7 +75,9 @@ spec:
       posix: true
       nfs4: true                     # D8: on by default
       untranslatable: warn           # warn | fail | skip  (journaled either way)
-    hardlinks: report                # fixed: report-only (D3); field reserved
+    hardlinks: report                # report (D3 default) | preserve (D11, docs/DESIGN-hardlinks.md)
+    hardlinks_max_group_scan: 0      # 0 = unlimited; caps a link group's size before
+                                     # falling back to independent copies (preserve only)
     specials: true                   # device nodes, FIFOs, sockets (needs root)
 
   probe:
