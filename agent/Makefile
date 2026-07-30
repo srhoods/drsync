@@ -6,7 +6,7 @@ SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -80,5 +80,15 @@ bin/state_test: src/state.o src/uring.o src/pb.o test/state_test.c
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ test/state_test.c src/state.o src/uring.o src/pb.o -pthread
 
+# Job options table (opts_store/opts_get): GPFS-detection flag (no_uring_copy)
+# defaults false on an ordinary filesystem and survives a tunables-only
+# update, see state.c's fstatfs check.
+opts-test: bin/opts_test
+	./bin/opts_test
+
+bin/opts_test: src/state.o src/uring.o src/pb.o test/opts_test.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/opts_test.c src/state.o src/uring.o src/pb.o -pthread
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test

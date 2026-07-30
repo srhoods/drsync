@@ -634,7 +634,7 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
             if (copy_ranges_parallel(ctx, in, out, ss->size, name) < 0)
                 goto drop;
             copied = ss->size;
-        } else if (!cfr && ucopy_available()) {
+        } else if (!cfr && !ctx->oe->no_uring_copy && ucopy_available()) {
             /* io_uring registered-buffer copy: read of the next block overlaps
              * the write of the current one, and the inline hash is fed in stream
              * order via the sink. */
@@ -660,9 +660,13 @@ void copy_file_task(struct walk_ctx *ctx, int sfd, int dfd, const char *name,
      * self-test probes only READ_FIXED, so a filesystem whose WRITE_FIXED
      * ignores the submitted length — GPFS flushes the whole 1 MiB registered
      * buffer, padding a sub-buffer file with stale data — is caught only here.
-     * On a mismatch, disable the fast engine for this thread and redo the file
-     * with the serial copy, which is always correct. (Sparse and serial set
-     * size_trusted, so they never reach this.) */
+     * GPFS itself is now kept off this engine entirely (opts_store's fstatfs
+     * check sets no_uring_copy, gating the ucopy_available() call above), so
+     * this is the remaining safety net for a filesystem sharing the bug that
+     * fstatfs doesn't identify as GPFS. On a mismatch, disable the fast engine
+     * for this thread and redo the file with the serial copy, which is always
+     * correct. (Sparse and serial set size_trusted, so they never reach
+     * this.) */
     if (!o->dry_run && !size_trusted) {
         struct stat dchk;
         if (fstat(out, &dchk) < 0) {

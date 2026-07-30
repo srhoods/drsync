@@ -138,8 +138,17 @@ size_t lease_inflight(struct inflight_view *dst, size_t cap);
 /* ---- job options table ---- */
 struct opts_entry {
     struct job_options o;
-    int src_fd; /* O_RDONLY|O_DIRECTORY on src root */
-    int dst_fd; /* O_RDONLY|O_DIRECTORY on dst root (created if missing) */
+    int  src_fd; /* O_RDONLY|O_DIRECTORY on src root */
+    int  dst_fd; /* O_RDONLY|O_DIRECTORY on dst root (created if missing) */
+    /* True when src_fd or dst_fd sits on GPFS: fstatfs at opts_store time
+     * (probe.c, tools/fsprobe/fsprobe.c share the magic 0x47504653). GPFS's
+     * WRITE_FIXED ignores the submitted length and flushes the whole 1 MiB
+     * registered buffer (ucopy.c), so the io_uring copy engine is unusable on
+     * it regardless of the job's own options; this is checked once here
+     * rather than discovered per-file via the ucopy_disable() size-mismatch
+     * path (copy.c), which still works but wastes a bad write + serial redo
+     * on every file before disabling for the thread. */
+    bool no_uring_copy;
 };
 int  opts_store(const struct job_options *o);
 const struct opts_entry *opts_get(uint64_t job_id);
