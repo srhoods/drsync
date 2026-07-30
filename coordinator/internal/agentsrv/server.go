@@ -514,7 +514,10 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 		groups = g
 	}
 
-	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups)
+	// sp.LinkSightings/maxGroupScan: wiring to the job's hardlinks spec option
+	// (coordinator-side only, never a JobOptions field — docs/DESIGN-hardlinks.md)
+	// is a follow-up; the agent does not send LinkSightings yet.
+	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups, nil, 0)
 	if err != nil {
 		return err
 	}

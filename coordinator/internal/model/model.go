@@ -20,6 +20,11 @@ const (
 	PassProbing  PassState = "PROBING" // per-agent mount probes gate the root shard
 	PassScanning PassState = "SCANNING"
 	PassDirfix   PassState = "DIRFIX"
+	// PassLinkfix creates hardlink-group member links once the anchor copy
+	// each depends on has landed (docs/DESIGN-hardlinks.md). Sits after
+	// DIRFIX (so linked members' directories already exist) and before
+	// VERIFY (so linked files are verified like any other destination entry).
+	PassLinkfix  PassState = "LINKFIX"
 	PassVerify   PassState = "VERIFY"
 	PassDelete   PassState = "DELETE"
 	PassComplete PassState = "COMPLETE"
@@ -45,9 +50,7 @@ const (
 	KindDelete    ShardKind = "delete"
 	KindProbe     ShardKind = "probe"
 	// KindLinkfix: linkat tasks for hardlink-group members once their group's
-	// anchor copy has landed (docs/DESIGN-hardlinks.md). Not yet wired into
-	// phaseOfKind/phaseRank/the pass state machine — that lands with the
-	// LINKFIX phase itself.
+	// anchor copy has landed (docs/DESIGN-hardlinks.md).
 	KindLinkfix ShardKind = "linkfix"
 )
 
@@ -76,9 +79,10 @@ var phaseRank = map[PassState]int{
 	PassProbing:  1,
 	PassScanning: 2,
 	PassDirfix:   3,
-	PassVerify:   4,
-	PassDelete:   5,
-	PassComplete: 6,
+	PassLinkfix:  4,
+	PassVerify:   5,
+	PassDelete:   6,
+	PassComplete: 7,
 }
 
 // phaseOfKind maps a shard kind to the pass phase it belongs to, for shard
@@ -86,9 +90,10 @@ var phaseRank = map[PassState]int{
 // phase (dir/entrylist/chunk/probe shards can appear again mid-SCANNING via
 // recursive directory expansion, so they carry no such signal).
 var phaseOfKind = map[ShardKind]PassState{
-	KindDirfix: PassDirfix,
-	KindVerify: PassVerify,
-	KindDelete: PassDelete,
+	KindDirfix:  PassDirfix,
+	KindLinkfix: PassLinkfix,
+	KindVerify:  PassVerify,
+	KindDelete:  PassDelete,
 }
 
 // EffectiveState reports the further-along of the pass's stored state and

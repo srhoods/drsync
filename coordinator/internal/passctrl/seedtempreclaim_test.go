@@ -47,7 +47,7 @@ func TestSeedTempReclaimOnlyUnfinalized(t *testing.T) {
 		[]store.NewChunkGroup{
 			{RelPath: "a/done.bin", TempName: doneTemp, Size: 8, MtimeNs: 1, NChunks: 1},
 			{RelPath: "b/dead.bin", TempName: deadTemp, Size: 8, MtimeNs: 2, NChunks: 1},
-		}); err != nil {
+		}, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 
