@@ -522,12 +522,77 @@ at the agent-side in-flight-write hypothesis; "heartbeat sent" firing roughly on
 schedule but the matching "heartbeat received" arriving late, alongside a
 "dispatch took unusually long" and/or "long wait for write lock" warning in the
 same window, points at the coordinator side instead — and the lock-wait
-`caller` label says which coordinator-internal job was in the way. If the
-agent-side logs show heartbeats queued and sent every 5s exactly on schedule
-with none of the above firing anywhere, every current hypothesis is wrong and
-the gap is somewhere not yet instrumented (the network path itself, most
-likely — worth a packet capture at that point rather than more application
-logging).
+`caller` label says which coordinator-internal job was in the way.
+
+**Both instrumented mechanisms came back negative.** Neither `"dispatch took
+unusually long"` nor `"store: long wait for write lock"` fired, which rules out
+both the coordinator-side hypothesis (§3.4) and, by the network path being
+implicated by neither, most of the agent-side in-flight-write hypothesis too.
+
+### 3.5 Root cause: O(lifetime lease count) scans under `lease_mu` — fixed
+
+New fleet data reframed the search entirely: with `-S` (stealing off, so the
+copy pool plays no role at all — confirmed separately: cranking `-C` had zero
+effect, because these jobs have nothing to copy), the requeue symptom
+reproduced by raising `-w` alone, starting around 34 workers. That rules out
+data-path traffic as the mechanism (there is none) and points at something
+that scales with **walker thread count on its own**.
+
+`lease_mu` — the mutex guarding the agent's held-lease table — is taken by
+every `lease_add` (on grant), `lease_start`/`lease_end` (once per shard, by
+whichever walker thread picks it up), `lease_remove` (on completion), *and* by
+`send_heartbeat`'s own `lease_snapshot`/`lease_inflight` calls every heartbeat
+interval. The previous implementation scanned `[0, n_used)` for every one of
+these — `n_used` a **high-water mark that only ever grew**, never shrinking as
+leases completed ("freed in place... not compacted"). For a job with nothing
+to copy, walk shards turn over very fast, so 34+ walker threads churn
+`lease_add`/`lease_start`/`lease_remove` at high frequency; as the job
+progresses `n_used` climbs toward `MAX_LEASES` (8192), and every one of those
+calls' scan cost climbs with it — all serialized behind one lock that
+`send_heartbeat` also needs, twice, every heartbeat interval. Severe enough
+contention here starves the heartbeat with **zero footprint on the network or
+the coordinator**: nothing to see in Send-Q, nothing slow in coordinator
+dispatch, nothing waiting on the coordinator's store lock — it's a pure
+in-process bottleneck upstream of anything that instrumentation could observe.
+This fits every property of the residual symptom: walker-count-driven,
+copy-independent, invisible to both prior diagnostics, and worsening over a
+job's lifetime (consistent with the noisy, non-monotonic 34-vs-35 threshold
+observed live — not a hard capacity wall, a race against however far `n_used`
+had already climbed when a given heartbeat needed the lock).
+
+**Fix:** rewrote the lease table (`state.c`) so every operation is O(leases
+*currently* held) or better, never O(leases ever held):
+- an intrusive free list for slot allocation (`lease_add` no longer scans for
+  a free slot),
+- an intrusive doubly-linked active list, walked by `lease_snapshot`/
+  `lease_inflight`/`lease_job_held` — cost bounded by concurrently-held
+  leases (roughly `(workers+copy_threads)*2` in practice), not by the
+  process's lifetime lease count,
+- an open-chained hash table keyed by `lease_id` (16384 buckets, load factor
+  ≤ 0.5 at the table's 8192-slot capacity), giving `lease_start`/`lease_remove`
+  O(1) lookup instead of a linear scan.
+
+Slot addresses never move (array-backed, never compacted), preserving the
+existing invariant that a worker's cached `tl_lease` pointer stays valid for
+the life of its lease. The external API is unchanged — no caller anywhere in
+the codebase needed to change.
+
+Unit tested in isolation (`agent/test/state_test.c`, `make -C agent test`):
+lifecycle correctness, `lease_job_held` reflecting only active leases, 500
+concurrently-held leases surviving an unrelated mid-list removal intact, and
+the direct regression test for the bug — 20,000 add+remove cycles (far more
+than the table's 8192-slot capacity, the scenario that made the old
+implementation's scan cost climb) followed by a snapshot that correctly shows
+zero held leases, not a leaked or degraded table.
+
+**Not yet confirmed against the reporting fleet as of this writing** — this is
+the strongest hypothesis to date (a concrete O(n) vs O(1) bug, provable by
+inspection, matching every observed property including the two negative
+instrumentation results), but every fix in this investigation looked sound
+until tested live. The `-w 34/35` "8/8 failed, 5/10 clean" noise pattern
+specifically should go away if this is right — a real remaining race would
+still show *some* signal correlated with `n_used`'s growth, not this random
+of a split.
 
 ## 4. Special Entry Types
 

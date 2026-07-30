@@ -84,7 +84,18 @@ struct outmsg *out_take_priority(void);
 /* ---- held leases (heartbeat renewal + in-flight reporting) ----
  * Registry slots are index-stable for the life of a lease (freed in place, never
  * compacted), so a worker can hold a pointer to its own slot and publish
- * progress into it without re-looking it up. */
+ * progress into it without re-looking it up.
+ *
+ * Internally (state.c) this is a fixed array plus an intrusive free list and
+ * an intrusive active list, so every operation is O(1) instead of the O(table
+ * high-water mark) linear scan an earlier version used — at 30+ walker
+ * threads churning small, fast (nothing-to-copy) shards, that scan, repeated
+ * by every lease_add/lease_start/lease_remove call and contended against
+ * send_heartbeat's own two scans (lease_snapshot, lease_inflight) under the
+ * same lock, could starve the heartbeat long enough to expire leases with no
+ * trace on the network or coordinator side — see docs/DESIGN-agent.md §3.5.
+ * next/prev/free_next below are that internal bookkeeping; every field is
+ * state.c-private in practice (no code outside it reads or writes them). */
 #define LEASE_PATH_MAX 256 /* truncated: enough to identify the subtree */
 
 struct lease_entry {
@@ -95,6 +106,9 @@ struct lease_entry {
     struct timespec granted_at, started_at;  /* CLOCK_MONOTONIC */
     bool            running;                 /* false = queued, not yet picked up */
     atomic_ullong   entries_done;            /* published by the owning worker */
+    int             active_next, active_prev; /* intrusive doubly-linked active list, -1 = none */
+    int             free_next;                 /* intrusive singly-linked free list, -1 = none */
+    int             hash_next;                 /* intrusive singly-linked hash-bucket chain, -1 = none */
 };
 
 /* Control thread: record a granted lease. Copies what it needs from it, so the

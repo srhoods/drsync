@@ -304,13 +304,114 @@ struct outmsg *out_take_priority(void)
 }
 
 /* ---- leases ----
- * Slots are freed in place (lease_id = 0) rather than compacted, so the pointer
- * a worker caches in lease_start stays valid until it releases the lease. n_used
- * is a high-water mark bounding the scans, not a count. */
+ * Slots are index-stable for the life of a lease (never compacted/moved), so
+ * the pointer a worker caches in lease_start (tl_lease) stays valid until it
+ * releases the lease.
+ *
+ * Every operation here is O(1), via three intrusive lists threaded through
+ * the fixed `leases` array (see struct lease_entry in agent.h):
+ *   - free list (free_head/free_next): slots not currently holding a lease.
+ *   - active list (active_head/active_next/active_prev): slots currently
+ *     holding a lease, doubly-linked so lease_remove can unlink in O(1)
+ *     without a scan. This is what lease_snapshot/lease_inflight/
+ *     lease_job_held walk — cost proportional to leases *currently held*
+ *     (bounded by roughly (workers+copy_threads)*2 in practice), not to how
+ *     many leases the process has ever held.
+ *   - hash table (hash[] + hash_next chains) keyed by lease_id: what
+ *     lease_start/lease_remove use to find a slot in O(1) instead of
+ *     scanning for it.
+ *
+ * An earlier version scanned [0, n_used) — a high-water mark that only ever
+ * grew — for every one of these operations. At 30+ walker threads churning
+ * many small, fast shards (nothing to copy), that scan's cost climbed over a
+ * job's lifetime and was repeated, under one mutex, by every lease_add/
+ * lease_start/lease_remove call from every walker thread *and* by
+ * send_heartbeat's own two scans every heartbeat interval — contention severe
+ * enough to starve the heartbeat with no trace on the network or coordinator
+ * side (Send-Q, dispatch timing, store-lock timing all stayed clean). See
+ * docs/DESIGN-agent.md §3.5. */
 #define MAX_LEASES 8192
+#define LEASE_HASH_BUCKETS 16384 /* power of 2, > MAX_LEASES for a low load factor */
 static struct lease_entry leases[MAX_LEASES];
-static size_t             n_used;
+static int                free_head = 0;   /* index of first free slot, -1 = table full */
+static int                active_head = -1; /* index of first active slot, -1 = none held */
+static int                hash[LEASE_HASH_BUCKETS];
 static pthread_mutex_t    lease_mu = PTHREAD_MUTEX_INITIALIZER;
+static bool                lease_tab_init_done;
+
+static void lease_tab_init_locked(void)
+{
+    if (lease_tab_init_done)
+        return;
+    for (int i = 0; i < MAX_LEASES; i++) {
+        leases[i].free_next = (i + 1 < MAX_LEASES) ? i + 1 : -1;
+        leases[i].active_next = leases[i].active_prev = -1;
+        leases[i].hash_next = -1;
+    }
+    for (int i = 0; i < LEASE_HASH_BUCKETS; i++)
+        hash[i] = -1;
+    lease_tab_init_done = true;
+}
+
+/* Simple multiplicative mix: lease_id is a well-distributed random 63-bit
+ * value (coordinator's newLeaseID), so a cheap mix is enough — no adversary
+ * chooses lease ids. */
+static unsigned hash_bucket(uint64_t id)
+{
+    uint64_t h = id * 0x9E3779B97F4A7C15ULL;
+    return (unsigned)(h >> 48) & (LEASE_HASH_BUCKETS - 1);
+}
+
+/* caller holds lease_mu */
+static int hash_find_locked(uint64_t id)
+{
+    for (int i = hash[hash_bucket(id)]; i != -1; i = leases[i].hash_next)
+        if (leases[i].lease_id == id)
+            return i;
+    return -1;
+}
+
+/* caller holds lease_mu */
+static void hash_insert_locked(int i)
+{
+    unsigned b = hash_bucket(leases[i].lease_id);
+    leases[i].hash_next = hash[b];
+    hash[b] = i;
+}
+
+/* caller holds lease_mu */
+static void hash_remove_locked(int i)
+{
+    unsigned b = hash_bucket(leases[i].lease_id);
+    int *p = &hash[b];
+    while (*p != -1 && *p != i)
+        p = &leases[*p].hash_next;
+    if (*p == i)
+        *p = leases[i].hash_next;
+}
+
+/* caller holds lease_mu */
+static void active_link_locked(int i)
+{
+    leases[i].active_prev = -1;
+    leases[i].active_next = active_head;
+    if (active_head != -1)
+        leases[active_head].active_prev = i;
+    active_head = i;
+}
+
+/* caller holds lease_mu */
+static void active_unlink_locked(int i)
+{
+    int prev = leases[i].active_prev, next = leases[i].active_next;
+    if (prev != -1)
+        leases[prev].active_next = next;
+    else
+        active_head = next;
+    if (next != -1)
+        leases[next].active_prev = prev;
+    leases[i].active_next = leases[i].active_prev = -1;
+}
 
 /* The lease this thread is currently processing (workers run one at a time). */
 static __thread struct lease_entry *tl_lease;
@@ -318,21 +419,17 @@ static __thread struct lease_entry *tl_lease;
 void lease_add(const struct shard_item *it)
 {
     pthread_mutex_lock(&lease_mu);
-    struct lease_entry *e = NULL;
-    for (size_t i = 0; i < n_used; i++) {
-        if (leases[i].lease_id == 0) {
-            e = &leases[i];
-            break;
-        }
-    }
-    if (!e && n_used < MAX_LEASES)
-        e = &leases[n_used++];
-    if (!e) {
+    lease_tab_init_locked();
+    int i = free_head;
+    if (i == -1) {
         pthread_mutex_unlock(&lease_mu);
         LOGE("lease table full (%d); not tracking lease %llu", MAX_LEASES,
              (unsigned long long)it->lease_id);
         return;
     }
+    free_head = leases[i].free_next;
+
+    struct lease_entry *e = &leases[i];
     e->lease_id = it->lease_id;
     e->shard_id = it->shard_id;
     e->job_id = it->job_id;
@@ -344,17 +441,23 @@ void lease_add(const struct shard_item *it)
     e->started_at = (struct timespec){ 0 };
     e->running = false;
     atomic_store(&e->entries_done, 0);
+
+    hash_insert_locked(i);
+    active_link_locked(i);
     pthread_mutex_unlock(&lease_mu);
 }
 
 void lease_remove(uint64_t id)
 {
     pthread_mutex_lock(&lease_mu);
-    for (size_t i = 0; i < n_used; i++) {
-        if (leases[i].lease_id == id) {
-            leases[i].lease_id = 0; /* freed in place; slot may be reused */
-            break;
-        }
+    lease_tab_init_locked();
+    int i = hash_find_locked(id);
+    if (i != -1) {
+        hash_remove_locked(i);
+        active_unlink_locked(i);
+        leases[i].lease_id = 0; /* free_next is set below, overwriting any stale value */
+        leases[i].free_next = free_head;
+        free_head = i;
     }
     pthread_mutex_unlock(&lease_mu);
 }
@@ -365,8 +468,9 @@ bool lease_job_held(uint64_t job_id)
 {
     bool held = false;
     pthread_mutex_lock(&lease_mu);
-    for (size_t i = 0; i < n_used; i++) {
-        if (leases[i].lease_id && leases[i].job_id == job_id) {
+    lease_tab_init_locked();
+    for (int i = active_head; i != -1; i = leases[i].active_next) {
+        if (leases[i].job_id == job_id) {
             held = true;
             break;
         }
@@ -378,14 +482,13 @@ bool lease_job_held(uint64_t job_id)
 void lease_start(uint64_t id)
 {
     pthread_mutex_lock(&lease_mu);
+    lease_tab_init_locked();
     tl_lease = NULL;
-    for (size_t i = 0; i < n_used; i++) {
-        if (leases[i].lease_id == id) {
-            clock_gettime(CLOCK_MONOTONIC, &leases[i].started_at);
-            leases[i].running = true;
-            tl_lease = &leases[i];
-            break;
-        }
+    int i = hash_find_locked(id);
+    if (i != -1) {
+        clock_gettime(CLOCK_MONOTONIC, &leases[i].started_at);
+        leases[i].running = true;
+        tl_lease = &leases[i];
     }
     pthread_mutex_unlock(&lease_mu);
 }
@@ -405,10 +508,9 @@ size_t lease_snapshot(uint64_t *dst, size_t cap)
 {
     size_t n = 0;
     pthread_mutex_lock(&lease_mu);
-    for (size_t i = 0; i < n_used && n < cap; i++) {
-        if (leases[i].lease_id)
-            dst[n++] = leases[i].lease_id;
-    }
+    lease_tab_init_locked();
+    for (int i = active_head; i != -1 && n < cap; i = leases[i].active_next)
+        dst[n++] = leases[i].lease_id;
     pthread_mutex_unlock(&lease_mu);
     return n;
 }
@@ -428,10 +530,9 @@ size_t lease_inflight(struct inflight_view *dst, size_t cap)
     clock_gettime(CLOCK_MONOTONIC, &now);
     size_t n = 0;
     pthread_mutex_lock(&lease_mu);
-    for (size_t i = 0; i < n_used && n < cap; i++) {
+    lease_tab_init_locked();
+    for (int i = active_head; i != -1 && n < cap; i = leases[i].active_next) {
         const struct lease_entry *e = &leases[i];
-        if (!e->lease_id)
-            continue;
         dst[n].lease_id = e->lease_id;
         dst[n].shard_id = e->shard_id;
         dst[n].job_id = e->job_id;

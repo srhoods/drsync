@@ -6,7 +6,7 @@ SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -71,5 +71,14 @@ bin/poolsize_test: src/poolsize.c test/poolsize_test.c
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ src/poolsize.c test/poolsize_test.c
 
+# Lease table (O(1) add/start/remove/snapshot/inflight/job_held): the fix for
+# the lease-requeue bug at high walker thread counts (see state.c).
+state-test: bin/state_test
+	./bin/state_test
+
+bin/state_test: src/state.o src/uring.o src/pb.o test/state_test.c
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/state_test.c src/state.o src/uring.o src/pb.o -pthread
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test

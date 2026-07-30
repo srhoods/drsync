@@ -71,9 +71,10 @@ static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to
  * renewal at once, expire together, and get requeued the instant contention
  * eased (a burst that looked like "expires, requeues, completes almost
  * instantly" but was never about which pool did the crawling — see
- * docs/DESIGN-agent.md §3.1-§3.4 for the full history — this thread alone
+ * docs/DESIGN-agent.md §3.1-§3.5 for the full history — this thread alone
  * was not sufficient either; see §3.3's priority mailbox (state.c
- * out_push_priority) and §3.4's open follow-up for why).
+ * out_push_priority) and §3.5 for the actual root cause (an O(n) lease-table
+ * scan under lease_mu, unrelated to anything this thread does).
  *
  * g_writer_stop_efd wakes the writer promptly on reconnect/shutdown (poll()
  * on the outbox alone would otherwise block indefinitely with nothing left
