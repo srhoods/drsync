@@ -323,17 +323,74 @@ needed to drain what its own stealing thread just queued. The original sizing
 (`cp_init`'s introducing commit) reserved a flat 1 thread — enough to guarantee
 liveness (the drain side always makes *some* progress, so the pool cannot deadlock)
 but not enough to guarantee *throughput*: with the default 8 copy threads, 7 could
-simultaneously become stealing producers against a single drainer. Under real fleet
-contention this let a stolen shard's `dpend_wait` (waiting on its own submitted
-copies) stall long enough to blow past the coordinator's lease TTL — the shard would
-expire, requeue, and then complete almost instantly once contention eased, since the
-underlying work was small or already done. Confirmed by fleet A/B testing: `-S`
-(stealing off, every copy thread a pure drainer) held the lease-requeue rate at 0%;
-re-enabling stealing with the flat reserve reproduced it immediately. The reserve now
+simultaneously become stealing producers against a single drainer. The reserve now
 scales at 25% of `copy_threads` (floored at 1, so the deadlock-freedom guarantee is
 never lost) — matching the codebase's existing 25/75 walker/copy design ratio
 (`ansible/roles/drsync_agent`) — so the drain side keeps real throughput at any pool
 size instead of degrading to one thread as the pool grows.
+
+> **This was not, on its own, the cause of the lease-requeue bug described in §3.2.**
+> It was the first hypothesis, built from reading the copy-pool contention path in
+> isolation, and shipped as a real (if insufficient) improvement to a genuine
+> deadlock-vs-throughput tradeoff. A fleet running `-w 14 -C 42` — a 4x larger reserve
+> than the flat-1 baseline under this fix — saw no change in the requeue rate,
+> disproving copy-pool starvation as *the* mechanism. See §3.2 for the actual cause
+> and how the two were told apart.
+
+### 3.2 Writer thread — outbound frames off the heartbeat path
+
+**Root cause of the lease-requeue bug** (§6's `RunSweeper`/`ExpiredLease` in
+DESIGN-coordinator.md exists to diagnose this class of symptom: a shard expires its
+lease, requeues, and completes almost instantly on retry, with no obvious cause).
+Confirmed live on the reporting fleet: `ss -tn` on an agent's control connection
+showed **Send-Q at 1657 bytes at the exact moment a burst of leases expired** —
+direct proof the socket's outbound buffer was backed up when the requeues happened.
+
+Before this fix, one thread — the control thread — did three things on a single
+blocking socket/TLS connection: read incoming frames (`FR_HEARTBEAT_ACK`,
+`FR_WORK_GRANT`, ...), send its own periodic frames (`FR_HEARTBEAT`, 1 per
+`hb_interval_s`; `FR_STATS_REPORT`, 1 Hz), and drain the **outbox** — a queue every
+worker and copy thread pushes into (`out_push`) with its shard results and journal
+batches. All outbound writes used `wire_write` → `write_full`, a plain blocking
+`write()`/`SSL_write()` loop with no `O_NONBLOCK` and no socket buffer tuning
+(`SO_SNDBUF`); the outbox queue itself was (and remains) unbounded.
+
+At high worker/copy thread counts, the aggregate rate of shard results and journal
+batches produced can exceed what the coordinator (or the network) drains from that
+one TCP connection. When the kernel send buffer fills, `write()` blocks until the
+peer makes room — and since the control thread did the outbox drain and the
+heartbeat send on the same loop iteration, a blocked write there stalled **the whole
+control thread**, heartbeat included, for as long as the buffer stayed full. Every
+lease the agent held could miss renewal at once (heartbeats renew only the leases
+listed in the agent's `held_lease_ids`, coordinator-side: `RenewLeasesByID`,
+DESIGN-coordinator.md §6), so a burst of leases would expire together, requeue, and
+— since the underlying work was often already finished or small — complete almost
+instantly once the send buffer drained and a normal heartbeat got through again.
+
+This is why the §3.1 copy-pool reserve fix made no difference: work-stealing was
+never the mechanism. It scales with the same knob (`-w`/`-C`, more threads means
+more result/journal traffic) but is otherwise unrelated to which pool did the
+crawling — `-S` (stealing disabled) does not change how much traffic the outbox
+carries or how the control thread drains it.
+
+**Fix:** a dedicated writer thread per session. `out_push` still queues frames
+(now including `FR_HEARTBEAT`/`FR_STATS_REPORT`/`FR_WORK_REQUEST`, via a new
+`queue_pb` that every producer besides the initial `FR_HELLO` handshake uses instead
+of writing inline); the writer thread alone calls `wire_write`, blocking as long as
+it needs to on a full send buffer without affecting anything else. The control
+thread's poll loop drops the outbox eventfd entirely — it only waits on the control
+socket (incoming frames) and the 1 Hz timer (queue, don't send, stats/heartbeat) —
+so a full send buffer can no longer delay when the timer is checked or a heartbeat
+is queued, only how promptly it's *written*, which is exactly the backpressure a
+lease renewal is supposed to tolerate (`RenewLeasesByID`'s at-least-once design
+already assumes some latency; it just cannot survive the sender going silent
+entirely). A second eventfd lets the writer report a send failure back to the
+control thread (which then drives the existing reconnect path) without either
+thread touching the connection while the other is using or tearing it down —
+matching OpenSSL's supported one-reader/one-writer-thread threading model for a
+single `SSL*`. The writer is started after a successful `dial()` and stopped
+(signaled, joined) before `session_teardown()` closes the connection, on every exit
+path from the per-session loop.
 
 ## 4. Special Entry Types
 

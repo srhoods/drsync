@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
@@ -49,6 +50,124 @@ static uint32_t g_hb_interval_s = 5;
 static uint64_t g_fleet_epoch;    /* from the first HelloAck */
 static bool     g_have_epoch;
 static volatile sig_atomic_t g_want_exit; /* coordinator or a signal asked us to stop */
+
+/* ---- writer thread ----
+ * Outbound frames (heartbeats, stats, work requests, and every worker/copy
+ * thread's shard results and journal batches) are queued (out_push) rather
+ * than written inline by whichever thread produced them. A dedicated thread
+ * drains the queue and does the actual (possibly blocking) socket/TLS write,
+ * so that a full TCP send buffer — which stalls a write() until the peer
+ * drains it — blocks only this thread, never the control thread that owns
+ * the heartbeat timer.
+ *
+ * Why this matters: the control thread used to drain the outbox and write it
+ * inline, on the same loop iteration that checks the 1 Hz heartbeat timer.
+ * At high worker/copy thread counts (observed: -w 14 -C 42), the aggregate
+ * result/journal traffic can exceed what the coordinator/network drains,
+ * filling the send buffer (confirmed live: ss -tn showed Send-Q at 1657
+ * bytes at the exact moment a burst of leases expired). A blocked write()
+ * stalled the whole control thread — no heartbeat could be sent for as long
+ * as the buffer stayed full — so every lease the agent held could miss
+ * renewal at once, expire together, and get requeued the instant contention
+ * eased (a burst that looked like "expires, requeues, completes almost
+ * instantly" but was never about which pool did the crawling — see
+ * docs/DESIGN-agent.md §3.2 and §3.1 for the two are-not-the-same issues).
+ *
+ * g_writer_stop_efd wakes the writer promptly on reconnect/shutdown (poll()
+ * on the outbox alone would otherwise block indefinitely with nothing left
+ * to queue). g_writer_err_efd is how the writer reports a send failure back
+ * to the control thread without either thread touching g_conn concurrently
+ * with the other tearing it down. */
+static int g_writer_stop_efd = -1;
+static int g_writer_err_efd = -1;
+static pthread_t g_writer_thread;
+static bool g_writer_running;
+
+static void *writer_main(void *arg)
+{
+    (void)arg;
+    struct pollfd pfds[2] = {
+        { .fd = g_outbox_eventfd, .events = POLLIN },
+        { .fd = g_writer_stop_efd, .events = POLLIN },
+    };
+    for (;;) {
+        if (poll(pfds, 2, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            LOGE("writer poll: %s", strerror(errno));
+            return NULL;
+        }
+        if (pfds[0].revents & POLLIN) {
+            uint64_t v;
+            while (read(g_outbox_eventfd, &v, sizeof v) > 0)
+                ;
+        }
+        struct outmsg *m = out_drain();
+        while (m) {
+            struct outmsg *next = m->next;
+            /* A frame lost to a mid-write drop is re-derived after the
+             * shard's lease expires and it is redone (at-least-once). */
+            if (wire_write(&g_conn, m->type, m->buf, m->len) < 0) {
+                LOGW("frame write failed (%s); reconnecting", strerror(errno));
+                uint64_t one = 1;
+                if (write(g_writer_err_efd, &one, sizeof one) < 0 && errno != EAGAIN)
+                    LOGE("writer error eventfd write: %s", strerror(errno));
+                /* Keep draining and freeing the rest of this batch (no more
+                 * writes attempted — the control thread is about to tear the
+                 * connection down) rather than leaking it; new frames queued
+                 * after this point wait for the next session's writer. */
+            }
+            free(m->buf);
+            free(m);
+            m = next;
+        }
+        if (pfds[1].revents & POLLIN)
+            return NULL; /* stop requested: drain loop above already ran once more */
+    }
+}
+
+/* Starts the writer thread for the session just established by dial(). */
+static int writer_start(void)
+{
+    g_writer_stop_efd = eventfd(0, EFD_CLOEXEC);
+    g_writer_err_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_writer_stop_efd < 0 || g_writer_err_efd < 0) {
+        LOGE("writer eventfd: %s", strerror(errno));
+        return -1;
+    }
+    if (pthread_create(&g_writer_thread, NULL, writer_main, NULL) != 0) {
+        LOGE("writer thread create failed");
+        close(g_writer_stop_efd);
+        close(g_writer_err_efd);
+        g_writer_stop_efd = g_writer_err_efd = -1;
+        return -1;
+    }
+    g_writer_running = true;
+    return 0;
+}
+
+/* Stops and joins the writer thread before session_teardown() closes the
+ * connection it may still be writing to. Safe to call even if writer_start
+ * never succeeded (session ended before the writer was needed, e.g. HELLO
+ * failure). */
+static void writer_stop(void)
+{
+    if (g_writer_running) {
+        uint64_t one = 1;
+        if (write(g_writer_stop_efd, &one, sizeof one) < 0)
+            LOGE("writer stop eventfd write: %s", strerror(errno));
+        pthread_join(g_writer_thread, NULL);
+        g_writer_running = false;
+    }
+    if (g_writer_stop_efd >= 0) {
+        close(g_writer_stop_efd);
+        g_writer_stop_efd = -1;
+    }
+    if (g_writer_err_efd >= 0) {
+        close(g_writer_err_efd);
+        g_writer_err_efd = -1;
+    }
+}
 
 static void on_signal(int sig)
 {
@@ -197,6 +316,9 @@ static int connect_coordinator(const char *hostport, char *host_out, size_t host
     return fd;
 }
 
+/* Blocking write straight to the socket — used only for FR_HELLO, before the
+ * writer thread (below) exists for this session. Every other outbound frame
+ * goes through queue_pb instead: see the writer-thread comment for why. */
 static int send_pb(uint16_t type, pb_buf *b)
 {
     if (b->oom) {
@@ -207,6 +329,22 @@ static int send_pb(uint16_t type, pb_buf *b)
     int rc = wire_write(&g_conn, type, b->p, b->len);
     pb_free(b);
     return rc;
+}
+
+/* Hands a frame to the outbox for the writer thread to send, instead of
+ * writing it inline. Never blocks: queuing is a mutex + malloc, not a
+ * syscall that can stall on a full TCP send buffer. Always "succeeds" from
+ * the caller's perspective (matching send_pb's 0-on-success contract) since
+ * a real send failure surfaces later, on the writer thread, as a reconnect. */
+static int queue_pb(uint16_t type, pb_buf *b)
+{
+    if (b->oom) {
+        pb_free(b);
+        errno = ENOMEM;
+        return -1;
+    }
+    out_push(type, b);
+    return 0;
 }
 
 static void maybe_request_work(bool from_timer)
@@ -229,7 +367,7 @@ static void maybe_request_work(bool from_timer)
     pb_buf b;
     pb_init(&b);
     enc_work_request(&b, (uint32_t)avail, cached, n);
-    if (send_pb(FR_WORK_REQUEST, &b) == 0)
+    if (queue_pb(FR_WORK_REQUEST, &b) == 0)
         g_request_pending = true;
 }
 
@@ -248,7 +386,7 @@ static int send_heartbeat(void)
     pb_init(&b);
     enc_heartbeat(&b, ++g_hb_seq, held, n, (uint32_t)wq_depth(),
                   (uint32_t)cp_depth(), read_rss(), inflight, n_inflight);
-    return send_pb(FR_HEARTBEAT, &b);
+    return queue_pb(FR_HEARTBEAT, &b);
 }
 
 static int send_stats(void)
@@ -266,7 +404,7 @@ static int send_stats(void)
     pb_buf b;
     pb_init(&b);
     enc_stats(&b, &s);
-    return send_pb(FR_STATS_REPORT, &b);
+    return queue_pb(FR_STATS_REPORT, &b);
 }
 
 /* returns -1 to terminate the session */
@@ -600,6 +738,15 @@ int main(int argc, char **argv)
              cfg.coordinator, cfg.agent_id, g_hb_interval_s, ack.lease_ttl_s,
              cfg.workers, cfg.copy_threads, g_uring_enabled, tls_enabled());
 
+        if (writer_start() < 0) {
+            session_teardown();
+            struct timespec ts = { backoff_ms / 1000,
+                                   (long)(backoff_ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+            backoff_ms = backoff_ms * 2 < backoff_max_ms ? backoff_ms * 2 : backoff_max_ms;
+            continue;
+        }
+
         /* Fresh session: clear the outstanding-request gate and re-ask. Held
          * leases are re-declared by the next heartbeat (Heartbeat renews by
          * agent id), so the coordinator keeps our in-flight work. */
@@ -610,7 +757,7 @@ int main(int argc, char **argv)
         struct pollfd pfds[3] = {
             { .fd = g_conn.fd, .events = POLLIN },
             { .fd = tfd, .events = POLLIN },
-            { .fd = g_outbox_eventfd, .events = POLLIN },
+            { .fd = g_writer_err_efd, .events = POLLIN },
         };
         unsigned tick = 0;
         bool reconnect = false;
@@ -634,36 +781,22 @@ int main(int argc, char **argv)
                     break;
                 }
                 tick++;
-                if (send_stats() < 0) {
-                    LOGW("stats send failed (%s); reconnecting", strerror(errno));
-                    reconnect = true;
-                    break;
-                }
-                if (tick % g_hb_interval_s == 0 && send_heartbeat() < 0) {
-                    LOGW("heartbeat send failed (%s); reconnecting", strerror(errno));
-                    reconnect = true;
-                    break;
-                }
+                /* send_stats/send_heartbeat only queue now (queue_pb): a
+                 * failure here means out-of-memory encoding the frame, not a
+                 * socket problem — an actual send failure is reported
+                 * asynchronously by the writer thread via pfds[2] below. */
+                send_stats();
+                if (tick % g_hb_interval_s == 0)
+                    send_heartbeat();
                 maybe_request_work(true);
             }
 
-            if (pfds[2].revents & POLLIN) { /* worker outbox */
+            if (pfds[2].revents & POLLIN) { /* writer thread reported a send failure */
                 uint64_t v;
-                while (read(g_outbox_eventfd, &v, sizeof v) > 0)
-                    ;
-                struct outmsg *m = out_drain();
-                while (m) {
-                    struct outmsg *next = m->next;
-                    /* A frame lost to a mid-write drop is re-derived after the
-                     * shard's lease expires and it is redone (at-least-once). */
-                    if (!reconnect && wire_write(&g_conn, m->type, m->buf, m->len) < 0) {
-                        LOGW("frame write failed (%s); reconnecting", strerror(errno));
-                        reconnect = true;
-                    }
-                    free(m->buf);
-                    free(m);
-                    m = next;
-                }
+                read(g_writer_err_efd, &v, sizeof v);
+                LOGW("writer reported a send failure; reconnecting");
+                reconnect = true;
+                break;
             }
 
             if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
@@ -686,6 +819,7 @@ int main(int argc, char **argv)
             }
         }
 
+        writer_stop(); /* before session_teardown closes the connection it writes to */
         session_teardown();
         if (g_want_exit)
             break;
