@@ -206,6 +206,7 @@ static void enc_stat_info(pb_buf *b, uint32_t field, const struct estat *e)
     pb_put_u64(&sub, 5, e->size);
     pb_put_i64(&sub, 6, e->atim.tv_sec * 1000000000 + e->atim.tv_nsec);
     pb_put_i64(&sub, 7, e->mtim.tv_sec * 1000000000 + e->mtim.tv_nsec);
+    pb_put_u64(&sub, 9, e->dev);
     pb_put_u64(&sub, 10, e->ino);
     pb_put_u64(&sub, 11, e->nlink);
     pb_put_u64(&sub, 12, e->rdev_major);
