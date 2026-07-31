@@ -24,6 +24,11 @@ before compression, ~30–60 GB with zstd).
 > `docs/ADMIN.md` §8. Not yet: role-based access (every authenticated caller
 > is equivalent) or OIDC/SSO, coordinator HA (§8), the event-driven pass
 > controller (state machine still ticks at 2 s).
+> **Hardlinks (2026-07-31, D11):** opt-in preservation is live — see §2.2 for the
+> LINKFIX phase and §3 for the `link_groups`/`link_members` schema; full design in
+> `docs/DESIGN-hardlinks.md`. `link_groups`/`link_members` currently follow
+> `chunk_groups`'s lifecycle (cleaned up at job purge, not per-pass) — a per-pass
+> reap is a tracked follow-up for hardlink-dense, long-running jobs, not yet built.
 
 ---
 
@@ -67,10 +72,14 @@ CREATED ──validate──▶ READY ──start──▶ RUNNING ⇄ PAUSED
 ### 2.2 Pass
 
 ```
-PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards done──▶ DIRFIX ──▶ VERIFY ──▶ [DELETE] ──▶ COMPLETE
-            (per-agent               (walk+diff+copy               (dir     (sampled     (only if
-             mount probe)             interleaved per               metadata  checksums,   explicitly
-                                      shard)                        sweep)    metadata)    triggered)
+PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards done──▶ DIRFIX ──▶ LINKFIX ──▶ VERIFY ──▶ [DELETE] ──▶ COMPLETE
+            (per-agent               (walk+diff+copy               (dir     (hardlink   (sampled     (only if
+             mount probe)             interleaved per               metadata  group      checksums,   explicitly
+                                      shard)                        sweep)    members     metadata)    triggered)
+                                                                               linked to
+                                                                               anchor,
+                                                                               opt-in —
+                                                                               D11)
 ```
 
 - `PROBING` gates the pass: one `ProbeTask` shard is pinned (`target_agent`) to each
@@ -89,6 +98,12 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   data starts moving seconds after pass start; there is no global "scan first" barrier.
 - `DIRFIX` applies directory metadata deepest-first from the journal's dir records
   (see agent doc §6.3). Cheap: directories are typically 1–5% of entries.
+- `LINKFIX` (D11, opt-in via `metadata.hardlinks: preserve`; `docs/DESIGN-hardlinks.md`)
+  seeds one `LinkTask` per hardlink-group member whose anchor copy has landed —
+  `seedLinkfix` reads `link_groups`/`link_members`, not the journal. A job left on the
+  D3 default (`report`) never populates that table, so this phase seeds nothing and
+  drains immediately. Sits after DIRFIX (so a member's destination directory already
+  exists) and before VERIFY (so linked files are verified like any other entry).
 - `VERIFY` grants verify batches built from the pass journal (all-metadata + sampled
   checksum per D4).
 - `DELETE` exists only when triggered with the explicit double-gate (D5); tasks are
@@ -116,9 +131,10 @@ QUEUED ──grant──▶ LEASED ──ShardResult ok──▶ DONE
 jobs    (id, name UNIQUE, spec_yaml, spec_hash, state, created_at, updated_at)
 passes  (id, job_id, pass_no, state, started_at, finished_at,
          files_scanned, files_copied, bytes_copied, files_meta_fixed,
-         orphans, errors, nlink_dup_files, nlink_dup_bytes)   -- denormalized counters
+         orphans, errors, nlink_dup_files, nlink_dup_bytes,
+         links_created, link_anchor_races, link_fallback)     -- denormalized counters
 shards  (id, pass_id, parent_shard_id, kind,        -- kind: dir | entrylist | chunk |
-         rel_path, payload BLOB,                    --        dirfix | verify | delete
+         rel_path, payload BLOB,                    --  dirfix | linkfix | verify | delete
          state, attempt, lease_id, lease_agent, lease_expiry,
          result BLOB, updated_at)
          INDEX (pass_id, state)                     -- the scheduler's working set
@@ -127,6 +143,10 @@ agents  (id, hostname, state, version, caps BLOB, last_heartbeat,
 chunk_groups (pass_id, rel_path, temp_name, size, mtime_ns,
               n_chunks, n_done, state)               -- large-file cross-fleet assembly;
               -- finalize task seeded (same tx as the last data chunk) at n_done==n_chunks
+link_groups  (pass_id, dev, ino, nlink_expected, members_seen,
+              anchor_rel_path, anchor_size, anchor_mtime_ns,
+              anchor_state, updated_at)              -- D11 hardlink correlation, pass-scoped;
+link_members (pass_id, dev, ino, rel_path, state)    -- cleaned up at job purge like chunk_groups
 journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control/dedup
 ```
 

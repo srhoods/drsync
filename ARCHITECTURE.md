@@ -4,7 +4,7 @@
 large-file chunking (including cross-fleet fan-out), verify/delete passes, and a
 the WebUI console all ship today. See §9 for the per-phase status. Key
 decisions ratified 2026-07-10 (see §10).
-**Date:** 2026-07-10 (status updated 2026-07-17)
+**Date:** 2026-07-10 (status updated 2026-07-31)
 **Author:** drafted for review by Steven Rhoods
 
 ---
@@ -28,7 +28,7 @@ Existing tools fail at this scale:
 
 1. Scale-out: N agents across M hosts, each mounting source and destination.
 2. Scan source **and** destination concurrently; compute the difference; copy only what's needed.
-3. Full metadata fidelity (owner, group, mode, timestamps, xattrs, ACLs, sparseness, symlinks, device nodes — hardlinks TBD, see open questions).
+3. Full metadata fidelity (owner, group, mode, timestamps, xattrs, ACLs, sparseness, symlinks, device nodes, hardlinks opt-in — D11).
 4. Survive agent/host failure without restarting the migration.
 5. Iterative convergence: repeated incremental passes until the delta is small enough for cutover (high change rate on source).
 6. Agents in **C** for maximum per-node throughput.
@@ -244,7 +244,7 @@ The fidelity contract, explicit per attribute (this table becomes a test matrix)
 | POSIX ACLs | via `system.posix_acl_access/default` xattrs | GPFS honors these; verified per-FS-pair |
 | NFSv4 ACLs | `system.nfs4_acl` xattr where the client exposes it | **known risk area** — fidelity depends on both mounts; flagged per-file when not translatable |
 | sparse files | `SEEK_HOLE`/`SEEK_DATA` on source, `fallocate(PUNCH_HOLE)`/skip on dest | falls back to zero-detection where lseek doesn't support holes (NFS < 4.2) |
-| hardlinks | **not preserved** (decision D3) | nlink>1 files copied as independent files; counts and duplicated bytes reported per pass so the cost stays visible |
+| hardlinks | **opt-in** (`metadata.hardlinks: preserve`, decision D11 — default `report`, D3's original behavior) | default: nlink>1 files copied as independent files, cost reported per pass; `preserve`: a pass-scoped link registry (`docs/DESIGN-hardlinks.md`) links group members to a shared anchor copy instead |
 | device/FIFO/socket nodes | `mknodat` | requires root/CAP_MKNOD |
 | Project/quota IDs, immutable flags | `FS_IOC_GETFLAGS`, per-FS | best-effort, reported when unsupported |
 
@@ -355,13 +355,13 @@ drsync/
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| **1 — MVP** | Coordinator + agent, posix lister, dual-tree diff, copy + full metadata, passes, CLI, Prometheus metrics. Correctness proven by fidelity test matrix. | **Shipped.** Plus mTLS, entry-list sharding for pathological directories, and coordinator-driven fleet spread so a volume below `shard_budget` still fans out across every agent (`test/fanout_e2e.sh`). |
+| **1 — MVP** | Coordinator + agent, posix lister, dual-tree diff, copy + full metadata, passes, CLI, Prometheus metrics. Correctness proven by fidelity test matrix. | **Shipped.** Plus mTLS, entry-list sharding for pathological directories, coordinator-driven fleet spread so a volume below `shard_budget` still fans out across every agent (`test/fanout_e2e.sh`), and opt-in hardlink preservation (D11, `test/hardlink_e2e.sh`, `test/hardlink_resilience_e2e.sh`). |
 | **2 — Scale & resilience** | Large-file chunking, GPFS policy lister, verify pass, delete pass, coordinator HA, fault-injection test suite, 1B-file synthetic benchmark. | **Partial.** Shipped: large-file chunking — local parallel ranges **and** cross-fleet chunk fan-out with idempotent recovery (`test/chunk_e2e.sh`, `test/chunk_resilience_e2e.sh`); verify pass (sampled xxHash3); delete pass. Outstanding: GPFS policy lister, coordinator HA, fault-injection suite, 1B-file benchmark. |
 | **3 — WebUI & polish** | WebUI, Weka snapshot lister, reports, cutover tooling. | **Partial.** Shipped: WebUI console (monitoring, job/agent/parked-shard control, error browser), per-pass reports, login (local accounts / Active Directory) + logout, optional HTTPS for the REST/WebUI listener, email notifications (per-pass, end-of-job summary with a per-pass duration column, tick-driven parked-shard alert digest). Outstanding: Weka snapshot lister, cutover tooling. |
 
 ---
 
-## 10. Decisions (D1–D9 ratified 2026-07-10; D10 2026-07-19)
+## 10. Decisions (D1–D9 ratified 2026-07-10; D10 2026-07-19; D11 2026-07-31)
 
 | # | Decision | Choice | Consequence |
 |---|---|---|---|
@@ -375,6 +375,7 @@ drsync/
 | **D8** | NFSv4 | **NFSv4 (incl. v4 ACLs) supported from the outset** — destination estate is moving to NFSv4 | ACL engine handles POSIX ACLs and NFSv4 ACLs (`system.nfs4_acl`) with per-job policy for untranslatable pairs; `copy_file_range` server-side copy used opportunistically on v4.2 |
 | **D9** | Job definition | **YAML job specs**, CLI flags as an alternative/override | YAML parsing lives only in the Go control plane; agents receive fully-resolved options as protobuf (no YAML in C) |
 | **D10** | Orphan detection in a split directory | **Stays with the splitting shard** — destination enumeration is *not* fanned out as its own shard kind | A pathological directory's source names stream out as entry-list shards while the destination listing is marked in place, so orphans cost one sorted listing and no extra syscalls. The rejected alternative — a destination-slice shard testing each name for source existence — costs one statx per destination entry per pass, and since the destination is built by drsync, pass 2+ would pay ~N statx to find ~0 orphans. The variant that avoids that (a shard re-reading both sides) only relocates the work: same total, same peak memory, plus a new shard kind across proto/agent/coordinator and orphan detection — which seeds the delete pass — moved onto a new code path |
+| **D11** | Hardlinks (supersedes D3) | **Preserved when opted in** (`metadata.hardlinks: preserve`) via a pass-scoped link registry — default stays `report` (D3's original behavior, unchanged for existing jobs) | A coordinator-side `link_groups`/`link_members` table (docs/DESIGN-hardlinks.md) correlates `(dev,ino)` sightings across shards; the first-sighted member is copied as a speculative anchor, later members are `linkat`'d to it in a new LINKFIX phase (between DIRFIX and VERIFY). D3's rationale — no *durable* global inode map — still holds: the registry is scratch state cleaned up at job purge, not carried across passes. A job-level `hardlinks_max_group_scan` cap falls back a pathologically large group to independent copies rather than risk unbounded per-pass state |
 
 ## 11. Detailed Design Documents
 
@@ -384,4 +385,5 @@ drsync/
 | [docs/DESIGN-coordinator.md](docs/DESIGN-coordinator.md) | `drsyncd`: state machines, SQLite schema, scheduler & leases, journals, REST/WS API, metrics |
 | [docs/DESIGN-agent.md](docs/DESIGN-agent.md) | C agent: thread pools, dual-tree walker, io_uring copy engine, metadata/ACL engine, verification, error handling, memory model |
 | [docs/DESIGN-jobspec.md](docs/DESIGN-jobspec.md) | YAML job spec schema, CLI mapping, defaults |
+| [docs/DESIGN-hardlinks.md](docs/DESIGN-hardlinks.md) | Hardlink preservation (D11): link registry schema, LINKFIX phase, speculative-anchor design |
 ```

@@ -114,6 +114,17 @@ decision D9).
 > untranslatable policy (now journalled as JR_FIDELITY_EXCEPTION, not just
 > counted); the translation needs an NFSv4 mount to develop and verify.
 > Verified end-to-end by `test/e2e.sh` (sync + fidelity + verify + delete).
+> Hardlink preservation (D11, opt-in via `metadata.hardlinks: preserve`,
+> `docs/DESIGN-hardlinks.md`) is now wired end-to-end: the walker emits a
+> `LinkSighting` on `ShardSplit` alongside the existing `NLINK_DUP` journal record
+> (unconditionally — the gate lives on the coordinator, not the agent); the new
+> `link.c` executor (`WI_LINKFIX`) runs `linkat` under the same fd-anchored
+> containment as the rest of the agent, with an anchor-gen drift check (mirroring
+> `ChunkTask.gen`) and EEXIST handling for both an idempotent re-run and a stale
+> destination entry. Verified by `test/hardlink_e2e.sh` (multi-agent dedup,
+> shared destination inode) and `test/hardlink_resilience_e2e.sh` (agent killed
+> mid-LINKFIX; an oversized group exceeding `hardlinks_max_group_scan` falls back
+> to independent copies).
 
 ---
 
@@ -821,7 +832,7 @@ outside the embedded `job_options` struct that update path overwrites.
 | symlink | `readlinkat` → `symlinkat` (replace via rename trick not possible: unlink+create; brief window documented) → `lchown` + `utimensat(AT_SYMLINK_NOFOLLOW)`; never followed, never chmod'd |
 | dir | created eagerly (mode 0700 initially) during walk; true metadata in DIRFIX phase |
 | device/FIFO/socket | `mknodat` + metadata; requires CAP_MKNOD (root) |
-| hardlinked file (nlink>1) | copied as independent file (D3); journal `NLINK_DUP {dev, ino, nlink, size}` — the report aggregates by (dev,ino) to compute duplication cost |
+| hardlinked file (nlink>1) | default (`report`, D3): copied as independent file; journal `NLINK_DUP {dev, ino, nlink, size}` — the report aggregates by (dev,ino) to compute duplication cost. Opt-in (`preserve`, D11, `docs/DESIGN-hardlinks.md`): the walker still copies the first-sighted member (speculative anchor) but also emits a `LinkSighting` on `ShardSplit`; later members are `linkat`'d to the anchor by a `WI_LINKFIX` task (`link.c`) in the LINKFIX phase instead of being copied |
 
 ## 5. Metadata Engine
 
