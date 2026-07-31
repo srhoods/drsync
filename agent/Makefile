@@ -2,11 +2,11 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wshadow -D_GNU_SOURCE -Ivendor
 LDFLAGS ?= -pthread -lzstd -lssl -lcrypto
 
-SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/poolsize.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/tempname.c src/walker.c src/main.c
+SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/poolsize.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/link.c src/tempname.c src/walker.c src/main.c
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test estat-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test estat-test link-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test estat-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test estat-test link-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -100,5 +100,15 @@ bin/estat_test: test/estat_test.c src/uring.o src/jrn.o src/msgs.o src/pb.o
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ test/estat_test.c src/uring.o src/jrn.o src/msgs.o src/pb.o -pthread -lzstd
 
+# do_linkfix (link.c): anchor gen re-check, linkat, EEXIST retry (already-
+# linked idempotency vs. stale-entry replace) — the LINKFIX phase's executor
+# core, factored out so it's testable without opts_get/journal-ack/lease.
+link-test: bin/link_test
+	./bin/link_test
+
+bin/link_test: test/link_test.c src/link.o src/delete.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/link_test.c src/link.o src/delete.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o -pthread -lzstd
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test bin/estat_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test bin/estat_test bin/link_test

@@ -260,6 +260,12 @@ struct walk_ctx {
      * coordinator to fan out into chunk tasks across the fleet. */
     struct bigfile          *bigfiles;
     size_t                   n_bigfiles, cap_bigfiles;
+    /* nlink>1 files found this shard, shipped as ShardSplit.link_sightings
+     * (docs/DESIGN-hardlinks.md §3.1) alongside the existing NLINK_DUP
+     * journal emit — sent unconditionally; the coordinator decides whether
+     * the job's hardlinks spec option asks it to act on them. */
+    struct linksighting     *linksightings;
+    size_t                   n_linksightings, cap_linksightings;
     uint64_t                 split_seq;
     /* In-flight split acks: shipped, awaiting the coordinator's ack. Drained
      * (all awaited) before the shard result — the ordering invariant (§4.2) —
@@ -367,6 +373,15 @@ void process_probe(const struct shard_item *it);
  * a directory whose mtime was bumped by cross-shard renames lands on its source
  * value (docs/DESIGN-coordinator.md §2.2 DIRFIX). */
 void process_dirfix(const struct shard_item *it);
+
+/* ---- linkfix executor (link.c) ----
+ * Executes one LinkTask: linkat a hardlink-group member to its group's
+ * already-copied anchor instead of copying data again
+ * (docs/DESIGN-hardlinks.md §3.3, LINKFIX phase). */
+void process_linkfix(const struct shard_item *it);
+/* Core linkat logic (anchor gen re-check, linkat, EEXIST retry), factored out
+ * for unit testing without the coordinator-protocol machinery. */
+int do_linkfix(struct walk_ctx *ctx, int dst_fd, const struct linkfix *lf);
 
 /* ---- walker (walker.c) ---- */
 /* Processes one shard end-to-end and enqueues its ShardResult. */

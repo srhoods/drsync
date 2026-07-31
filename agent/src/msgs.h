@@ -75,6 +75,8 @@ enum {
     JR_WOULD_DELETE = 12,
     JR_DELETED = 13,
     JR_SRC_CHANGED = 14,
+    JR_LINK_CREATED = 15,  /* hardlink member linked to its group's anchor */
+    JR_LINK_FALLBACK = 16, /* hardlink group fell back to independent copy */
 };
 
 /* Control.Command */
@@ -158,6 +160,7 @@ enum {
     WI_CHUNK = 4,     /* ChunkTask: one byte range of a big file, or its finalize */
     WI_PROBE = 5,     /* ProbeTask: verify this agent's src/dst mounts before work */
     WI_DIRFIX = 6,    /* DirFixBatch: re-apply directory metadata after all copies */
+    WI_LINKFIX = 7,   /* LinkTask: linkat a hardlink-group member to its anchor */
 };
 
 /* Per-shard walk overrides (proto WalkOverrides). The coordinator sends these
@@ -198,6 +201,19 @@ struct dirmeta {
     int64_t  atime_ns, mtime_ns;
 };
 
+/* WI_LINKFIX (proto LinkTask): create one destination directory entry for a
+ * hardlink-group member by linking it to the group's anchor — the member
+ * that was already copied in full when this group was first discovered
+ * (docs/DESIGN-hardlinks.md §3.3/§3.4) — instead of copying data again.
+ * anchor_gen is the anchor's (size, mtime) at copy time, re-checked before
+ * linking so a drifted anchor aborts rather than propagating stale data. */
+struct linkfix {
+    char    *anchor_rel; /* malloc'd; owner frees */
+    char    *member_rel; /* malloc'd; owner frees */
+    uint64_t gen_size;
+    int64_t  gen_mtime_ns;
+};
+
 struct shard_item {
     uint64_t lease_id;
     uint32_t lease_ttl_s;
@@ -211,6 +227,7 @@ struct shard_item {
     size_t   n_paths;
     struct dirmeta *dirs;     /* WI_DIRFIX: malloc'd array; owner frees */
     size_t   n_dirs;
+    struct linkfix link;      /* WI_LINKFIX */
     struct walk_overrides ov; /* WI_SHARD/WI_ENTRYLIST */
     struct chunk_info chunk;  /* WI_CHUNK */
 };
@@ -255,6 +272,10 @@ struct shard_counters {
     uint64_t fidelity_exceptions; /* attribute not preservable: counted, never dropped */
     uint64_t verify_ok;
     uint64_t verify_fail;
+    /* Hardlink preservation (docs/DESIGN-hardlinks.md), all pass-scoped: */
+    uint64_t links_created;     /* member links created via linkat (space saved) */
+    uint64_t link_anchor_races; /* redundant speculative copies (§3.4) */
+    uint64_t link_fallback;     /* groups that fell back to independent-copy */
 };
 
 struct cached_opts {
@@ -302,6 +323,20 @@ struct bigfile {
 };
 void enc_bigfile_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                        const struct bigfile *files, size_t n_files);
+/* ShardSplit carrying hardlink sightings: an nlink>1 file's (dev,ino) plus its
+ * rel_path/nlink/size/mtime_ns (proto ShardSplit.LinkSighting). The walker
+ * still copies the file independently as before (D3, speculative-anchor
+ * design docs/DESIGN-hardlinks.md §3.4) — this only lets the coordinator
+ * correlate it against other members of the same group. */
+struct linksighting {
+    uint64_t dev, ino;
+    char    *rel;
+    uint32_t nlink;
+    uint64_t size;
+    int64_t  mtime_ns;
+};
+void enc_linksighting_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                            const struct linksighting *sightings, size_t n_sightings);
 void enc_shard_result(pb_buf *b, uint64_t shard_id, uint64_t lease_id, int status,
                       const struct shard_counters *c, const char *error);
 void enc_stats(pb_buf *b, const struct stats_snapshot *s);

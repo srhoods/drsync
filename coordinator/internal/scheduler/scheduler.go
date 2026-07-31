@@ -52,8 +52,10 @@ const spreadSplitThreshold = 4000
 // jobPolicy is a job's resolved agent options plus its coordinator-side
 // fan-out policy. Parsed once and cached together: both come from the spec.
 type jobPolicy struct {
-	opts   *drsyncpb.JobOptions
-	spread model.SpreadPolicy
+	opts       *drsyncpb.JobOptions
+	spread     model.SpreadPolicy
+	hardlinks  string // report | preserve — never reaches JobOptions (coordinator-side only)
+	maxGrpScan uint64
 }
 
 type Scheduler struct {
@@ -301,7 +303,8 @@ func (s *Scheduler) jobPolicy(jobID int64) (*jobPolicy, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &jobPolicy{opts: opts, spread: spec.SpreadPolicy()}
+	p := &jobPolicy{opts: opts, spread: spec.SpreadPolicy(),
+		hardlinks: spec.Spec.Metadata.Hardlinks, maxGrpScan: spec.Spec.Metadata.HardlinksMaxGroupScan}
 	s.mu.Lock()
 	s.policies[jobID] = p
 	s.mu.Unlock()
@@ -316,6 +319,19 @@ func (s *Scheduler) JobOptions(jobID int64) (*drsyncpb.JobOptions, error) {
 		return nil, err
 	}
 	return pol.opts, nil
+}
+
+// HardlinksPolicy resolves a job's metadata.hardlinks spec option (D3 default
+// "report", or "preserve" — docs/DESIGN-hardlinks.md) and its
+// hardlinks_max_group_scan cap. Coordinator-side only: unlike JobOptions,
+// this never reaches the agent — it only gates whether onShardSplit acts on
+// LinkSightings the agent already always sends (§0/§3.1).
+func (s *Scheduler) HardlinksPolicy(jobID int64) (mode string, maxGroupScan uint64, err error) {
+	pol, err := s.jobPolicy(jobID)
+	if err != nil {
+		return "", 0, err
+	}
+	return pol.hardlinks, pol.maxGrpScan, nil
 }
 
 // InvalidateOptions drops a job's cached spec (job update flow).

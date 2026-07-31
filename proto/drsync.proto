@@ -16,9 +16,9 @@
 //
 // minor 1: Heartbeat.inflight — per-lease progress detail.
 // minor 2: LinkSighting (ShardSplit), LinkTask (WorkItem), ShardCounters
-//          links_created/link_anchor_races/link_fallback — hardlink
-//          preservation wire types (docs/DESIGN-hardlinks.md). Unused by the
-//          coordinator until the LINKFIX phase lands; additive only.
+//          links_created/link_anchor_races/link_fallback, JournalRecord
+//          JR_LINK_CREATED/JR_LINK_FALLBACK — hardlink preservation wire
+//          types (docs/DESIGN-hardlinks.md); additive only.
 
 syntax = "proto3";
 
@@ -578,6 +578,9 @@ message JournalRecord {
     JR_WOULD_DELETE       = 12;  // dry-run
     JR_DELETED            = 13;
     JR_SRC_CHANGED        = 14;
+    // Hardlink preservation (docs/DESIGN-hardlinks.md):
+    JR_LINK_CREATED       = 15;  // member linked to its group's anchor
+    JR_LINK_FALLBACK      = 16;  // group fell back to independent copy
   }
   Type type        = 1;
   bytes rel_path   = 2;

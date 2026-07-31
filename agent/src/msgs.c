@@ -35,6 +35,7 @@ const char *wi_kind_name(int kind)
     case WI_CHUNK:     return "chunk";
     case WI_PROBE:     return "probe";
     case WI_DIRFIX:    return "dirfix";
+    case WI_LINKFIX:   return "linkfix";
     default:           return "unknown";
     }
 }
@@ -134,6 +135,27 @@ void enc_bigfile_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
     }
 }
 
+void enc_linksighting_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                            const struct linksighting *sightings, size_t n_sightings)
+{
+    pb_put_u64(b, 1, parent_shard_id);
+    pb_put_u64(b, 2, seq);
+    for (size_t i = 0; i < n_sightings; i++) {
+        /* one ShardSplit.LinkSighting (field 6): dev(1), ino(2), rel_path(3),
+         * nlink(4), size(5), mtime_ns(6) */
+        pb_buf ls;
+        pb_init(&ls);
+        pb_put_u64(&ls, 1, sightings[i].dev);
+        pb_put_u64(&ls, 2, sightings[i].ino);
+        pb_put_bytes(&ls, 3, sightings[i].rel, strlen(sightings[i].rel));
+        pb_put_u64(&ls, 4, sightings[i].nlink);
+        pb_put_u64(&ls, 5, sightings[i].size);
+        pb_put_i64(&ls, 6, sightings[i].mtime_ns);
+        pb_put_msg(b, 6, &ls);
+        pb_free(&ls);
+    }
+}
+
 static void enc_counters(pb_buf *b, uint32_t field, const struct shard_counters *c)
 {
     pb_buf sub;
@@ -154,6 +176,9 @@ static void enc_counters(pb_buf *b, uint32_t field, const struct shard_counters 
     pb_put_u64(&sub, 14, c->fidelity_exceptions);
     pb_put_u64(&sub, 15, c->verify_ok);
     pb_put_u64(&sub, 16, c->verify_fail);
+    pb_put_u64(&sub, 17, c->links_created);
+    pb_put_u64(&sub, 18, c->link_anchor_races);
+    pb_put_u64(&sub, 19, c->link_fallback);
     pb_put_msg(b, field, &sub);
     pb_free(&sub);
 }
@@ -551,11 +576,15 @@ void shard_item_free(struct shard_item *it)
         free(it->dirs[i].rel_path);
     free(it->dirs);
     free(it->chunk.temp_name);
+    free(it->link.anchor_rel);
+    free(it->link.member_rel);
     it->rel_path = NULL;
     it->paths = NULL;
     it->vchecksum = NULL;
     it->dirs = NULL;
     it->chunk.temp_name = NULL;
+    it->link.anchor_rel = NULL;
+    it->link.member_rel = NULL;
     it->n_paths = 0;
     it->n_dirs = 0;
 }
@@ -890,6 +919,64 @@ static bool dec_chunk_task(const uint8_t *p, size_t n, struct shard_item *it)
     return !c.err;
 }
 
+/* LinkTask: anchor_rel (4), member_rel (5), gen (6, FileGen: size/mtime_ns). */
+static bool dec_link_task(const uint8_t *p, size_t n, struct shard_item *it)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    const uint8_t *sp;
+    size_t sn;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1: it->shard_id = pb_get_varint(&c); break;
+        case 2: it->job_id = pb_get_varint(&c); break;
+        case 3: it->pass_no = (uint32_t)pb_get_varint(&c); break;
+        case 4:
+            if (!pb_get_len(&c, &sp, &sn))
+                return false;
+            free(it->link.anchor_rel);
+            it->link.anchor_rel = malloc(sn + 1);
+            if (!it->link.anchor_rel)
+                return false;
+            memcpy(it->link.anchor_rel, sp, sn);
+            it->link.anchor_rel[sn] = '\0';
+            break;
+        case 5:
+            if (!pb_get_len(&c, &sp, &sn))
+                return false;
+            free(it->link.member_rel);
+            it->link.member_rel = malloc(sn + 1);
+            if (!it->link.member_rel)
+                return false;
+            memcpy(it->link.member_rel, sp, sn);
+            it->link.member_rel[sn] = '\0';
+            break;
+        case 6: {
+            if (!pb_get_len(&c, &sp, &sn))
+                return false;
+            pb_cur gc;
+            pb_cur_init(&gc, sp, sn);
+            uint32_t gf;
+            int gwt;
+            while (pb_next(&gc, &gf, &gwt)) {
+                switch (gf) {
+                case 1: it->link.gen_size = pb_get_varint(&gc); break;
+                case 2: it->link.gen_mtime_ns = (int64_t)pb_get_varint(&gc); break;
+                default: pb_skip(&gc, gwt);
+                }
+            }
+            if (gc.err)
+                return false;
+            break;
+        }
+        default: pb_skip(&c, wt);
+        }
+    }
+    return !c.err;
+}
+
 static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
 {
     struct shard_item it = {0};
@@ -944,6 +1031,12 @@ static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
             if (!pb_get_len(&c, &sp, &sn) || !dec_probe_task(sp, sn, &it))
                 goto fail;
             it.kind = WI_PROBE;
+            have_item = true;
+            break;
+        case 10:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_link_task(sp, sn, &it))
+                goto fail;
+            it.kind = WI_LINKFIX;
             have_item = true;
             break;
         default: pb_skip(&c, wt);

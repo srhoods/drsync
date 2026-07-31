@@ -278,6 +278,8 @@ void process_item(struct shard_item *it)
         process_probe(it);
     else if (it->kind == WI_DIRFIX)
         process_dirfix(it);
+    else if (it->kind == WI_LINKFIX)
+        process_linkfix(it);
     else
         process_shard(it);
     lease_end(); /* the processors already released the lease itself */

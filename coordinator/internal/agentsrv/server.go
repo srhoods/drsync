@@ -514,10 +514,12 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 		groups = g
 	}
 
-	// sp.LinkSightings/maxGroupScan: wiring to the job's hardlinks spec option
-	// (coordinator-side only, never a JobOptions field — docs/DESIGN-hardlinks.md)
-	// is a follow-up; the agent does not send LinkSightings yet.
-	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups, nil, 0)
+	sightings, maxGroupScan, err := s.planLinkSightings(int64(sp.ParentShardId), sp.LinkSightings)
+	if err != nil {
+		return err
+	}
+
+	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups, sightings, maxGroupScan)
 	if err != nil {
 		return err
 	}
@@ -591,6 +593,39 @@ func (s *Server) planBigFiles(parentShardID int64, bigs []*drsyncpb.ShardSplit_B
 			RelPath: rel, TempName: temp, Size: bf.Size, MtimeNs: bf.MtimeNs, NChunks: nChunks})
 	}
 	return shards, groups, nil
+}
+
+// planLinkSightings resolves whether this job opts into hardlink preservation
+// (metadata.hardlinks: preserve — docs/DESIGN-hardlinks.md) and, if so,
+// converts the wire sightings into the store's representation. A job left on
+// the D3 default ("report") gets nil back — its sightings are simply never
+// recorded, so link_groups/link_members never accumulate a single row for a
+// job that never asked for the feature. Skips the spec lookup entirely when
+// there is nothing to convert, since every ordinary ShardSplit (no nlink>1
+// files this shard) would otherwise pay a spec resolve for nothing.
+func (s *Server) planLinkSightings(parentShardID int64, wire []*drsyncpb.ShardSplit_LinkSighting) ([]store.NewLinkSighting, uint64, error) {
+	if len(wire) == 0 {
+		return nil, 0, nil
+	}
+	jobID, _, err := s.st.ShardJobPass(parentShardID)
+	if err != nil {
+		return nil, 0, err
+	}
+	mode, maxGroupScan, err := s.sched.HardlinksPolicy(jobID)
+	if err != nil {
+		return nil, 0, err
+	}
+	if mode != "preserve" {
+		return nil, 0, nil
+	}
+	sightings := make([]store.NewLinkSighting, len(wire))
+	for i, w := range wire {
+		sightings[i] = store.NewLinkSighting{
+			Dev: w.Dev, Ino: w.Ino, RelPath: string(w.RelPath),
+			Nlink: w.Nlink, Size: w.Size, MtimeNs: w.MtimeNs,
+		}
+	}
+	return sightings, maxGroupScan, nil
 }
 
 // finalizeShard builds the terminal chunk task for a group: no byte range, just
