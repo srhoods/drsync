@@ -24,7 +24,7 @@ before compression, ~30–60 GB with zstd).
 > `docs/ADMIN.md` §8. Not yet: role-based access (every authenticated caller
 > is equivalent) or OIDC/SSO, coordinator HA (§8), the event-driven pass
 > controller (state machine still ticks at 2 s).
-> **Hardlinks (2026-07-31, D11):** opt-in preservation is live — see §2.2 for the
+> **Hardlinks (2026-07-31, D11):** preservation is live and on by default — see §2.2 for the
 > LINKFIX phase and §3 for the `link_groups`/`link_members` schema; full design in
 > `docs/DESIGN-hardlinks.md`. `link_groups`/`link_members` currently follow
 > `chunk_groups`'s lifecycle (cleaned up at job purge, not per-pass) — a per-pass
@@ -77,8 +77,8 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
              mount probe)             interleaved per               metadata  group      checksums,   explicitly
                                       shard)                        sweep)    members     metadata)    triggered)
                                                                                linked to
-                                                                               anchor,
-                                                                               opt-in —
+                                                                               anchor by
+                                                                               default —
                                                                                D11)
 ```
 
@@ -98,12 +98,13 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   data starts moving seconds after pass start; there is no global "scan first" barrier.
 - `DIRFIX` applies directory metadata deepest-first from the journal's dir records
   (see agent doc §6.3). Cheap: directories are typically 1–5% of entries.
-- `LINKFIX` (D11, opt-in via `metadata.hardlinks: preserve`; `docs/DESIGN-hardlinks.md`)
+- `LINKFIX` (D11, `metadata.hardlinks`, default `preserve`; `docs/DESIGN-hardlinks.md`)
   seeds one `LinkTask` per hardlink-group member whose anchor copy has landed —
-  `seedLinkfix` reads `link_groups`/`link_members`, not the journal. A job left on the
-  D3 default (`report`) never populates that table, so this phase seeds nothing and
-  drains immediately. Sits after DIRFIX (so a member's destination directory already
-  exists) and before VERIFY (so linked files are verified like any other entry).
+  `seedLinkfix` reads `link_groups`/`link_members`, not the journal. A job that opts
+  out (`hardlinks: report`, D3's original behavior) never populates that table, so
+  this phase seeds nothing and drains immediately. Sits after DIRFIX (so a member's
+  destination directory already exists) and before VERIFY (so linked files are
+  verified like any other entry).
 - `VERIFY` grants verify batches built from the pass journal (all-metadata + sampled
   checksum per D4).
 - `DELETE` exists only when triggered with the explicit double-gate (D5); tasks are

@@ -60,9 +60,10 @@ spec:
       posix: true
       nfs4: true
       untranslatable: warn           # warn | fail | skip — how to treat an untranslatable ACL
-    hardlinks: report                # report (default) | preserve — nlink>1 files are
-                                     # copied independently either way unless preserve
-                                     # links them to a shared copy (docs/DESIGN-hardlinks.md)
+    hardlinks: preserve               # preserve (default) | report — preserve links
+                                     # nlink>1 files to a shared destination copy;
+                                     # report copies them independently (D3 behavior;
+                                     # set this to opt out) — docs/DESIGN-hardlinks.md
     hardlinks_max_group_scan: 0      # cap a link group's member count before giving up and
                                      # falling back to independent copies; 0 = unlimited
 

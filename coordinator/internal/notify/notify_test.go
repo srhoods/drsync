@@ -259,6 +259,40 @@ func TestRenderJobNoJournalSummary(t *testing.T) {
 	}
 }
 
+// The end-of-job summary must surface links_created (docs/DESIGN-hardlinks.md,
+// on by default since D11) — this was reported missing from production.
+func TestRenderJobShowsHardlinksRow(t *testing.T) {
+	_, htmlBody, textBody := renderJob(JobReport{
+		Job: "prod-cutover", State: "COMPLETED", Converged: true,
+		LinksCreated: 4_500, LinkFallback: 2, LinkAnchorRaces: 1,
+	})
+	if !strings.Contains(htmlBody, "Hardlinks") {
+		t.Error("html should include a Hardlinks row")
+	}
+	if !strings.Contains(htmlBody, "4,500") || !strings.Contains(textBody, "4,500") {
+		t.Errorf("expected grouped links_created count in both bodies:\nhtml:%s\ntext:%s", htmlBody, textBody)
+	}
+	if !strings.Contains(htmlBody, "fell back") {
+		t.Error("html should mention the fallback count when nonzero")
+	}
+	if !strings.Contains(htmlBody, "anchor race") {
+		t.Error("html should mention the anchor-race count when nonzero")
+	}
+}
+
+// A job that never touched a hardlink (LinksCreated/LinkFallback/
+// LinkAnchorRaces all zero) must not show three uninformative zero rows —
+// mirrors how Parked shards and the journal summary are conditional.
+func TestRenderJobOmitsHardlinksRowWhenUnused(t *testing.T) {
+	_, htmlBody, textBody := renderJob(JobReport{Job: "prod-cutover", State: "COMPLETED"})
+	if strings.Contains(htmlBody, "Hardlinks") {
+		t.Error("html should omit the Hardlinks row when nothing was linked")
+	}
+	if strings.Contains(textBody, "Hardlinks") {
+		t.Error("text should omit the Hardlinks row when nothing was linked")
+	}
+}
+
 func TestRenderParkedShardsAlert(t *testing.T) {
 	subject, htmlBody, textBody := renderParkedShards(ParkedShardsReport{
 		Job: "prod-cutover", Src: "/mnt/gpfs/home", Dst: "/mnt/weka/home",

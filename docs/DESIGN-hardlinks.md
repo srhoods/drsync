@@ -1,9 +1,9 @@
 # drsync Detailed Design — Hardlink Preservation
 
 **Status:** Implemented (decision D11, `ARCHITECTURE.md` §10), ratified 2026-07-31.
-Supersedes D3's blanket "not preserved" for jobs that opt in via
-`metadata.hardlinks: preserve`; default stays `report` (D3's original behavior,
-unchanged for existing jobs).
+Supersedes D3's blanket "not preserved." `metadata.hardlinks: preserve` is now the
+**default** (as of 2026-07-31); set `hardlinks: report` to opt out to D3's original
+behavior.
 **Scope:** dual-tree walker (agent), coordinator state + scheduler, wire protocol, job
 spec — all four repo areas, landed as five incremental PRs.
 
@@ -317,14 +317,13 @@ shard table's normal 10⁵–10⁶ working set (`ARCHITECTURE.md` §6), so:
 
 ```yaml
 metadata_fidelity:
-  hardlinks: preserve              # was: report (D3 default, stays default)
-                                    # preserve | report
+  hardlinks: preserve              # preserve (default, as of 2026-07-31) | report
   hardlinks_max_group_scan: 0       # 0 = unlimited; caps worst-case registry size (§3.6)
 ```
 
-`hardlinks: report` keeps exactly today's D3 behavior (independent copies, counted).
-`hardlinks: preserve` opts into this design. Default stays `report` — this is an
-explicit opt-in, not a behavior change for existing jobs.
+`hardlinks: preserve` is the default — this design's link registry runs for every job
+unless explicitly turned off. `hardlinks: report` opts back out to exactly D3's
+original behavior (independent copies, counted, no `link_groups` state built at all).
 
 Report additions (alongside existing `nlink_dup_files`/`nlink_dup_bytes`):
 
@@ -350,7 +349,9 @@ Report additions (alongside existing `nlink_dup_files`/`nlink_dup_bytes`):
 ## 6. Rollout (as landed)
 
 Landed as five incremental PRs, each independently buildable/testable, feature inert
-(`hardlinks: report`, D3's default) until the last one:
+(`hardlinks: report`, D3's original default at the time) until the last one. The
+default itself later flipped to `preserve` (2026-07-31, after the series above
+merged) — see §4.
 
 1. `dev` added to `struct estat`, wired through the `NLINK_DUP` journal record
    (`StatInfo.dev`, field 9 — already reserved in the proto, never previously

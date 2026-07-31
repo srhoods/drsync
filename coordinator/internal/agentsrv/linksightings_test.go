@@ -24,6 +24,22 @@ spec:
     hardlinks: preserve
 `
 
+// reportSpecYAML explicitly opts out of hardlink preservation (D3 behavior).
+// Distinct from specYAML (which leaves metadata.hardlinks unset and so
+// resolves to the D11 default, preserve) — needed to exercise the "report
+// mode is gated" path now that unset no longer means report.
+const reportSpecYAML = `
+apiVersion: drsync/v1
+kind: Job
+metadata:
+  name: report-e2e
+spec:
+  source: { path: /src }
+  destination: { path: /dst }
+  metadata:
+    hardlinks: report
+`
+
 func newTestServerWithSpec(t *testing.T, name string, spec []byte) (*Server, *store.Store, *store.Job) {
 	t.Helper()
 	dir := t.TempDir()
@@ -46,12 +62,12 @@ func newTestServerWithSpec(t *testing.T, name string, spec []byte) (*Server, *st
 	return srv, st, job
 }
 
-// TestPlanLinkSightingsReportModeIsGated: a job left on the D3 default
-// ("report") must not record any sightings — planLinkSightings returns nil so
-// RecordSplit never touches link_groups for a job that never asked for
-// preservation.
+// TestPlanLinkSightingsReportModeIsGated: a job that explicitly opts out
+// (metadata.hardlinks: report, D3 behavior) must not record any sightings —
+// planLinkSightings returns nil so RecordSplit never touches link_groups for
+// a job that asked not to preserve hardlinks.
 func TestPlanLinkSightingsReportModeIsGated(t *testing.T) {
-	srv, st, job := newTestServerWithSpec(t, "report-e2e", []byte(specYAML))
+	srv, st, job := newTestServerWithSpec(t, "report-e2e", []byte(reportSpecYAML))
 	pass, err := st.CreatePass(job.ID, 1, model.PassScanning)
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +117,34 @@ func TestPlanLinkSightingsPreserveModeConverts(t *testing.T) {
 	if sg.Dev != 7 || sg.Ino != 200 || sg.RelPath != "a/one" || sg.Nlink != 3 ||
 		sg.Size != 4096 || sg.MtimeNs != 123 {
 		t.Errorf("converted sighting = %+v, want dev=7 ino=200 rel=a/one nlink=3 size=4096 mtime=123", sg)
+	}
+}
+
+// TestPlanLinkSightingsDefaultsToPreserve: a job that leaves metadata.hardlinks
+// unset (specYAML) must resolve to the D11 default (preserve), not the old D3
+// default (report) — this is the actual behavior change: an operator who
+// never mentions hardlinks in their spec gets preservation for free.
+func TestPlanLinkSightingsDefaultsToPreserve(t *testing.T) {
+	srv, st, job := newTestServerWithSpec(t, "default-e2e", []byte(specYAML))
+	pass, err := st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := st.InsertShards(pass.ID, 0, []store.NewShard{{Kind: model.KindDir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wire := []*drsyncpb.ShardSplit_LinkSighting{
+		{Dev: 1, Ino: 100, RelPath: []byte("a/one"), Nlink: 2, Size: 10, MtimeNs: 1},
+	}
+	sightings, _, err := srv.planLinkSightings(root[0], wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sightings) != 1 {
+		t.Fatalf("planLinkSightings with metadata.hardlinks unset = %d sightings, want 1 (default preserve)",
+			len(sightings))
 	}
 }
 

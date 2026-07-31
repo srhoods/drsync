@@ -85,19 +85,20 @@ type JobSpec struct {
 				NFS4           *bool  `yaml:"nfs4"`
 				Untranslatable string `yaml:"untranslatable"`
 			} `yaml:"acls"`
-			// Hardlinks: report (D3 default — nlink>1 files copied
-			// independently, counted) | preserve (docs/DESIGN-hardlinks.md —
-			// a pass-scoped registry links group members to a shared
-			// anchor copy instead). Coordinator-side only: it decides
-			// whether to act on LinkSightings, never reaches the agent as
-			// a MetadataOptions field.
+			// Hardlinks: preserve (D11 default — a pass-scoped registry
+			// links group members to a shared anchor copy, docs/DESIGN-
+			// hardlinks.md) | report (D3 behavior — nlink>1 files copied
+			// independently, counted; opt out by setting this explicitly).
+			// Coordinator-side only: it decides whether to act on
+			// LinkSightings, never reaches the agent as a MetadataOptions
+			// field.
 			Hardlinks string `yaml:"hardlinks"`
 			// HardlinksMaxGroupScan caps a single link group's member
 			// count before the coordinator gives up correlating it and
-			// falls back to independent copies for that group (already
-			// what "report" does by default) — a safety valve against a
-			// pathological one-group-has-a-million-members tree blowing
-			// up link_groups/link_members. 0 = unlimited.
+			// falls back to independent copies for that group (D3
+			// behavior) — a safety valve against a pathological
+			// one-group-has-a-million-members tree blowing up
+			// link_groups/link_members. 0 = unlimited.
 			HardlinksMaxGroupScan uint64 `yaml:"hardlinks_max_group_scan"`
 			Specials              *bool  `yaml:"specials"`
 		} `yaml:"metadata"`
@@ -222,7 +223,7 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Metadata.ACLs.Untranslatable = "warn"
 	}
 	if sp.Metadata.Hardlinks == "" {
-		sp.Metadata.Hardlinks = "report" // D3 default; explicit opt-in to preserve
+		sp.Metadata.Hardlinks = "preserve" // D11 default; set "report" to opt out (D3 behavior)
 	}
 	boolDefault(&sp.Metadata.Specials, true)
 	boolDefault(&sp.Probe.RequireMount, true)

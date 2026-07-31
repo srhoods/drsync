@@ -188,6 +188,20 @@ func renderJob(r JobReport) (subject, htmlBody, textBody string) {
 		{"Orphans remaining", commas(r.OrphansRemaining)},
 		{"Delete pass ran", yesNo(r.DeletePassRan)},
 	}
+	// Hardlink preservation (docs/DESIGN-hardlinks.md, default on since D11):
+	// shown only when it did something, so a job whose tree has no hardlinks
+	// (or that opted out via metadata.hardlinks: report) doesn't carry three
+	// always-zero rows.
+	if r.LinksCreated+r.LinkAnchorRaces+r.LinkFallback > 0 {
+		text := commas(r.LinksCreated) + " linked"
+		if r.LinkFallback > 0 {
+			text += fmt.Sprintf(", %s fell back to independent copy", commas(r.LinkFallback))
+		}
+		if r.LinkAnchorRaces > 0 {
+			text += fmt.Sprintf(", %s anchor race(s)", commas(r.LinkAnchorRaces))
+		}
+		rows = append(rows, [2]string{"Hardlinks", text})
+	}
 	if r.ParkedShards > 0 {
 		rows = append(rows, [2]string{"Parked shards", commas(int64(r.ParkedShards)) + " — operator attention required"})
 	}
@@ -219,11 +233,13 @@ var journalTypes = []struct{ key, label string }{
 	{"DIR_META", "dir meta"},
 	{"SKIPPED_CLEAN", "skipped (clean)"},
 	{"VERIFY_OK", "verify ok"},
+	{"LINK_CREATED", "hardlinks created"},
 	{"WOULD_COPY", "would copy (dry-run)"},
 	{"WOULD_DELETE", "would delete (dry-run)"},
 	{"NLINK_DUP", "hardlink duplicates"},
 	{"ORPHAN", "orphans observed"},
 	{"SRC_CHANGED", "source changed mid-copy"},
+	{"LINK_FALLBACK", "hardlink groups fell back"},
 	{"ERROR", "errors"},
 	{"FIDELITY_EXCEPTION", "fidelity exceptions"},
 	{"VERIFY_FAIL", "verify failed"},

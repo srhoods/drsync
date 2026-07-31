@@ -36,8 +36,8 @@ func TestDefaultsAppliedToMinimalSpec(t *testing.T) {
 	if sp.Tuning.ShardBudget != 2_000 {
 		t.Errorf("tuning.shard_budget = %d, want 2000", sp.Tuning.ShardBudget)
 	}
-	if sp.Metadata.Hardlinks != "report" {
-		t.Errorf("metadata.hardlinks = %q, want report", sp.Metadata.Hardlinks)
+	if sp.Metadata.Hardlinks != "preserve" {
+		t.Errorf("metadata.hardlinks = %q, want preserve", sp.Metadata.Hardlinks)
 	}
 	if sp.Metadata.HardlinksMaxGroupScan != 0 {
 		t.Errorf("metadata.hardlinks_max_group_scan = %d, want 0 (unlimited)",

@@ -2,10 +2,12 @@ package model
 
 import "testing"
 
-// TestHardlinksPreserveParses confirms the opt-in value round-trips: this is
-// coordinator-side-only (docs/DESIGN-hardlinks.md) — it never reaches
+// TestHardlinksPreserveParses confirms the explicit value round-trips: this
+// is coordinator-side-only (docs/DESIGN-hardlinks.md) — it never reaches
 // ToJobOptions/MetadataOptions, so there is nothing to assert there, only
-// that the spec field itself parses and is validated.
+// that the spec field itself parses and is validated. preserve is also the
+// D11 default (TestDefaultsAppliedToMinimalSpec), so this pins the explicit
+// spelling stays equivalent to leaving it unset.
 func TestHardlinksPreserveParses(t *testing.T) {
 	spec := filterBase + "  metadata:\n    hardlinks: preserve\n"
 	s, err := ParseSpec([]byte(spec))
@@ -14,6 +16,22 @@ func TestHardlinksPreserveParses(t *testing.T) {
 	}
 	if s.Spec.Metadata.Hardlinks != "preserve" {
 		t.Errorf("metadata.hardlinks = %q, want preserve", s.Spec.Metadata.Hardlinks)
+	}
+}
+
+// TestHardlinksReportOptsOut confirms explicitly setting "report" sticks
+// (D3 behavior) rather than being defaulted back to "preserve" — the *bool
+// pattern used elsewhere in this file doesn't apply to a string field, so
+// this is the guard against a boolDefault-style "empty means unset" bug
+// silently overriding an explicit opt-out.
+func TestHardlinksReportOptsOut(t *testing.T) {
+	spec := filterBase + "  metadata:\n    hardlinks: report\n"
+	s, err := ParseSpec([]byte(spec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Spec.Metadata.Hardlinks != "report" {
+		t.Errorf("metadata.hardlinks = %q, want report (explicit opt-out must stick)", s.Spec.Metadata.Hardlinks)
 	}
 }
 
