@@ -39,7 +39,7 @@ import (
 // flag) only to deliberately exclude old agents.
 const (
 	ProtoMajor = 1
-	ProtoMinor = 1
+	ProtoMinor = 2
 
 	// MinorInflight is the minor at which agents began reporting per-lease
 	// in-flight detail in the heartbeat.

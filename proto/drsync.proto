@@ -15,6 +15,10 @@
 // "agent does not report this" apart from "agent reports zero".
 //
 // minor 1: Heartbeat.inflight — per-lease progress detail.
+// minor 2: LinkSighting (ShardSplit), LinkTask (WorkItem), ShardCounters
+//          links_created/link_anchor_races/link_fallback — hardlink
+//          preservation wire types (docs/DESIGN-hardlinks.md). Unused by the
+//          coordinator until the LINKFIX phase lands; additive only.
 
 syntax = "proto3";
 
@@ -398,6 +402,20 @@ message ProbeTask {
   uint64 job_id  = 2;
 }
 
+// Creates one destination directory entry for a hardlink-group member by
+// linking it to the group's anchor (the first member of the group already
+// copied in full) instead of copying data again. See docs/DESIGN-hardlinks.md
+// §3.3. Seeded only once the anchor's copy is confirmed landed.
+message LinkTask {
+  uint64 task_id     = 1;
+  uint64 job_id      = 2;
+  uint32 pass_no     = 3;
+  string anchor_rel  = 4;  // destination path already populated (the anchor)
+  string member_rel  = 5;  // destination path to linkat into existence
+  FileGen anchor_gen = 6;  // size/mtime the anchor had when copied; re-checked
+                           // before linking so a drifted anchor is caught
+}
+
 message WorkItem {
   uint64 lease_id    = 1;
   uint32 lease_ttl_s = 2;
@@ -409,6 +427,7 @@ message WorkItem {
     VerifyBatch    verify     = 7;
     DeleteBatch    delete     = 8;
     ProbeTask      probe      = 9;
+    LinkTask       link       = 10;
   }
 }
 
@@ -441,9 +460,25 @@ message ShardSplit {
     uint64 size     = 2;
     int64  mtime_ns = 3;  // with size, the gen a chunk aborts on if it drifts
   }
-  repeated NewShard subdirs         = 3;
-  repeated NewEntryList entry_lists = 4;
-  repeated BigFile big_files        = 5;
+  // A regular file with nlink>1 (D3's NLINK_DUP case). The walker still
+  // copies it independently as before (speculative-anchor design,
+  // docs/DESIGN-hardlinks.md §3.4) — this sighting only lets the coordinator
+  // correlate it against other members of the same (dev,ino) group so later
+  // members can be linked instead of copied. nlink is the group's expected
+  // member count as this file's own stat saw it (a lower bound: filters can
+  // exclude some members from ever being sighted).
+  message LinkSighting {
+    uint64 dev      = 1;
+    uint64 ino      = 2;
+    bytes  rel_path = 3;
+    uint32 nlink    = 4;
+    uint64 size     = 5;
+    int64  mtime_ns = 6;
+  }
+  repeated NewShard     subdirs         = 3;
+  repeated NewEntryList entry_lists     = 4;
+  repeated BigFile      big_files       = 5;
+  repeated LinkSighting link_sightings  = 6;
 }
 
 message ShardSplitAck {
@@ -486,6 +521,12 @@ message ShardCounters {
   uint64 fidelity_exceptions = 14;
   uint64 verify_ok           = 15;
   uint64 verify_fail         = 16;
+  // Hardlink preservation (docs/DESIGN-hardlinks.md), all pass-scoped:
+  uint64 links_created    = 17;  // member links created via linkat (space saved)
+  uint64 link_anchor_races = 18;  // redundant speculative copies (§3.4) — bounded,
+                                  // at most one per group, tracked for visibility
+  uint64 link_fallback    = 19;  // groups that fell back to independent-copy
+                                 // (anchor failure or hardlinks_max_group_scan cap)
 }
 
 message ShardResult {

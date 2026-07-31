@@ -298,8 +298,12 @@ type passView struct {
 	FidelityExc   int64           `json:"fidelity_exceptions"`
 	VerifyOK      int64           `json:"verify_ok"`
 	VerifyFail    int64           `json:"verify_fail"`
-	StartedAtMs   int64           `json:"started_at_ms,omitempty"`
-	FinishedAtMs  int64           `json:"finished_at_ms,omitempty"`
+	// Hardlink preservation (docs/DESIGN-hardlinks.md), pass-scoped.
+	LinksCreated    int64 `json:"links_created"`
+	LinkAnchorRaces int64 `json:"link_anchor_races"`
+	LinkFallback    int64 `json:"link_fallback"`
+	StartedAtMs     int64 `json:"started_at_ms,omitempty"`
+	FinishedAtMs    int64 `json:"finished_at_ms,omitempty"`
 	// DurationMs is finished-started for a completed pass, or elapsed-so-far
 	// (now-started) for one still running. Zero if the pass never started.
 	DurationMs int64 `json:"duration_ms"`
@@ -312,6 +316,8 @@ func passViewOf(p *store.Pass) passView {
 		MetaFixed: p.MetaFixed, Orphans: p.Orphans, Errors: p.Errors,
 		FidelityExc: p.FidelityExceptions,
 		VerifyOK:    p.VerifyOK, VerifyFail: p.VerifyFail,
+		LinksCreated: p.LinksCreated, LinkAnchorRaces: p.LinkAnchorRaces,
+		LinkFallback: p.LinkFallback,
 	}
 	if p.Started.Valid {
 		v.StartedAtMs = p.Started.Int64

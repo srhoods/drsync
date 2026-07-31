@@ -65,6 +65,10 @@ type JobReport struct {
 	OrphansRemaining int64
 	DeletePassRan    bool
 	ParkedShards     int
+	// Hardlink preservation (docs/DESIGN-hardlinks.md), summed across passes.
+	LinksCreated    int64
+	LinkAnchorRaces int64
+	LinkFallback    int64
 	// JournalSummary is the per-type record histogram across every pass of the
 	// job (the same aggregation as `drsync journal cat <name> --summary`),
 	// keyed by record type with the "JR_" prefix stripped (e.g. "COPIED",
