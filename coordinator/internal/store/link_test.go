@@ -26,6 +26,78 @@ func TestRecordLinkSightingsFirstIsAnchor(t *testing.T) {
 	}
 }
 
+// TestRecordLinkSightingsHighBitInode is the production regression: VAST (and
+// other filesystems with 64-bit inode allocators) hands out inode numbers
+// with the high bit set, which database/sql's default uint64 argument
+// converter rejects outright ("values with high bit set are not supported"),
+// independent of the SQLite column's declared type. dev/ino must survive a
+// round trip through link_groups/link_members at the full uint64 range,
+// including math.MaxUint64 itself.
+func TestRecordLinkSightingsHighBitInode(t *testing.T) {
+	s := openTest(t)
+	_, passID, shardID := seed(t, s)
+
+	const hugeIno uint64 = 1<<63 + 12345 // high bit set, VAST-scale
+	const maxIno uint64 = 1<<64 - 1      // math.MaxUint64
+	first := []NewLinkSighting{
+		{Dev: 1, Ino: hugeIno, RelPath: "a/one", Nlink: 2, Size: 4096, MtimeNs: 111},
+	}
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, first, 0); err != nil {
+		t.Fatalf("RecordSplit with a high-bit inode: %v", err)
+	}
+	second := []NewLinkSighting{
+		{Dev: 1, Ino: hugeIno, RelPath: "b/two", Nlink: 2, Size: 4096, MtimeNs: 111},
+	}
+	if _, err := s.RecordSplit(shardID, 2, nil, nil, second, 0); err != nil {
+		t.Fatalf("RecordSplit (second sighting) with a high-bit inode: %v", err)
+	}
+	// A second, independent group at the absolute max value.
+	maxGroup := []NewLinkSighting{
+		{Dev: maxIno, Ino: maxIno, RelPath: "c/max", Nlink: 2, Size: 8192, MtimeNs: 222},
+	}
+	if _, err := s.RecordSplit(shardID, 3, nil, nil, maxGroup, 0); err != nil {
+		t.Fatalf("RecordSplit with dev=ino=MaxUint64: %v", err)
+	}
+
+	members, err := s.PendingLinkMembers(passID)
+	if err != nil {
+		t.Fatalf("PendingLinkMembers after a high-bit inode: %v", err)
+	}
+	if len(members) != 1 {
+		t.Fatalf("PendingLinkMembers = %v, want 1 (b/two, pending against the huge-inode anchor)", members)
+	}
+	m := members[0]
+	if m.RelPath != "b/two" || m.AnchorRelPath != "a/one" || m.AnchorSize != 4096 {
+		t.Errorf("member = %+v, want rel_path=b/two anchor=a/one size=4096", m)
+	}
+
+	// dev/ino round-trip exactly, not just "some value" — verified via the raw
+	// row rather than a Go-side accessor, since dev/ino are never SELECTed
+	// back into a struct anywhere in the production code path. Filtered by
+	// dev=1 to disambiguate from the second (dev=ino=MaxUint64) group also in
+	// this pass.
+	var rawIno int64
+	if err := s.rdb.QueryRow(`SELECT ino FROM link_groups
+		WHERE pass_id = ? AND dev = 1`, passID).Scan(&rawIno); err != nil {
+		t.Fatalf("reading back the huge-inode group row: %v", err)
+	}
+	if gotIno := uint64(rawIno); gotIno != hugeIno {
+		t.Errorf("group ino round-tripped as %d, want %d", gotIno, hugeIno)
+	}
+
+	// The MaxUint64 group (dev=ino=MaxUint64) round-trips too — the absolute
+	// edge of the type, not just "a large value".
+	var rawMaxDev, rawMaxIno int64
+	if err := s.rdb.QueryRow(`SELECT dev, ino FROM link_groups
+		WHERE pass_id = ? AND dev != 1`, passID).Scan(&rawMaxDev, &rawMaxIno); err != nil {
+		t.Fatalf("reading back the MaxUint64 group row: %v", err)
+	}
+	if uint64(rawMaxDev) != maxIno || uint64(rawMaxIno) != maxIno {
+		t.Errorf("MaxUint64 group round-tripped as (%d,%d), want (%d,%d)",
+			uint64(rawMaxDev), uint64(rawMaxIno), maxIno, maxIno)
+	}
+}
+
 // TestRecordLinkSightingsSecondIsPendingMember: a later sighting of the same
 // group is a pending member, joined with the anchor's path and gen — exactly
 // what seedLinkfix needs to build a LinkTask.
