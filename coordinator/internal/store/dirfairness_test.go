@@ -19,7 +19,7 @@ import (
 // that would starve everything else without the cap.
 func seedEntrylist(t *testing.T, s *Store, nEL, nOther int) (elIDs, otherIDs []int64) {
 	t.Helper()
-	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	job, err := s.CreateJob("t1", []byte(specYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

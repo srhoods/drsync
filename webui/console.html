@@ -1214,10 +1214,11 @@
       const passtxt = j.pass_count
         ? `pass ${j.pass_no} · ${esc((j.pass_state || "").toLowerCase())}`
         : (j.state === "COMPLETED" ? "converged" : "—");
-      const meta = j.pass_count
+      const meta = (j.pass_count
         ? `${countFmt(j.entries_walked)} walked · ${countFmt(j.files_copied)} copied` +
           (j.state === "RUNNING" ? ` · running ${humanMS(j.duration_running_ms)}` : "")
-        : (j.dry_run ? "dry-run · not started" : "—");
+        : (j.dry_run ? "dry-run · not started" : "—")) +
+        (j.username ? ` · ${esc(j.username)}` : "");
       const right = j.dry_run ? "dry-run" : (j.state === "RUNNING" ? "live" : esc(j.state.toLowerCase()));
       return `<div class="jrow ${sev} ${j.name === S.selected ? "sel" : ""}" tabindex="0" role="button" data-job="${esc(j.name)}">
         <div class="sev"></div>

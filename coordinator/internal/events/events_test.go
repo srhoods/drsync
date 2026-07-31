@@ -59,7 +59,7 @@ func TestPollerDiffsStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	job, err := st.CreateJob("evjob", []byte(jobSpecYAML), false)
+	job, err := st.CreateJob("evjob", []byte(jobSpecYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

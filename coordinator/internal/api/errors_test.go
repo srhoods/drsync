@@ -70,7 +70,7 @@ func setup(t *testing.T) (*Server, int64) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	job, err := st.CreateJob("j", []byte(jobSpecYAML), false)
+	job, err := st.CreateJob("j", []byte(jobSpecYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

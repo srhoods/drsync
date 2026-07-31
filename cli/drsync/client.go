@@ -10,11 +10,27 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"strings"
 	"time"
 
 	"github.com/coder/websocket"
 )
+
+// localUsername identifies who is running the CLI, sent as the
+// X-Drsync-Username header so job list/submit can attribute jobs to a
+// person. os/user requires cgo (or a working NSS) to resolve accounts on
+// some systems, notably minimal containers, so it falls back to the
+// $USER/$LOGNAME env vars used by every shell.
+func localUsername() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	if v := os.Getenv("USER"); v != "" {
+		return v
+	}
+	return os.Getenv("LOGNAME")
+}
 
 type client struct {
 	server string
@@ -60,6 +76,9 @@ func (c *client) do(method, path string, body []byte, out any) error {
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if u := localUsername(); u != "" {
+		req.Header.Set("X-Drsync-Username", u)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

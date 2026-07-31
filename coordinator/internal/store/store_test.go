@@ -699,7 +699,7 @@ func openTest(t *testing.T) *Store {
 
 func seed(t *testing.T, s *Store) (jobID, passID, shardID int64) {
 	t.Helper()
-	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	job, err := s.CreateJob("t1", []byte(specYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -976,7 +976,7 @@ func TestSplitIdempotency(t *testing.T) {
 // when it last started running), and restamped with a later time on resume.
 func TestRunningSinceStampedOnEntryToRunning(t *testing.T) {
 	s := openTest(t)
-	job, err := s.CreateJob("run-since", []byte(specYAML), false)
+	job, err := s.CreateJob("run-since", []byte(specYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1415,7 +1415,7 @@ func TestCountSchedulableAgents(t *testing.T) {
 // anyone.
 func TestTargetedShardOnlyLeasedByTarget(t *testing.T) {
 	s := openTest(t)
-	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	job, err := s.CreateJob("t1", []byte(specYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1455,7 +1455,7 @@ func TestTargetedShardOnlyLeasedByTarget(t *testing.T) {
 // phase is not stalled by a shard no live agent can lease.
 func TestPruneStaleProbes(t *testing.T) {
 	s := openTest(t)
-	job, err := s.CreateJob("t1", []byte(specYAML), false)
+	job, err := s.CreateJob("t1", []byte(specYAML), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1545,7 +1545,7 @@ func TestCreateJobDestinationConflictIsAtomic(t *testing.T) {
 			defer wg.Done()
 			<-start // release them together to maximise overlap
 			name := fmt.Sprintf("j%d", i)
-			_, errs[i] = s.CreateJob(name, spec(name, "/dst/home"), false)
+			_, errs[i] = s.CreateJob(name, spec(name, "/dst/home"), false, "")
 		}(i)
 	}
 	close(start)

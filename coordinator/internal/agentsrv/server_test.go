@@ -78,7 +78,7 @@ func TestAgentSession(t *testing.T) {
 	pc := passctrl.New(st, dir)
 
 	// Seed: job submitted and started (pass 1 with root shard).
-	if _, err := st.CreateJob("e2e", []byte(specYAML), false); err != nil {
+	if _, err := st.CreateJob("e2e", []byte(specYAML), false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := pc.StartJob("e2e"); err != nil {
@@ -205,7 +205,7 @@ func newTestServer(t *testing.T) *Server {
 	met := metrics.New()
 	sched := scheduler.New(st, met, 30*time.Second)
 	pc := passctrl.New(st, dir)
-	if _, err := st.CreateJob("e2e", []byte(specYAML), false); err != nil {
+	if _, err := st.CreateJob("e2e", []byte(specYAML), false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := pc.StartJob("e2e"); err != nil {

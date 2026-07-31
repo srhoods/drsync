@@ -49,7 +49,7 @@ func getJSON(t *testing.T, h http.HandlerFunc, path string, into any) {
 // reintroduce the N+1 the console used to issue on every 2.5s poll.
 func TestListJobsCarriesPassRollup(t *testing.T) {
 	srv := consoleSrv(t)
-	job, err := srv.st.CreateJob("rollup", []byte(specFor("rollup", "/src/a", "/dst/a")), false)
+	job, err := srv.st.CreateJob("rollup", []byte(specFor("rollup", "/src/a", "/dst/a")), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestListJobsCarriesPassRollup(t *testing.T) {
 // the read path either way).
 func TestListJobsCarriesDurationRunning(t *testing.T) {
 	srv := consoleSrv(t)
-	job, err := srv.st.CreateJob("dur", []byte(specFor("dur", "/src/d", "/dst/d")), false)
+	job, err := srv.st.CreateJob("dur", []byte(specFor("dur", "/src/d", "/dst/d")), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestListJobsCarriesDurationRunning(t *testing.T) {
 // yield zeroes rather than dropping the row or erroring on NULLs.
 func TestListJobsWithNoPasses(t *testing.T) {
 	srv := consoleSrv(t)
-	if _, err := srv.st.CreateJob("fresh", []byte(specFor("fresh", "/src/b", "/dst/b")), true); err != nil {
+	if _, err := srv.st.CreateJob("fresh", []byte(specFor("fresh", "/src/b", "/dst/b")), true, ""); err != nil {
 		t.Fatal(err)
 	}
 	var got []struct {
@@ -227,7 +227,7 @@ func TestReportParkedCarriesParkTime(t *testing.T) {
 // writing journal segments getReport would have to scan.
 func TestReportCarriesJournalSummary(t *testing.T) {
 	srv := consoleSrv(t)
-	job, err := srv.st.CreateJob("jsum", []byte(specFor("jsum", "/src/j", "/dst/j")), false)
+	job, err := srv.st.CreateJob("jsum", []byte(specFor("jsum", "/src/j", "/dst/j")), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestReportNeverReadsJournalFiles(t *testing.T) {
 	journalRoot := filepath.Join(dir, "journals")
 	srv := New(st, nil, metrics.New(), nil, journalRoot, "")
 
-	job, err := srv.st.CreateJob("noscan", []byte(specFor("noscan", "/src/n", "/dst/n")), false)
+	job, err := srv.st.CreateJob("noscan", []byte(specFor("noscan", "/src/n", "/dst/n")), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,7 +424,7 @@ func TestAgentInflightDisconnected404s(t *testing.T) {
 // and returns its id plus a timestamp taken before the park.
 func parkOneShard(t *testing.T, srv *Server) (int64, int64) {
 	t.Helper()
-	job, err := srv.st.CreateJob("parked-job", []byte(specFor("parked-job", "/src/c", "/dst/c")), false)
+	job, err := srv.st.CreateJob("parked-job", []byte(specFor("parked-job", "/src/c", "/dst/c")), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

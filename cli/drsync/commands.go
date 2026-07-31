@@ -37,10 +37,11 @@ type passView struct {
 }
 
 type jobView struct {
-	Name   string     `json:"name"`
-	State  string     `json:"state"`
-	DryRun bool       `json:"dry_run"`
-	Passes []passView `json:"passes"`
+	Name     string     `json:"name"`
+	State    string     `json:"state"`
+	DryRun   bool       `json:"dry_run"`
+	Username string     `json:"username"`
+	Passes   []passView `json:"passes"`
 }
 
 type event struct {
@@ -209,9 +210,9 @@ func jobList(args []string) error {
 		return err
 	}
 	tw := newTable()
-	fmt.Fprintln(tw, "NAME\tSTATE\tDRY-RUN")
+	fmt.Fprintln(tw, "NAME\tSTATE\tDRY-RUN\tUSER")
 	for _, j := range jobs {
-		fmt.Fprintf(tw, "%s\t%s\t%v\n", j.Name, j.State, j.DryRun)
+		fmt.Fprintf(tw, "%s\t%s\t%v\t%s\n", j.Name, j.State, j.DryRun, j.Username)
 	}
 	return tw.Flush()
 }
