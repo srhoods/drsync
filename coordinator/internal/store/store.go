@@ -1006,9 +1006,19 @@ type NewLinkSighting struct {
 // recorded either way, so the report's group-size number stays accurate.
 func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting, maxGroupScan uint64) error {
 	for _, sg := range sightings {
+		// SQLite INTEGER storage is 64-bit two's-complement, same as int64 —
+		// but database/sql's default converter rejects a uint64 with the high
+		// bit set outright ("values with high bit set are not supported"),
+		// which VAST (and other filesystems with 64-bit inode allocators)
+		// routinely produces. int64(x) here is a bit-preserving reinterpret,
+		// not a truncation: the exact value round-trips back out via
+		// uint64(int64Value) on read (see PendingLinkMembers).
+		dev, ino := int64(sg.Dev), int64(sg.Ino)
+		size := int64(sg.Size)
+
 		var exists bool
 		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM link_groups
-			WHERE pass_id = ? AND dev = ? AND ino = ?)`, passID, sg.Dev, sg.Ino).Scan(&exists); err != nil {
+			WHERE pass_id = ? AND dev = ? AND ino = ?)`, passID, dev, ino).Scan(&exists); err != nil {
 			return err
 		}
 		memberState := "pending"
@@ -1018,30 +1028,30 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 				(pass_id, dev, ino, nlink_expected, anchor_rel_path,
 				 anchor_size, anchor_mtime_ns, anchor_state, updated_at)
 				VALUES (?,?,?,?,?,?,?, 'copied', ?)`,
-				passID, sg.Dev, sg.Ino, sg.Nlink, sg.RelPath, sg.Size, sg.MtimeNs, nowMS()); err != nil {
+				passID, dev, ino, sg.Nlink, sg.RelPath, size, sg.MtimeNs, nowMS()); err != nil {
 				return err
 			}
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO link_members
 			(pass_id, dev, ino, rel_path, state) VALUES (?,?,?,?,?)`,
-			passID, sg.Dev, sg.Ino, sg.RelPath, memberState); err != nil {
+			passID, dev, ino, sg.RelPath, memberState); err != nil {
 			return err
 		}
 		var seen uint64
 		var priorState string
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM link_members
-			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, sg.Dev, sg.Ino).Scan(&seen); err != nil {
+			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, dev, ino).Scan(&seen); err != nil {
 			return err
 		}
 		if err := tx.QueryRow(`SELECT anchor_state FROM link_groups
-			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, sg.Dev, sg.Ino).Scan(&priorState); err != nil {
+			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, dev, ino).Scan(&priorState); err != nil {
 			return err
 		}
 		fallback := maxGroupScan > 0 && seen > maxGroupScan
 		if _, err := tx.Exec(`UPDATE link_groups SET members_seen = ?, updated_at = ?,
 			anchor_state = CASE WHEN ? THEN 'fallback' ELSE anchor_state END
 			WHERE pass_id = ? AND dev = ? AND ino = ?`,
-			seen, nowMS(), fallback, passID, sg.Dev, sg.Ino); err != nil {
+			seen, nowMS(), fallback, passID, dev, ino); err != nil {
 			return err
 		}
 		// Count the transition into fallback exactly once per group — not
@@ -1067,10 +1077,16 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	groups []NewChunkGroup, sightings []NewLinkSighting, maxGroupScan uint64) ([]int64, error) {
 	s.lockTimed("RecordSplit")
 	defer s.mu.Unlock()
+	// int64(seq): bit-preserving reinterpret, not a truncation — see
+	// recordLinkSightingsTx's comment. seq is agent-assigned per-parent and in
+	// practice never near 2^63, but binding a uint64 with the high bit set
+	// fails outright regardless of value, so this is defensive rather than a
+	// known-triggering case like dev/ino.
+	seq64 := int64(seq)
 
 	var idsJSON string
 	err := s.db.QueryRow(`SELECT assigned_ids FROM splits WHERE parent_shard_id = ? AND seq = ?`,
-		parentShardID, seq).Scan(&idsJSON)
+		parentShardID, seq64).Scan(&idsJSON)
 	if err == nil {
 		var ids []int64
 		return ids, json.Unmarshal([]byte(idsJSON), &ids)
@@ -1095,10 +1111,13 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	for _, g := range groups {
 		// INSERT OR IGNORE: a big file already fanned out in an earlier split
 		// (e.g. the parent re-ran) keeps its original group and chunk shards.
+		// int64(g.Size): see recordLinkSightingsTx's comment on why a uint64
+		// with the high bit set must be reinterpreted, not passed as-is —
+		// database/sql rejects it outright regardless of column type.
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO chunk_groups
 			(pass_id, rel_path, temp_name, size, mtime_ns, n_chunks)
 			VALUES (?,?,?,?,?,?)`,
-			passID, g.RelPath, g.TempName, g.Size, g.MtimeNs, g.NChunks); err != nil {
+			passID, g.RelPath, g.TempName, int64(g.Size), g.MtimeNs, g.NChunks); err != nil {
 			return nil, err
 		}
 	}
@@ -1107,7 +1126,7 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	}
 	blob, _ := json.Marshal(ids)
 	if _, err := tx.Exec(`INSERT INTO splits (parent_shard_id, seq, assigned_ids) VALUES (?,?,?)`,
-		parentShardID, seq, string(blob)); err != nil {
+		parentShardID, seq64, string(blob)); err != nil {
 		return nil, err
 	}
 	return ids, tx.Commit()
@@ -1188,9 +1207,11 @@ func (s *Store) PendingLinkMembers(passID int64) ([]LinkMember, error) {
 	var out []LinkMember
 	for rows.Next() {
 		var m LinkMember
-		if err := rows.Scan(&m.RelPath, &m.AnchorRelPath, &m.AnchorSize, &m.AnchorMtimeNs); err != nil {
+		var anchorSize int64 // see recordLinkSightingsTx: stored via int64(sg.Size)
+		if err := rows.Scan(&m.RelPath, &m.AnchorRelPath, &anchorSize, &m.AnchorMtimeNs); err != nil {
 			return nil, err
 		}
+		m.AnchorSize = uint64(anchorSize)
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -2186,13 +2207,17 @@ func (s *Store) SchedulerCounts() (SchedulerCounts, error) {
 func (s *Store) JournalCursor(passID int64, agentID string) (uint64, error) {
 	s.lockTimed("JournalCursor")
 	defer s.mu.Unlock()
-	var seq uint64
+	// Scan into int64, not uint64: database/sql's Scan rejects a stored value
+	// with the high bit set the same way Exec rejects a uint64 argument (see
+	// recordLinkSightingsTx). uint64(seq) below is the matching bit-preserving
+	// reinterpret back.
+	var seq int64
 	err := s.db.QueryRow(`SELECT acked_seq FROM journal_cursors WHERE pass_id = ? AND agent_id = ?`,
 		passID, agentID).Scan(&seq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
-	return seq, err
+	return uint64(seq), err
 }
 
 func (s *Store) SetJournalCursor(passID int64, agentID string, seq uint64) error {
@@ -2200,6 +2225,6 @@ func (s *Store) SetJournalCursor(passID int64, agentID string, seq uint64) error
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO journal_cursors (pass_id, agent_id, acked_seq) VALUES (?,?,?)
 		ON CONFLICT(pass_id, agent_id) DO UPDATE SET acked_seq = MAX(acked_seq, excluded.acked_seq)`,
-		passID, agentID, seq)
+		passID, agentID, int64(seq))
 	return err
 }
