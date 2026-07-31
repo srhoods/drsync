@@ -172,6 +172,7 @@ struct estat {
     uint32_t        mode;
     uint32_t        uid, gid;
     uint32_t        nlink;
+    uint64_t        dev;  /* st_dev; ino is only unique combined with this */
     uint64_t        ino;
     uint64_t        size;
     uint64_t        blocks; /* 512B blocks; sparseness heuristic */

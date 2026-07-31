@@ -138,6 +138,7 @@ static void estat_from_statx(struct estat *e, const struct statx *sx)
     e->uid = sx->stx_uid;
     e->gid = sx->stx_gid;
     e->nlink = sx->stx_nlink;
+    e->dev = makedev(sx->stx_dev_major, sx->stx_dev_minor);
     e->ino = sx->stx_ino;
     e->size = sx->stx_size;
     e->blocks = sx->stx_blocks;
@@ -155,6 +156,7 @@ void estat_of(struct estat *e, const struct stat *st)
     e->uid = st->st_uid;
     e->gid = st->st_gid;
     e->nlink = (uint32_t)st->st_nlink;
+    e->dev = (uint64_t)st->st_dev;
     e->ino = (uint64_t)st->st_ino;
     e->size = (uint64_t)st->st_size;
     e->blocks = (uint64_t)st->st_blocks;

@@ -6,7 +6,7 @@ SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test estat-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test estat-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -90,5 +90,15 @@ bin/opts_test: src/state.o src/uring.o src/pb.o test/opts_test.c
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ test/opts_test.c src/state.o src/uring.o src/pb.o -pthread
 
+# struct estat's dev field (agent.h) and its NLINK_DUP journal encoding
+# (msgs.c enc_stat_info field 9) — (dev,ino) is the key the coordinator's
+# duplication-cost aggregation and (later) the hardlink registry rely on.
+estat-test: bin/estat_test
+	./bin/estat_test
+
+bin/estat_test: test/estat_test.c src/uring.o src/jrn.o src/msgs.o src/pb.o
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/estat_test.c src/uring.o src/jrn.o src/msgs.o src/pb.o -pthread -lzstd
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test bin/estat_test
