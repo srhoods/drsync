@@ -50,7 +50,7 @@ func newTestServerWithSpec(t *testing.T, name string, spec []byte) (*Server, *st
 	t.Cleanup(func() { st.Close() })
 	met := metrics.New()
 	sched := scheduler.New(st, met, 30*time.Second)
-	job, err := st.CreateJob(name, spec, false)
+	job, err := st.CreateJob(name, spec, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

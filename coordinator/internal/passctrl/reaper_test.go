@@ -108,7 +108,7 @@ metadata:
 spec:
   source: { path: /src2 }
   destination: { path: /dst2 }
-`), false)
+`), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

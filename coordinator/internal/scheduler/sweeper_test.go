@@ -39,7 +39,7 @@ func newSweeperStore(t *testing.T) *store.Store {
 // right, not just that some counter incremented.
 func TestRunSweeperLabelsExpiryByAgentAndKind(t *testing.T) {
 	st := newSweeperStore(t)
-	job, err := st.CreateJob("t1", []byte(sweeperSpec), false)
+	job, err := st.CreateJob("t1", []byte(sweeperSpec), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestRunSweeperLabelsExpiryByAgentAndKind(t *testing.T) {
 // the reason shards are dying outright" when reading the metric.
 func TestRunSweeperLabelsFinalExpiryAsParked(t *testing.T) {
 	st := newSweeperStore(t)
-	job, err := st.CreateJob("t1", []byte(sweeperSpec), false)
+	job, err := st.CreateJob("t1", []byte(sweeperSpec), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

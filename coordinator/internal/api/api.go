@@ -228,6 +228,23 @@ func (s *Server) validSessionCookie(r *http.Request) bool {
 	return err == nil
 }
 
+// requestUsername identifies who is making the request, for attribution
+// (e.g. job submission) rather than authorization. A WebUI session cookie is
+// authoritative — it names the account that logged in. There is no
+// equivalent identity behind the shared bearer token, so CLI submits send
+// their OS user in a header instead; that value is client-asserted and only
+// ever used for display, never for access control.
+func (s *Server) requestUsername(r *http.Request) string {
+	if s.sessions != nil {
+		if c, err := r.Cookie(authn.CookieName); err == nil {
+			if u, err := s.sessions.Verify(c.Value); err == nil && u != "" {
+				return u
+			}
+		}
+	}
+	return r.Header.Get("X-Drsync-Username")
+}
+
 func httpErr(w http.ResponseWriter, code int, format string, args ...any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -243,10 +260,11 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 // ---------------------------------------------------------------------------
 
 type jobView struct {
-	Name   string         `json:"name"`
-	State  model.JobState `json:"state"`
-	DryRun bool           `json:"dry_run"`
-	Passes []passView     `json:"passes,omitempty"`
+	Name     string         `json:"name"`
+	State    model.JobState `json:"state"`
+	DryRun   bool           `json:"dry_run"`
+	Username string         `json:"username,omitempty"`
+	Passes   []passView     `json:"passes,omitempty"`
 }
 
 // jobListView is a jobs-list row: the job plus the pass rollup the console
@@ -256,6 +274,7 @@ type jobListView struct {
 	Name          string          `json:"name"`
 	State         model.JobState  `json:"state"`
 	DryRun        bool            `json:"dry_run"`
+	Username      string          `json:"username,omitempty"`
 	PassCount     int             `json:"pass_count"`
 	PassNo        int             `json:"pass_no,omitempty"`
 	PassState     model.PassState `json:"pass_state,omitempty"`
@@ -345,7 +364,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dryRun := r.URL.Query().Get("dry_run") == "true"
-	job, err := s.st.CreateJob(spec.Metadata.Name, body, dryRun)
+	username := s.requestUsername(r)
+	job, err := s.st.CreateJob(spec.Metadata.Name, body, dryRun, username)
 	var dc *store.DestinationConflictError
 	if errors.As(err, &dc) {
 		httpErr(w, http.StatusConflict, "%s", destConflictMsg(dc))
@@ -355,8 +375,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusConflict, "create job: %v", err)
 		return
 	}
-	slog.Info("job submitted", "job", job.Name, "dry_run", dryRun)
-	writeJSON(w, http.StatusCreated, jobView{Name: job.Name, State: job.State, DryRun: job.DryRun})
+	slog.Info("job submitted", "job", job.Name, "dry_run", dryRun, "username", username)
+	writeJSON(w, http.StatusCreated, jobView{Name: job.Name, State: job.State, DryRun: job.DryRun, Username: job.Username})
 }
 
 // destConflictMsg explains an overlapping destination in operator terms: what
@@ -380,7 +400,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	out := make([]jobListView, 0, len(jobs))
 	for _, j := range jobs {
 		out = append(out, jobListView{
-			Name: j.Name, State: j.State, DryRun: j.DryRun,
+			Name: j.Name, State: j.State, DryRun: j.DryRun, Username: j.Username,
 			PassCount: j.Passes, PassNo: j.LatestPassNo,
 			PassState: j.LatestPassState, EntriesWalked: j.LatestEntriesWalked,
 			FilesCopied: j.FilesCopied, BytesCopied: j.BytesCopied,
@@ -401,7 +421,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	v := jobView{Name: job.Name, State: job.State, DryRun: job.DryRun}
+	v := jobView{Name: job.Name, State: job.State, DryRun: job.DryRun, Username: job.Username}
 	passes, err := s.st.ListPasses(job.ID)
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, "%v", err)

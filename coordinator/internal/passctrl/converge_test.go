@@ -37,7 +37,7 @@ func newController(t *testing.T) *Controller {
 // makeJob creates a RUNNING job from spec and returns it.
 func makeJob(t *testing.T, c *Controller, spec []byte) *store.Job {
 	t.Helper()
-	job, err := c.st.CreateJob("t1", spec, false)
+	job, err := c.st.CreateJob("t1", spec, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

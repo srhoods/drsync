@@ -11,7 +11,7 @@ import (
 // PROBING with one probe pinned to each agent — the root walk shard is withheld.
 func TestSeedPassProbesConnectedAgents(t *testing.T) {
 	c := newController(t)
-	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false); err != nil {
+	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.st.UpsertAgent("a1", "h", "v1", 1); err != nil {
@@ -55,7 +55,7 @@ func TestSeedPassProbesConnectedAgents(t *testing.T) {
 // machine inserts the root shard and advances PROBING → SCANNING.
 func TestProbeGateTransitionsToScanning(t *testing.T) {
 	c := newController(t)
-	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false); err != nil {
+	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.st.UpsertAgent("a1", "h", "v1", 1); err != nil {
@@ -94,7 +94,7 @@ func TestProbeGateTransitionsToScanning(t *testing.T) {
 // to probe, so the pass opens directly in SCANNING with the root shard.
 func TestSeedPassNoAgentsFallsBackToScanning(t *testing.T) {
 	c := newController(t)
-	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false); err != nil {
+	if _, err := c.st.CreateJob("t1", []byte(baseSpec), false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.StartJob("t1"); err != nil {

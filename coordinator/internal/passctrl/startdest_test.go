@@ -21,7 +21,7 @@ spec:
 
 func makeJobNamed(t *testing.T, c *Controller, name, dst string) *store.Job {
 	t.Helper()
-	job, err := c.st.CreateJob(name, destSpec(name, dst), false)
+	job, err := c.st.CreateJob(name, destSpec(name, dst), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

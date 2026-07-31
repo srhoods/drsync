@@ -35,7 +35,7 @@ func TestGrantNeverExceedsAgentReceiveBuffer(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	job, err := st.CreateJob("t1", []byte(sweeperSpec), false)
+	job, err := st.CreateJob("t1", []byte(sweeperSpec), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestGrantBelowCapIsUnaffected(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	job, err := st.CreateJob("t1", []byte(sweeperSpec), false)
+	job, err := st.CreateJob("t1", []byte(sweeperSpec), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

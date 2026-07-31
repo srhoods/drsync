@@ -389,6 +389,7 @@ var migrations = []string{
 	`ALTER TABLE passes ADD COLUMN links_created INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE passes ADD COLUMN link_anchor_races INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE passes ADD COLUMN link_fallback INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE jobs ADD COLUMN username TEXT NOT NULL DEFAULT ''`,
 }
 
 func (s *Store) Close() error {
@@ -416,6 +417,7 @@ type Job struct {
 	SpecYAML       []byte
 	State          model.JobState
 	DryRun         bool
+	Username       string
 	CreatedAt      int64
 	UpdatedAt      int64
 	RunningSinceMs sql.NullInt64
@@ -473,7 +475,7 @@ func (s *Store) destinationConflictLocked(excludeName, dst string, states []mode
 // CreateJob inserts a READY job. The destination-overlap check runs under the
 // same lock as the insert: checking in the caller would let two concurrent
 // submits of overlapping destinations both pass before either row lands.
-func (s *Store) CreateJob(name string, specYAML []byte, dryRun bool) (*Job, error) {
+func (s *Store) CreateJob(name string, specYAML []byte, dryRun bool, username string) (*Job, error) {
 	s.lockTimed("CreateJob")
 	defer s.mu.Unlock()
 	spec, err := model.ParseSpec(specYAML)
@@ -486,14 +488,14 @@ func (s *Store) CreateJob(name string, specYAML []byte, dryRun bool) (*Job, erro
 	}
 	now := nowMS()
 	res, err := s.db.Exec(
-		`INSERT INTO jobs (name, spec_yaml, state, dry_run, created_at, updated_at) VALUES (?,?,?,?,?,?)`,
-		name, specYAML, string(model.JobReady), boolInt(dryRun), now, now)
+		`INSERT INTO jobs (name, spec_yaml, state, dry_run, username, created_at, updated_at) VALUES (?,?,?,?,?,?,?)`,
+		name, specYAML, string(model.JobReady), boolInt(dryRun), username, now, now)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
 	return &Job{ID: id, Name: name, SpecYAML: specYAML, State: model.JobReady,
-		DryRun: dryRun, CreatedAt: now, UpdatedAt: now}, nil
+		DryRun: dryRun, Username: username, CreatedAt: now, UpdatedAt: now}, nil
 }
 
 func boolInt(b bool) int {
@@ -506,14 +508,14 @@ func boolInt(b bool) int {
 func scanJob(row interface{ Scan(...any) error }) (*Job, error) {
 	var j Job
 	var dry int
-	if err := row.Scan(&j.ID, &j.Name, &j.SpecYAML, &j.State, &dry, &j.CreatedAt, &j.UpdatedAt, &j.RunningSinceMs); err != nil {
+	if err := row.Scan(&j.ID, &j.Name, &j.SpecYAML, &j.State, &dry, &j.Username, &j.CreatedAt, &j.UpdatedAt, &j.RunningSinceMs); err != nil {
 		return nil, err
 	}
 	j.DryRun = dry != 0
 	return &j, nil
 }
 
-const jobCols = `id, name, spec_yaml, state, dry_run, created_at, updated_at, running_since_ms`
+const jobCols = `id, name, spec_yaml, state, dry_run, username, created_at, updated_at, running_since_ms`
 
 func (s *Store) GetJob(name string) (*Job, error) {
 	return scanJob(s.rdb.QueryRow(`SELECT `+jobCols+` FROM jobs WHERE name = ?`, name))
@@ -571,7 +573,7 @@ type JobSummary struct {
 // match instead.
 func (s *Store) JobSummaries() ([]*JobSummary, error) {
 	rows, err := s.rdb.Query(`SELECT j.id, j.name, j.state,
-		  j.dry_run, j.created_at, j.updated_at, j.running_since_ms,
+		  j.dry_run, j.username, j.created_at, j.updated_at, j.running_since_ms,
 		  COALESCE(t.npasses, 0), COALESCE(t.files, 0),
 		  COALESCE(t.bytes, 0), COALESCE(t.errors, 0),
 		  COALESCE(lp.pass_no, 0), COALESCE(lp.state, ''),
@@ -591,7 +593,7 @@ func (s *Store) JobSummaries() ([]*JobSummary, error) {
 	for rows.Next() {
 		var v JobSummary
 		var dry int
-		if err := rows.Scan(&v.ID, &v.Name, &v.State, &dry,
+		if err := rows.Scan(&v.ID, &v.Name, &v.State, &dry, &v.Username,
 			&v.CreatedAt, &v.UpdatedAt, &v.RunningSinceMs, &v.Passes, &v.FilesCopied, &v.BytesCopied,
 			&v.Errors, &v.LatestPassNo, &v.LatestPassState,
 			&v.LatestEntriesWalked); err != nil {

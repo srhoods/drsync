@@ -468,14 +468,14 @@ func TestCheckParkedShardsFlushesOnWindowElapseWithoutNewPark(t *testing.T) {
 
 func TestJobParkedShardsFiltersByJob(t *testing.T) {
 	c := newController(t)
-	job1, err := c.st.CreateJob("j1", baseSpec2("j1"), false)
+	job1, err := c.st.CreateJob("j1", baseSpec2("j1"), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := c.st.SetJobState(job1.ID, model.JobRunning); err != nil {
 		t.Fatal(err)
 	}
-	job2, err := c.st.CreateJob("j2", baseSpec2("j2"), false)
+	job2, err := c.st.CreateJob("j2", baseSpec2("j2"), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
