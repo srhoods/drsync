@@ -275,6 +275,13 @@ func (s *Scheduler) buildItem(row *store.ShardRow, ov *drsyncpb.WalkOverrides) (
 	case model.KindProbe:
 		item.Item = &drsyncpb.WorkItem_Probe{Probe: &drsyncpb.ProbeTask{
 			TaskId: uint64(row.ID), JobId: jobID}}
+	case model.KindLinkfix:
+		m := &drsyncpb.LinkTask{}
+		if err := proto.Unmarshal(row.Payload, m); err != nil {
+			return nil, err
+		}
+		m.TaskId, m.JobId, m.PassNo = uint64(row.ID), jobID, passNo
+		item.Item = &drsyncpb.WorkItem_Link{Link: m}
 	default:
 		return nil, fmt.Errorf("unknown shard kind %q", row.Kind)
 	}

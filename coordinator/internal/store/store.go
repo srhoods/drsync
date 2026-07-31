@@ -1028,8 +1028,13 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 			return err
 		}
 		var seen uint64
+		var priorState string
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM link_members
 			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, sg.Dev, sg.Ino).Scan(&seen); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(`SELECT anchor_state FROM link_groups
+			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, sg.Dev, sg.Ino).Scan(&priorState); err != nil {
 			return err
 		}
 		fallback := maxGroupScan > 0 && seen > maxGroupScan
@@ -1038,6 +1043,15 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 			WHERE pass_id = ? AND dev = ? AND ino = ?`,
 			seen, nowMS(), fallback, passID, sg.Dev, sg.Ino); err != nil {
 			return err
+		}
+		// Count the transition into fallback exactly once per group — not
+		// every subsequent sighting of an already-fallen-back group, which
+		// would inflate the report's cost signal past the actual group count.
+		if fallback && priorState != "fallback" {
+			if _, err := tx.Exec(`UPDATE passes SET link_fallback = link_fallback + 1
+				WHERE id = ?`, passID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

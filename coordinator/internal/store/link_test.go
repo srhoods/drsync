@@ -115,6 +115,13 @@ func TestRecordLinkSightingsMaxGroupScanFallback(t *testing.T) {
 	}, 2); err != nil {
 		t.Fatal(err)
 	}
+	// Fourth sighting of the SAME already-fallen-back group: must not
+	// increment link_fallback again (it counts groups, not sightings).
+	if _, err := s.RecordSplit(shardID, 4, nil, nil, []NewLinkSighting{
+		{Dev: 1, Ino: 100, RelPath: "d/four", Nlink: 3, Size: 10, MtimeNs: 1},
+	}, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	var anchorState string
 	if err := s.rdb.QueryRow(`SELECT anchor_state FROM link_groups
@@ -130,6 +137,16 @@ func TestRecordLinkSightingsMaxGroupScanFallback(t *testing.T) {
 	}
 	if len(members) != 0 {
 		t.Fatalf("PendingLinkMembers = %v, want none once the group fell back", members)
+	}
+
+	var linkFallback int64
+	if err := s.rdb.QueryRow(`SELECT link_fallback FROM passes WHERE id = ?`, passID).
+		Scan(&linkFallback); err != nil {
+		t.Fatal(err)
+	}
+	if linkFallback != 1 {
+		t.Errorf("passes.link_fallback = %d, want 1 (one group fell back, four sightings)",
+			linkFallback)
 	}
 }
 

@@ -171,6 +171,9 @@ static void test_eexist_already_linked_is_idempotent(void)
     };
     int status = do_linkfix(&ctx, dst_fd, &lf);
     CHECK(status == RES_OK, "status = %d, want RES_OK (idempotent re-run)", status);
+    CHECK(ctx.c.links_created == 0, "links_created = %llu, want 0 (already converged, not a new link)",
+          (unsigned long long)ctx.c.links_created);
+    CHECK(last_journal_type(&ctx) == -1, "journal should stay empty on an idempotent no-op re-run");
 
     struct stat mst;
     CHECK(fstatat(dst_fd, "member", &mst, AT_SYMLINK_NOFOLLOW) == 0, "member vanished");
