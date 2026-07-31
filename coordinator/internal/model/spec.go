@@ -85,7 +85,21 @@ type JobSpec struct {
 				NFS4           *bool  `yaml:"nfs4"`
 				Untranslatable string `yaml:"untranslatable"`
 			} `yaml:"acls"`
-			Specials *bool `yaml:"specials"`
+			// Hardlinks: report (D3 default — nlink>1 files copied
+			// independently, counted) | preserve (docs/DESIGN-hardlinks.md —
+			// a pass-scoped registry links group members to a shared
+			// anchor copy instead). Coordinator-side only: it decides
+			// whether to act on LinkSightings, never reaches the agent as
+			// a MetadataOptions field.
+			Hardlinks string `yaml:"hardlinks"`
+			// HardlinksMaxGroupScan caps a single link group's member
+			// count before the coordinator gives up correlating it and
+			// falls back to independent copies for that group (already
+			// what "report" does by default) — a safety valve against a
+			// pathological one-group-has-a-million-members tree blowing
+			// up link_groups/link_members. 0 = unlimited.
+			HardlinksMaxGroupScan uint64 `yaml:"hardlinks_max_group_scan"`
+			Specials              *bool  `yaml:"specials"`
 		} `yaml:"metadata"`
 		Probe struct {
 			// RequireMount gates the per-agent mount probe: when true (default)
@@ -206,6 +220,9 @@ func (s *JobSpec) ApplyDefaults() {
 	boolDefault(&sp.Metadata.ACLs.NFS4, true)
 	if sp.Metadata.ACLs.Untranslatable == "" {
 		sp.Metadata.ACLs.Untranslatable = "warn"
+	}
+	if sp.Metadata.Hardlinks == "" {
+		sp.Metadata.Hardlinks = "report" // D3 default; explicit opt-in to preserve
 	}
 	boolDefault(&sp.Metadata.Specials, true)
 	boolDefault(&sp.Probe.RequireMount, true)
@@ -347,6 +364,11 @@ func (s *JobSpec) Validate() error {
 	}
 	if r := s.Spec.Verify.Checksum.SampleRate; r < 0 || r > 1 {
 		return fmt.Errorf("verify.checksum.sample_rate must be in [0,1]")
+	}
+	switch s.Spec.Metadata.Hardlinks {
+	case "report", "preserve":
+	default:
+		return fmt.Errorf("metadata.hardlinks must be report|preserve")
 	}
 	switch s.Spec.Tuning.SpreadMode {
 	case SpreadAuto, SpreadOff, SpreadAlways:

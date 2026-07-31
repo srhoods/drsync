@@ -225,6 +225,47 @@ CREATE TABLE IF NOT EXISTS chunk_groups (
   PRIMARY KEY (pass_id, rel_path)
 ) WITHOUT ROWID;
 
+-- link_groups/link_members correlate hardlink-group members across shards
+-- (docs/DESIGN-hardlinks.md). A group is identified by (dev,ino), which is
+-- unique only within one pass's walk — this is scratch state, reaped with the
+-- rest of the pass's shard rows, not a durable cross-pass inode map (D3's
+-- rationale survives: no *durable* global inode map is introduced).
+--
+-- anchor_state: pending (anchor sighted, its shard result not back yet) |
+-- copied (anchor confirmed landed; members can now be linked) | fallback
+-- (anchor failed, or the group exceeded hardlinks_max_group_scan — members
+-- fall back to independent copies, already what happened by default).
+CREATE TABLE IF NOT EXISTS link_groups (
+  pass_id          INTEGER NOT NULL,
+  dev              INTEGER NOT NULL,
+  ino              INTEGER NOT NULL,
+  nlink_expected   INTEGER NOT NULL,
+  members_seen     INTEGER NOT NULL DEFAULT 0,
+  anchor_rel_path  TEXT NOT NULL DEFAULT '',
+  -- anchor_size/anchor_mtime_ns are the gen the anchor was copied at, carried
+  -- on every LinkTask (FileGen) so a linkat re-checks the anchor has not
+  -- drifted since — the same drift guard ChunkTask.gen gives chunk fan-out.
+  anchor_size      INTEGER NOT NULL DEFAULT 0,
+  anchor_mtime_ns  INTEGER NOT NULL DEFAULT 0,
+  anchor_state     TEXT NOT NULL DEFAULT 'pending',
+  updated_at       INTEGER NOT NULL,
+  PRIMARY KEY (pass_id, dev, ino)
+) WITHOUT ROWID;
+
+-- One row per sighted member of a link group (including the anchor member
+-- itself, state 'anchor'). state: pending (awaiting a LinkTask) | queued (a
+-- LinkTask now exists for it) | linked (linkat succeeded) | anchor (this
+-- member IS the group's anchor copy).
+CREATE TABLE IF NOT EXISTS link_members (
+  pass_id  INTEGER NOT NULL,
+  dev      INTEGER NOT NULL,
+  ino      INTEGER NOT NULL,
+  rel_path TEXT NOT NULL,
+  state    TEXT NOT NULL DEFAULT 'pending',
+  PRIMARY KEY (pass_id, dev, ino, rel_path)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS link_members_group ON link_members (pass_id, dev, ino);
+
 -- journal_type_counts is the per-(pass, journal record type) histogram —
 -- what "drsync journal cat --summary" reports — computed once by
 -- SetJournalTypeCounts when a pass reaches COMPLETE (passctrl.advancePhase)
@@ -638,10 +679,12 @@ func (s *Store) DeleteJob(name string) (int64, error) {
 		`DELETE FROM shards WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM shard_counts WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM chunk_groups WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM link_members WHERE pass_id IN (` + passSel + `)`,
+		`DELETE FROM link_groups WHERE pass_id IN (` + passSel + `)`,
 		`DELETE FROM passes WHERE job_id = ?`,
 		`DELETE FROM jobs WHERE id = ?`,
 	}
-	args := []any{id, id, id, id, id, id, id, id}
+	args := []any{id, id, id, id, id, id, id, id, id, id}
 	for i, q := range stmts {
 		if _, err := tx.Exec(q, args[i]); err != nil {
 			return 0, err
@@ -930,11 +973,84 @@ type NewChunkGroup struct {
 	NChunks  int
 }
 
+// NewLinkSighting is one nlink>1 file the walker reported on a ShardSplit
+// (docs/DESIGN-hardlinks.md §3.1) — a raw sighting, not yet correlated against
+// any other member of its (dev,ino) group.
+type NewLinkSighting struct {
+	Dev, Ino uint64
+	RelPath  string
+	Nlink    uint32
+	Size     uint64
+	MtimeNs  int64
+}
+
+// recordLinkSightingsTx folds sightings into link_groups/link_members. The
+// first sighting of a (pass,dev,ino) group becomes its anchor (state
+// 'copied' — set here, not 'pending', because the walker copies the anchor
+// speculatively inline during the same walk that reports the sighting, per
+// the speculative-anchor design in docs/DESIGN-hardlinks.md §3.4; there is no
+// separate "anchor confirmed" round trip to wait for). Every later sighting of
+// the same group is inserted as a 'pending' member.
+//
+// Idempotent throughout via INSERT OR IGNORE on the (pass,dev,ino,rel_path)
+// primary key of link_members: a re-sent ShardSplit (retransmit) or a member
+// re-seen after its shard is re-queued records the same row twice for free,
+// with no separate dedup check needed. members_seen is a straight COUNT(*)
+// after each insert, not an incremented counter — a counter invites exactly
+// the double-counting bug a retransmit would otherwise trigger.
+//
+// maxGroupScan (0 = unlimited) caps a group's member count: once the count
+// exceeds it, the group flips to anchor_state 'fallback' so seedLinkfix never
+// seeds a LinkTask for any of its members — they keep the independent copies
+// the walker already made. The member row this sighting represents is still
+// recorded either way, so the report's group-size number stays accurate.
+func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting, maxGroupScan uint64) error {
+	for _, sg := range sightings {
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM link_groups
+			WHERE pass_id = ? AND dev = ? AND ino = ?)`, passID, sg.Dev, sg.Ino).Scan(&exists); err != nil {
+			return err
+		}
+		memberState := "pending"
+		if !exists {
+			memberState = "anchor"
+			if _, err := tx.Exec(`INSERT INTO link_groups
+				(pass_id, dev, ino, nlink_expected, anchor_rel_path,
+				 anchor_size, anchor_mtime_ns, anchor_state, updated_at)
+				VALUES (?,?,?,?,?,?,?, 'copied', ?)`,
+				passID, sg.Dev, sg.Ino, sg.Nlink, sg.RelPath, sg.Size, sg.MtimeNs, nowMS()); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO link_members
+			(pass_id, dev, ino, rel_path, state) VALUES (?,?,?,?,?)`,
+			passID, sg.Dev, sg.Ino, sg.RelPath, memberState); err != nil {
+			return err
+		}
+		var seen uint64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM link_members
+			WHERE pass_id = ? AND dev = ? AND ino = ?`, passID, sg.Dev, sg.Ino).Scan(&seen); err != nil {
+			return err
+		}
+		fallback := maxGroupScan > 0 && seen > maxGroupScan
+		if _, err := tx.Exec(`UPDATE link_groups SET members_seen = ?, updated_at = ?,
+			anchor_state = CASE WHEN ? THEN 'fallback' ELSE anchor_state END
+			WHERE pass_id = ? AND dev = ? AND ino = ?`,
+			seen, nowMS(), fallback, passID, sg.Dev, sg.Ino); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RecordSplit persists a ShardSplit idempotently: retransmits of the same
 // (parent, seq) return the originally assigned ids (protocol doc §4.3). groups
-// (for big files whose data-chunk shards are among shards) are created in the
-// same transaction; pass nil when there are none.
-func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard, groups []NewChunkGroup) ([]int64, error) {
+// (for big files whose data-chunk shards are among shards) and sightings
+// (nlink>1 files reported this split) are recorded in the same transaction;
+// pass nil for either when there are none. maxGroupScan is the job's
+// hardlinks_max_group_scan (0 = unlimited).
+func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
+	groups []NewChunkGroup, sightings []NewLinkSighting, maxGroupScan uint64) ([]int64, error) {
 	s.lockTimed("RecordSplit")
 	defer s.mu.Unlock()
 
@@ -971,6 +1087,9 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard, 
 			passID, g.RelPath, g.TempName, g.Size, g.MtimeNs, g.NChunks); err != nil {
 			return nil, err
 		}
+	}
+	if err := recordLinkSightingsTx(tx, passID, sightings, maxGroupScan); err != nil {
+		return nil, err
 	}
 	blob, _ := json.Marshal(ids)
 	if _, err := tx.Exec(`INSERT INTO splits (parent_shard_id, seq, assigned_ids) VALUES (?,?,?)`,
@@ -1020,6 +1139,69 @@ func (s *Store) UnfinalizedChunkTemps(passID int64) ([]ChunkTemp, error) {
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// LinkMember is one hardlink-group member still awaiting a LinkTask, joined
+// with the group's anchor path and the (size, mtime) gen it was copied at —
+// everything seedLinkfix needs to build the LinkTask directly, no second query
+// per row.
+type LinkMember struct {
+	RelPath       string
+	AnchorRelPath string
+	AnchorSize    uint64
+	AnchorMtimeNs int64
+}
+
+// PendingLinkMembers lists a pass's hardlink-group members whose group anchor
+// has confirmed COPIED but which have not yet been linked — the set
+// seedLinkfix turns into LinkTasks at the DIRFIX→LINKFIX transition. A group
+// whose anchor never reached 'copied' (fallback, or still pending — the
+// latter should not happen once the scan phase has drained, since every
+// sighting arrives via ShardSplit before its shard's result) contributes no
+// rows: its members keep the independent copies they already made
+// speculatively.
+func (s *Store) PendingLinkMembers(passID int64) ([]LinkMember, error) {
+	rows, err := s.rdb.Query(`
+		SELECT m.rel_path, g.anchor_rel_path, g.anchor_size, g.anchor_mtime_ns
+		FROM link_members m
+		JOIN link_groups g ON g.pass_id = m.pass_id AND g.dev = m.dev AND g.ino = m.ino
+		WHERE m.pass_id = ? AND m.state = 'pending' AND g.anchor_state = 'copied'`,
+		passID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LinkMember
+	for rows.Next() {
+		var m LinkMember
+		if err := rows.Scan(&m.RelPath, &m.AnchorRelPath, &m.AnchorSize, &m.AnchorMtimeNs); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// MarkLinkMembersQueued flips 'pending' members to 'queued' once seedLinkfix
+// has inserted their LinkTask, so a defensive re-run of seedLinkfix (there is
+// none on the current call path — advance() only reaches PendingLinkMembers
+// once per pass, at the DIRFIX→LINKFIX transition — but the same table would
+// otherwise silently double-seed if that ever changed) sees nothing left to do.
+func (s *Store) MarkLinkMembersQueued(passID int64, relPaths []string) error {
+	if len(relPaths) == 0 {
+		return nil
+	}
+	s.lockTimed("MarkLinkMembersQueued")
+	defer s.mu.Unlock()
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(relPaths)), ",")
+	args := make([]any, 0, len(relPaths)+1)
+	args = append(args, passID)
+	for _, p := range relPaths {
+		args = append(args, p)
+	}
+	_, err := s.db.Exec(`UPDATE link_members SET state = 'queued'
+		WHERE pass_id = ? AND state = 'pending' AND rel_path IN (`+ph+`)`, args...)
+	return err
 }
 
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for

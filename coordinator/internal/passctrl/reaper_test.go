@@ -136,9 +136,10 @@ spec:
 	assertNoneGone(t, c, "other pass's DONE shards", otherDone)
 }
 
-// TestAdvanceReapsDirfixOnVerifyTransition: DIRFIX's own DONE shards are reaped
-// once the pass reaches VERIFY.
-func TestAdvanceReapsDirfixOnVerifyTransition(t *testing.T) {
+// TestAdvanceReapsDirfixOnLinkfixTransition: DIRFIX's own DONE shards are
+// reaped once the pass reaches LINKFIX (the phase now inserted between DIRFIX
+// and VERIFY, docs/DESIGN-hardlinks.md).
+func TestAdvanceReapsDirfixOnLinkfixTransition(t *testing.T) {
 	c := newController(t)
 	job := makeJob(t, c, []byte(baseSpec))
 	pass, err := c.st.CreatePass(job.ID, 1, model.PassDirfix)
@@ -154,10 +155,35 @@ func TestAdvanceReapsDirfixOnVerifyTransition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if pass.State != model.PassLinkfix {
+		t.Fatalf("pass state = %s, want LINKFIX", pass.State)
+	}
+	assertAllGone(t, c, "dirfix-phase DONE shards", doneDirfix)
+}
+
+// TestAdvanceReapsLinkfixOnVerifyTransition: LINKFIX's own DONE shards (empty
+// link_groups here — no LinkTasks were seeded, so this exercises the
+// no-op-but-still-advances path) are reaped once the pass reaches VERIFY.
+func TestAdvanceReapsLinkfixOnVerifyTransition(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassLinkfix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneLinkfix := seedDoneShards(t, c, pass.ID, model.KindLinkfix, 30)
+
+	if err := c.advance(job); err != nil {
+		t.Fatal(err)
+	}
+	pass, err = c.st.PassByNo(job.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if pass.State != model.PassVerify {
 		t.Fatalf("pass state = %s, want VERIFY", pass.State)
 	}
-	assertAllGone(t, c, "dirfix-phase DONE shards", doneDirfix)
+	assertAllGone(t, c, "linkfix-phase DONE shards", doneLinkfix)
 }
 
 // TestAdvanceReapsVerifyOnPassComplete: VERIFY's own DONE shards are reaped

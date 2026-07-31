@@ -415,16 +415,32 @@ func (c *Controller) advance(job *store.Job) error {
 		c.reapPhase(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
 		return nil
 	case model.PassDirfix:
+		// Seed LINKFIX before flipping the phase (same reason as every other
+		// transition here: an empty queue between the SetPassState and the
+		// first shard would let a tick skip straight past a phase with
+		// nothing granted yet).
+		n, err := c.seedLinkfix(pass)
+		if err != nil {
+			return err
+		}
+		slog.Info("pass phase: DIRFIX → LINKFIX", "job", job.Name,
+			"pass", pass.PassNo, "link_tasks", n)
+		if err := c.st.SetPassState(pass.ID, model.PassLinkfix); err != nil {
+			return err
+		}
+		c.reapPhase(job, pass, model.KindDirfix)
+		return nil
+	case model.PassLinkfix:
 		n, err := c.seedVerify(job, pass)
 		if err != nil {
 			return err
 		}
-		slog.Info("pass phase: DIRFIX → VERIFY", "job", job.Name,
+		slog.Info("pass phase: LINKFIX → VERIFY", "job", job.Name,
 			"pass", pass.PassNo, "verify_entries", n)
 		if err := c.st.SetPassState(pass.ID, model.PassVerify); err != nil {
 			return err
 		}
-		c.reapPhase(job, pass, model.KindDirfix)
+		c.reapPhase(job, pass, model.KindLinkfix)
 		return nil
 	case model.PassVerify:
 		// DELETE phase only on explicit operator trigger (D5); default skips.
@@ -591,6 +607,53 @@ func (c *Controller) seedTempReclaim(pass *store.Pass) (int, error) {
 		return 0, nil
 	}
 	if _, err := c.st.InsertShards(pass.ID, 0, shards); err != nil {
+		return 0, err
+	}
+	return len(shards), nil
+}
+
+// seedLinkfix builds one LinkTask shard per hardlink-group member whose
+// group's anchor copy has confirmed landed (docs/DESIGN-hardlinks.md §3.3).
+// Called only once the DIRFIX phase has drained: LinkSightings arrive on
+// ShardSplit alongside every other kind of shard discovery, so a sighting
+// from any still-queued or still-leased shard could still add a pending
+// member after this point — draining SCANNING (checked long before DIRFIX
+// even starts) already proves no such shard remains, which is the same
+// completeness argument seedTempReclaim relies on for chunk residue.
+//
+// A group whose anchor never reached 'copied' contributes no rows — its
+// members already have independent copies from the speculative-anchor walk
+// (§3.4), so there is nothing to do for them here; that outcome is counted at
+// journal time as LINK_FALLBACK, not here.
+func (c *Controller) seedLinkfix(pass *store.Pass) (int, error) {
+	members, err := c.st.PendingLinkMembers(pass.ID)
+	if err != nil {
+		return 0, err
+	}
+	if len(members) == 0 {
+		return 0, nil
+	}
+	shards := make([]store.NewShard, 0, len(members))
+	relPaths := make([]string, 0, len(members))
+	for _, m := range members {
+		payload, err := proto.Marshal(&drsyncpb.LinkTask{
+			JobId:     uint64(pass.JobID),
+			PassNo:    uint32(pass.PassNo),
+			AnchorRel: m.AnchorRelPath,
+			MemberRel: m.RelPath,
+			AnchorGen: &drsyncpb.FileGen{Size: m.AnchorSize, MtimeNs: m.AnchorMtimeNs},
+		})
+		if err != nil {
+			return 0, err
+		}
+		shards = append(shards, store.NewShard{
+			Kind: model.KindLinkfix, RelPath: m.RelPath, Payload: payload})
+		relPaths = append(relPaths, m.RelPath)
+	}
+	if _, err := c.st.InsertShards(pass.ID, 0, shards); err != nil {
+		return 0, err
+	}
+	if err := c.st.MarkLinkMembersQueued(pass.ID, relPaths); err != nil {
 		return 0, err
 	}
 	return len(shards), nil

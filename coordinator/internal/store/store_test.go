@@ -127,7 +127,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	assertCountsConsistent(t, s, "after lease (1 LEASED)")
 	if _, err := s.RecordSplit(shardID, 1, []NewShard{
 		{Kind: model.KindDir, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
-	}, nil); err != nil {
+	}, nil, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	assertCountsConsistent(t, s, "after split")
@@ -374,7 +374,7 @@ func TestReapDoneShardsDeletesSplits(t *testing.T) {
 	}
 	childIDs, err := s.RecordSplit(shardID, 1, []NewShard{
 		{Kind: model.KindEntryList, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
-	}, nil)
+	}, nil, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +405,7 @@ func TestReapDoneShardsDeletesSplits(t *testing.T) {
 	}
 	if _, err := s.RecordSplit(otherParent[0], 1, []NewShard{
 		{Kind: model.KindEntryList, RelPath: "c"},
-	}, nil); err != nil {
+	}, nil, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -953,11 +953,11 @@ func TestSplitIdempotency(t *testing.T) {
 		{Kind: model.KindDir, RelPath: "a"},
 		{Kind: model.KindDir, RelPath: "b"},
 	}
-	ids1, err := s.RecordSplit(shardID, 7, subs, nil)
+	ids1, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ids2, err := s.RecordSplit(shardID, 7, subs, nil) // retransmit
+	ids2, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0) // retransmit
 	if err != nil {
 		t.Fatal(err)
 	}
