@@ -527,6 +527,7 @@
     <span class="clock mono" id="clock">--:--:--</span>
     <span class="user-chip" id="user-chip" hidden>👤 <span id="user-name"></span></span>
     <button class="tbtn" id="logout" aria-label="Log out" hidden>logout</button>
+    <button class="tbtn" id="units" aria-label="Toggle throughput units"><span id="units-i">Gbps</span></button>
     <button class="tbtn" id="theme" aria-label="Toggle color theme"><span id="theme-i">◐</span> theme</button>
   </div>
 </header>
@@ -622,7 +623,7 @@
       <div class="tl-wrap">
         <div class="tl-top">
           <div class="tl-big"><span id="tl-now">–</span> <span class="u"></span></div>
-          <div class="tl-leg"><span><i></i> bytes/s</span><span id="tl-peak">peak –</span></div>
+          <div class="tl-leg"><span><i></i> <span id="tl-leg-u">throughput</span></span><span id="tl-peak">peak –</span></div>
         </div>
         <canvas id="tl" height="150" aria-label="Aggregate throughput timeline"></canvas>
       </div>
@@ -817,6 +818,18 @@
     drawTL(); drawSparks(); if (curView === "queue") renderQueuePage();
   });
 
+  // ---------- throughput units (persisted) ----------
+  // "bits" (default) shows network-familiar decimal bit rates (Gbps); "bytes"
+  // shows this codebase's usual binary byte rates (GiB/s), matching humanBytes.
+  let unitsMode = localStorage.getItem("drsync.units") === "bytes" ? "bytes" : "bits";
+  const applyUnits = m => { unitsMode = m; $("#units-i").textContent = m === "bytes" ? "GiB/s" : "Gbps"; };
+  applyUnits(unitsMode);
+  $("#units").addEventListener("click", () => {
+    applyUnits(unitsMode === "bytes" ? "bits" : "bytes");
+    localStorage.setItem("drsync.units", unitsMode);
+    renderKPIs(); renderFleet(); drawTL(); drawSparks();
+  });
+
   // ---------- clock ----------
   const clock = $("#clock");
   const tickClock = () => { clock.textContent = new Date().toISOString().slice(11, 19) + " UTC"; };
@@ -829,10 +842,20 @@
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return (i === 0 ? Math.round(n) : n.toFixed(n < 10 ? 2 : 1)) + " " + u[i];
   }
-  function rate(bps) { // bytes/s → [value, unit]
-    bps = +bps || 0; const u = ["B/s","KiB/s","MiB/s","GiB/s","TiB/s"]; let i = 0;
-    while (bps >= 1024 && i < u.length - 1) { bps /= 1024; i++; }
-    return [i === 0 ? String(Math.round(bps)) : bps.toFixed(bps < 10 ? 2 : 1), u[i]];
+  // rate: bytes/s → [value, unit], display-unit dependent on unitsMode.
+  // "bits" is decimal (SI, ×1000) bits/s — the network-throughput convention
+  // (a "10G" link means 10,000,000,000 bits/s, not a binary quantity).
+  // "bytes" stays binary (×1024) GiB/s-style, consistent with humanBytes.
+  function rate(bps) {
+    bps = +bps || 0;
+    if (unitsMode === "bytes") {
+      const u = ["B/s","KiB/s","MiB/s","GiB/s","TiB/s"]; let i = 0;
+      while (bps >= 1024 && i < u.length - 1) { bps /= 1024; i++; }
+      return [i === 0 ? String(Math.round(bps)) : bps.toFixed(bps < 10 ? 2 : 1), u[i]];
+    }
+    let v = bps * 8; const u = ["bps","Kbps","Mbps","Gbps","Tbps"]; let i = 0;
+    while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+    return [i === 0 ? String(Math.round(v)) : v.toFixed(v < 10 ? 2 : 1), u[i]];
   }
   function countFmt(n) {
     n = +n || 0;
@@ -1725,6 +1748,7 @@
     ctx.beginPath(); ctx.arc(ex, ey, 3.2, 0, 7); ctx.fillStyle = acc2; ctx.fill();
     const [cvv, cu] = rate(data[n - 1]); $("#tl-now").textContent = cvv;
     const uEl = document.querySelector(".tl-big .u"); if (uEl) uEl.textContent = cu;
+    $("#tl-leg-u").textContent = cu;
     const [pv, pu] = rate(Math.max(...data)); $("#tl-peak").textContent = "peak " + pv + " " + pu;
   }
   function hexA(hex, a) { hex = hex.replace("#", ""); if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");

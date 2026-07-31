@@ -181,7 +181,7 @@ test("a closely-spaced poll does not blank the fleet's rates", async () => {
     assert.notEqual(c.text(id), "\u2013", `${id} blanked after a close poll`);
   }
   const fleet = c.$("#fleet").textContent;
-  assert.ok(/MiB|GiB|KiB/.test(fleet), "fleet throughput column blanked");
+  assert.ok(/Mbps|Gbps|Kbps|MiB|GiB|KiB/.test(fleet), "fleet throughput column blanked");
 });
 
 // --------------------------------------------------------------------------
