@@ -49,8 +49,8 @@ Direction key: `A→C` agent to coordinator, `C→A` coordinator to agent.
 | 3 | `Heartbeat` | A→C | liveness + implicit renewal of **all** leases held by this agent; includes coarse load (queue depths, in-flight bytes) and, from protocol minor 1, per-lease in-flight detail (§3.2) |
 | 4 | `HeartbeatAck` | C→A | piggybacks control state: pause/resume/drain flags, config-changed epoch |
 | 5 | `WorkRequest` | A→C | credit-based pull: "I have capacity for N shards / M copy tasks"; sent whenever local queues drop below low-water marks |
-| 6 | `WorkGrant` | C→A | 0..N work items, each a `Shard`, `EntryListShard`, `ChunkTask`, `DirFixBatch`, `VerifyBatch`, `DeleteBatch`, `ProbeTask` (a mount-probe pinned to this agent, gating pass start), or `LinkTask` (D11, linkat a hardlink-group member to its anchor — opt-in, `docs/DESIGN-hardlinks.md`); each carries a lease (id, TTL) |
-| 7 | `ShardSplit` | A→C | new shards discovered mid-walk (subdirectories pushed back, or entry-list batches from a huge directory); also carries `LinkSighting`s (D11, nlink>1 files — sent unconditionally, acted on only if the job opted into `hardlinks: preserve`); coordinator persists + queues them, acks with assigned shard ids |
+| 6 | `WorkGrant` | C→A | 0..N work items, each a `Shard`, `EntryListShard`, `ChunkTask`, `DirFixBatch`, `VerifyBatch`, `DeleteBatch`, `ProbeTask` (a mount-probe pinned to this agent, gating pass start), or `LinkTask` (D11, linkat a hardlink-group member to its anchor — on by default, `docs/DESIGN-hardlinks.md`); each carries a lease (id, TTL) |
+| 7 | `ShardSplit` | A→C | new shards discovered mid-walk (subdirectories pushed back, or entry-list batches from a huge directory); also carries `LinkSighting`s (D11, nlink>1 files — sent unconditionally, acted on unless the job opted out via `hardlinks: report`); coordinator persists + queues them, acks with assigned shard ids |
 | 8 | `ShardSplitAck` | C→A | ids assigned; until received, the agent must not report the parent shard complete (no lost subtrees) |
 | 9 | `ShardResult` | A→C | terminal state of a leased shard: counters (entries walked, tasks emitted/completed, bytes copied), orphan count, error summary, nlink>1 stats, wall/IO timings. Status `RESULT_RELEASED` means a draining agent is handing a shard back **unstarted** (not a failure) so the coordinator re-queues it for an active agent |
 | 10 | `TaskResult` | A→C | terminal state for coordinator-tracked tasks (chunk copies, dirfix batches, verify batches); batched |
@@ -94,8 +94,9 @@ message ChunkTask {            // one range of a large file
   uint64 file_gen   = 5;       // src (mtime,size) snapshot; chunk aborts if src changed
 }
 
-message LinkTask {             // D11, opt-in: linkat a hardlink-group member to its
-                                // anchor instead of copying it (docs/DESIGN-hardlinks.md)
+message LinkTask {             // D11, default behavior: linkat a hardlink-group
+                                // member to its anchor instead of copying it
+                                // (docs/DESIGN-hardlinks.md)
   uint64 task_id    = 1;
   string anchor_rel = 2;       // destination path already populated (the anchor)
   string member_rel = 3;       // destination path to linkat into existence

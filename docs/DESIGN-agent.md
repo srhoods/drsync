@@ -114,8 +114,9 @@ decision D9).
 > untranslatable policy (now journalled as JR_FIDELITY_EXCEPTION, not just
 > counted); the translation needs an NFSv4 mount to develop and verify.
 > Verified end-to-end by `test/e2e.sh` (sync + fidelity + verify + delete).
-> Hardlink preservation (D11, opt-in via `metadata.hardlinks: preserve`,
-> `docs/DESIGN-hardlinks.md`) is now wired end-to-end: the walker emits a
+> Hardlink preservation (D11, `metadata.hardlinks`, default `preserve` as of
+> 2026-07-31 — set `report` to opt out; `docs/DESIGN-hardlinks.md`) is now wired
+> end-to-end: the walker emits a
 > `LinkSighting` on `ShardSplit` alongside the existing `NLINK_DUP` journal record
 > (unconditionally — the gate lives on the coordinator, not the agent); the new
 > `link.c` executor (`WI_LINKFIX`) runs `linkat` under the same fd-anchored

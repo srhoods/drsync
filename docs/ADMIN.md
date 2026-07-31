@@ -66,10 +66,10 @@ and delete phases. Browse it with `drsync journal` / `drsync errors`.
 
 - **Orphans (destination files with no source) are report-only by default** —
   drsync never deletes anything until you run a doubly-gated delete pass (§5).
-- **Hardlinks are copied as independent files by default**, with `nlink>1` reported
-  so the storage cost is visible rather than silently de-duplicated. Set
-  `metadata.hardlinks: preserve` in the job spec to link hardlink-group members to
-  a shared destination copy instead (`docs/DESIGN-hardlinks.md`); see below.
+- **Hardlinks are preserved by default**: hardlink-group members are linked to a
+  shared destination copy (`docs/DESIGN-hardlinks.md`); see below. Set
+  `metadata.hardlinks: report` to opt out (D3 behavior — nlink>1 files copied as
+  independent files, with the duplicated bytes reported per pass).
 - **Full metadata fidelity**: owner, mode, times, xattrs, POSIX + NFSv4 ACLs,
   sparse extents, device/FIFO specials. An attribute that can't be translated is
   counted as a *fidelity exception* (or fails the entry under policy), never
@@ -142,7 +142,7 @@ spec:
     times: true
     xattrs: true
     acls:  { posix: true, nfs4: true, untranslatable: warn }  # warn | fail | skip
-    hardlinks: report             # report (default) | preserve — see below
+    hardlinks: preserve           # preserve (default) | report — see below
     hardlinks_max_group_scan: 0   # 0 = unlimited; caps a link group's size before
                                   #   falling back to independent copies (preserve only)
     specials: true                # device nodes, FIFOs, sockets
@@ -195,22 +195,22 @@ spec:
 You can keep the spec minimal and override individual fields at submit time with
 `--set` (§3), which is handy for reusing one template across jobs.
 
-**`metadata.hardlinks: preserve`** (docs/DESIGN-hardlinks.md). By default drsync
-copies every hardlinked file (`nlink > 1` on the source) as an independent file,
-only reporting the duplicated bytes so the space cost stays visible
-(`nlink_dup_files`/`nlink_dup_bytes` per pass). Setting `hardlinks: preserve` instead
-links each group's later members to a shared destination copy — `stat` on the
-destination will show the same inode and matching `nlink` as the source group.
-This is per-job opt-in; existing jobs are unaffected. `hardlinks_max_group_scan`
-(default 0, unlimited) bounds the coordinator's per-pass bookkeeping for a
-pathologically large group (some backup tools produce single hardlink groups with
-millions of members) — a group over the cap falls back to independent copies for
-that pass, exactly like the default behavior, and is counted via `link_fallback` in
-the report so the fallback is visible rather than silent. The report (`drsync report
-<job>` and the `/report` API) shows `links_created` (destination links actually
-made), `link_anchor_races` (a redundant speculative copy — bounded, at most one per
-group, harmless), and `link_fallback` (groups that fell back this pass) alongside the
-existing nlink-duplication counters.
+**`metadata.hardlinks`** (docs/DESIGN-hardlinks.md). By default (`preserve`) drsync
+links each hardlink group's later members to a shared destination copy — `stat` on
+the destination will show the same inode and matching `nlink` as the source group.
+Set `hardlinks: report` to opt out (D3 behavior): every hardlinked file (`nlink > 1`
+on the source) is copied as an independent file, and only the duplicated bytes are
+reported so the space cost stays visible (`nlink_dup_files`/`nlink_dup_bytes` per
+pass). `hardlinks_max_group_scan` (default 0, unlimited) bounds the coordinator's
+per-pass bookkeeping for a pathologically large group (some backup tools produce
+single hardlink groups with millions of members) — a group over the cap falls back
+to independent copies for that pass, exactly like `report` mode, and is counted via
+`link_fallback` in the report so the fallback is visible rather than silent. The
+report (`drsync report <job>` and the `/report` API, and now the end-of-job summary
+email) shows `links_created` (destination links actually made), `link_anchor_races`
+(a redundant speculative copy — bounded, at most one per group, harmless), and
+`link_fallback` (groups that fell back this pass) alongside the existing
+nlink-duplication counters.
 
 ---
 
