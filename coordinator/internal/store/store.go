@@ -1238,7 +1238,10 @@ func (s *Store) MarkLinkMembersQueued(passID int64, relPaths []string) error {
 	}
 	_, err := s.db.Exec(`UPDATE link_members SET state = 'queued'
 		WHERE pass_id = ? AND state = 'pending' AND rel_path IN (`+ph+`)`, args...)
-	return err
+	if err != nil {
+		return fmt.Errorf("MarkLinkMembersQueued (relPaths=%d): %w", len(relPaths), err)
+	}
+	return nil
 }
 
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for
@@ -1548,7 +1551,7 @@ func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Durat
 	res, err := s.db.Exec(`UPDATE shards SET lease_expiry = ?
 		WHERE state = ? AND lease_agent = ? AND lease_id IN (`+string(ph)+`)`, args...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("RenewLeasesByID agent=%s (leaseIDs=%d): %w", agentID, len(leaseIDs), err)
 	}
 	matched, err = res.RowsAffected()
 	return matched, err
@@ -1613,7 +1616,7 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 	rows, err := tx.Query(`SELECT id FROM shards WHERE pass_id = ? AND state = ? AND kind IN (`+ph+`)
 		LIMIT ?`, args...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ReapDoneShards select (kinds=%d args=%d): %w", len(kinds), len(args), err)
 	}
 	var ids []int64
 	for rows.Next() {
@@ -1638,11 +1641,11 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 		idArgs[i] = id
 	}
 	if _, err := tx.Exec(`DELETE FROM splits WHERE parent_shard_id IN (`+idPh+`)`, idArgs...); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ReapDoneShards delete splits (ids=%d): %w", len(idArgs), err)
 	}
 	n, err := execCountTx(tx, `DELETE FROM shards WHERE id IN (`+idPh+`)`, idArgs...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ReapDoneShards delete shards (ids=%d): %w", len(idArgs), err)
 	}
 	if _, err := tx.Exec(`UPDATE passes SET shards_reaped = shards_reaped + ? WHERE id = ?`,
 		n, passID); err != nil {

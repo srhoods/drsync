@@ -231,7 +231,13 @@ func (c *Controller) tick() error {
 			continue
 		}
 		if err := c.advance(job); err != nil {
-			slog.Error("advance failed", "job", job.Name, "err", err)
+			pass, perr := c.st.ActivePass(job.ID)
+			passNo, passState := -1, "?"
+			if perr == nil && pass != nil {
+				passNo, passState = pass.PassNo, string(pass.State)
+			}
+			slog.Error("advance failed", "job", job.Name, "pass", passNo,
+				"pass_state", passState, "err", err)
 		}
 	}
 	if err := c.checkParkedShards(); err != nil {
