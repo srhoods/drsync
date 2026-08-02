@@ -265,6 +265,50 @@ LINKFIX phase has pending work, so no agent below minor 3 (unable to decode
 byte-for-byte, as a historical/reference shape only — decoding an old capture or journal
 still works; nothing encodes it anymore.
 
+**A `shards` row seeded before this fix was deployed keeps its old, unbatched `LinkTask`
+payload forever** — there is no in-place migration of already-written bytes. Once the
+coordinator is rebuilt, `buildItem` unconditionally parses `KindLinkfix` payloads as
+`LinkTaskBatch`; an old-shape row fails with `unbuildable payload: proto: cannot parse
+invalid wire-format data` and parks. Recovery is a one-time manual DB fix, not automatic:
+delete the pass's `linkfix` shard rows (and their `splits` rows) and revert every
+`link_members` row still at `state='queued'` back to `'pending'`, so the next tick's
+`seedLinkfix` re-seeds the phase cleanly in the new shape. Deleting the shards is what
+matters — `advance()`'s parked-shard guard (`ShardStateCounts`, unscoped by kind) blocks
+*any* phase of the pass from progressing while so much as one shard sits `parked`,
+regardless of which phase it belongs to, so stale `linkfix` rows left over from a prior
+attempt can silently stall a *different* phase (observed: a pass stuck in `DIRFIX`,
+blocked by `linkfix` rows from an earlier cycle, not by anything DIRFIX itself was
+doing). No corresponding fleet-side action needed — old agents were never able to decode
+either shape's newest form regardless, and `-min-agent-minor` already governs which
+agents are eligible.
+
+**Follow-up: `MarkLinkMembersQueued`'s `IN`-list shape didn't scale — fixed.** Once
+`LinkTaskBatch` was seeding real production volume, `seedLinkfix`'s per-batch
+`MarkLinkMembersQueued(passID, relPaths)` call — `UPDATE link_members SET state =
+'queued' WHERE pass_id = ? AND state = 'pending' AND rel_path IN (...)`, run once per
+~2000-member flush — turned out to cost **~1.3s per call** against a `link_members`
+table with millions of rows for the pass, because `rel_path` is only the trailing column
+of the `(pass_id, dev, ino, rel_path)` primary key: SQLite could narrow to the pass_id
+but then had to scan every one of that pass's rows checking each against the `IN`-list.
+Harmless at the original one-member-at-a-time `LinkTask` seeding (a handful of rows to
+scan); at ~1250 batches for a 2.5M-member pass, ~1.3s each is **20+ cumulative minutes**
+holding the coordinator's single write lock, stalling every agent's dispatch and
+heartbeat renewal fleet-wide — observed live as heartbeats exceeding 50s and shards
+parking on `MaxShardAttempts` after repeated lease expiry, a second, independent
+mechanism producing the same symptom class as §3.3's original heartbeat-cap bug.
+
+Fixed by having `PendingLinkMembers` also return each member's `dev`/`ino` (`LinkMember.Dev/Ino`)
+and switching `MarkLinkMembersQueued` from one `IN`-list statement to one prepared
+`UPDATE ... WHERE pass_id = ? AND dev = ? AND ino = ? AND rel_path = ? AND state =
+'pending'` executed per member inside a single transaction — a true primary-key seek,
+not a scan. Measured: ~10ms for the same 2000-row batch against the same table (~120x),
+pinned by `TestMarkLinkMembersQueuedStaysFastAtScale`
+(`coordinator/internal/store/link_test.go`). An index on `(pass_id, state)`
+(`link_members_pending`) was added alongside this for `PendingLinkMembers`' own query
+shape, though it turned out not to be sufficient by itself for the `IN`-list query —
+SQLite's planner did not choose to seek per `IN`-list value even with that index present,
+which is what made the per-row PK-seek rewrite necessary rather than optional.
+
 ### 3.4 Why the anchor is copied *speculatively*, not gated
 
 An alternative design holds **every** member of a link group back until the group is
@@ -435,7 +479,16 @@ merged) — see §4.
    see §3.3 for the mechanism. `agent/src/agent.h`'s self-reported `PROTO_MINOR` was
    also corrected to 3 here; it had never been bumped past 1 despite minor 2 (item 2
    above) already landing, an unrelated pre-existing gap this follow-up's own
-   `MinAgentMinor` gating depends on being accurate.
+   `MinAgentMinor` gating depends on being accurate. A production redeploy of this
+   fix surfaced two more issues, both closed within the same follow-up (§3.3): shard
+   rows seeded before the redeploy carried the old unbatched payload shape and parked
+   as unparseable (fixed manually per pass via a documented DB repair, no code fix
+   possible for bytes already written), and `MarkLinkMembersQueued`'s `rel_path
+   IN (...)` shape turned out to cost ~1.3s per call against a multi-million-row
+   `link_members` table — no index could prune it, since `rel_path` is only the
+   trailing primary-key column — fixed by switching to one primary-key-seeked
+   `UPDATE` per member in a single transaction (~120x faster, pinned by
+   `TestMarkLinkMembersQueuedStaysFastAtScale`).
 
 **D11 — Hardlinks preserved via a pass-scoped link registry, opt-in, superseding D3's
 blanket "not preserved" for jobs that request it.** D3's rationale (no *durable* global

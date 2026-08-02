@@ -664,7 +664,7 @@ func (c *Controller) seedLinkfix(pass *store.Pass) (int, error) {
 	}
 	total := 0
 	batchEntries := make([]*drsyncpb.LinkEntry, 0, linkfixBatchSize)
-	batchPaths := make([]string, 0, linkfixBatchSize)
+	batchKeys := make([]store.LinkMemberKey, 0, linkfixBatchSize)
 	flush := func() error {
 		if len(batchEntries) == 0 {
 			return nil
@@ -681,12 +681,12 @@ func (c *Controller) seedLinkfix(pass *store.Pass) (int, error) {
 			[]store.NewShard{{Kind: model.KindLinkfix, Payload: payload}}); err != nil {
 			return err
 		}
-		if err := c.st.MarkLinkMembersQueued(pass.ID, batchPaths); err != nil {
+		if err := c.st.MarkLinkMembersQueued(pass.ID, batchKeys); err != nil {
 			return err
 		}
 		total += len(batchEntries)
 		batchEntries = batchEntries[:0]
-		batchPaths = batchPaths[:0]
+		batchKeys = batchKeys[:0]
 		return nil
 	}
 	for _, m := range members {
@@ -695,7 +695,7 @@ func (c *Controller) seedLinkfix(pass *store.Pass) (int, error) {
 			MemberRel: m.RelPath,
 			AnchorGen: &drsyncpb.FileGen{Size: m.AnchorSize, MtimeNs: m.AnchorMtimeNs},
 		})
-		batchPaths = append(batchPaths, m.RelPath)
+		batchKeys = append(batchKeys, store.LinkMemberKey{Dev: m.Dev, Ino: m.Ino, RelPath: m.RelPath})
 		if len(batchEntries) >= linkfixBatchSize {
 			if err := flush(); err != nil {
 				return total, err

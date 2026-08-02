@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+)
 
 // TestRecordLinkSightingsFirstIsAnchor: the first sighting of a (dev,ino)
 // group becomes its anchor (state 'copied' immediately — the speculative-
@@ -240,7 +244,10 @@ func TestMarkLinkMembersQueuedIsScopedToPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.MarkLinkMembersQueued(passID, []string{"a/one", "b/two"}); err != nil {
+	if err := s.MarkLinkMembersQueued(passID, []LinkMemberKey{
+		{Dev: 1, Ino: 100, RelPath: "a/one"},
+		{Dev: 1, Ino: 100, RelPath: "b/two"},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -258,5 +265,87 @@ func TestMarkLinkMembersQueuedIsScopedToPending(t *testing.T) {
 	}
 	if memberState != "queued" {
 		t.Errorf("pending member state = %q, want queued", memberState)
+	}
+}
+
+// TestMarkLinkMembersQueuedStaysFastAtScale is the regression pin for the
+// production incident this fixed: a link_members table with millions of
+// unrelated pending rows for the same pass_id made a single
+// MarkLinkMembersQueued call (then an UPDATE ... WHERE rel_path IN (...)
+// list) take ~1.3s, because rel_path has no supporting index outside the
+// tail of the (pass_id, dev, ino, rel_path) primary key — SQLite could only
+// narrow to pass_id, then scan every one of that pass's rows checking the
+// IN-list. Run once per LinkTaskBatch flush (~1250 times for a 2.5M-member
+// pass), that held the coordinator's single write lock for a cumulative
+// ~20+ minutes, stalling every agent's heartbeat renewal fleet-wide.
+//
+// Seeds link_members directly (bypassing RecordSplit/ShardSplit — not what
+// this test is about) since the real bug only manifests at a row count
+// RecordSplit's per-sighting path would take far too long to build in a
+// unit test. Asserts a 2000-row MarkLinkMembersQueued call against a
+// 500K-row pass completes well within what a lease TTL can tolerate — not
+// a tight bound (CI hardware varies), just proof it's seek-based, not
+// scan-based: the pre-fix IN-list shape scaled with total pending rows,
+// this shape does not.
+func TestMarkLinkMembersQueuedStaysFastAtScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test; skipped with -short")
+	}
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	const totalRows = 500_000
+	const batchSize = 2000
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO link_members (pass_id, dev, ino, rel_path, state)
+		VALUES (?, ?, ?, ?, 'pending')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < totalRows; i++ {
+		if _, err := stmt.Exec(passID, 1, i, fmt.Sprintf("member/%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	keys := make([]LinkMemberKey, batchSize)
+	for i := 0; i < batchSize; i++ {
+		// Middle of the table, not the first/last rows — a scan-based plan
+		// pays roughly the same regardless of position; a seek-based plan
+		// should too, which is exactly what this test distinguishes.
+		n := totalRows/2 + i
+		keys[i] = LinkMemberKey{Dev: 1, Ino: uint64(n), RelPath: fmt.Sprintf("member/%d", n)}
+	}
+
+	start := time.Now()
+	if err := s.MarkLinkMembersQueued(passID, keys); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	// The pre-fix IN-list shape took ~1.3s for this exact batch size against
+	// a comparable row count (measured directly against modernc.org/sqlite
+	// during the incident's post-mortem); the PK-seek shape measured ~10ms
+	// for the same batch. 200ms leaves generous headroom for slow CI
+	// hardware while still failing hard if this regresses to a table scan.
+	if elapsed > 200*time.Millisecond {
+		t.Errorf("MarkLinkMembersQueued(%d keys) against %d rows took %v, "+
+			"want well under 200ms — looks like a scan-based plan regressed back in",
+			batchSize, totalRows, elapsed)
+	}
+
+	var queued int
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_members
+		WHERE pass_id = ? AND state = 'queued'`, passID).Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	if queued != batchSize {
+		t.Errorf("queued count = %d, want %d", queued, batchSize)
 	}
 }
