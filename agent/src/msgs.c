@@ -576,17 +576,20 @@ void shard_item_free(struct shard_item *it)
         free(it->dirs[i].rel_path);
     free(it->dirs);
     free(it->chunk.temp_name);
-    free(it->link.anchor_rel);
-    free(it->link.member_rel);
+    for (size_t i = 0; i < it->n_links; i++) {
+        free(it->links[i].anchor_rel);
+        free(it->links[i].member_rel);
+    }
+    free(it->links);
     it->rel_path = NULL;
     it->paths = NULL;
     it->vchecksum = NULL;
     it->dirs = NULL;
     it->chunk.temp_name = NULL;
-    it->link.anchor_rel = NULL;
-    it->link.member_rel = NULL;
+    it->links = NULL;
     it->n_paths = 0;
     it->n_dirs = 0;
+    it->n_links = 0;
 }
 
 /* ProbeTask { task_id = 1, job_id = 2 }. task_id is the probe shard's id; the
@@ -919,13 +922,87 @@ static bool dec_chunk_task(const uint8_t *p, size_t n, struct shard_item *it)
     return !c.err;
 }
 
-/* LinkTask: anchor_rel (4), member_rel (5), gen (6, FileGen: size/mtime_ns). */
-static bool dec_link_task(const uint8_t *p, size_t n, struct shard_item *it)
+/* LinkEntry: anchor_rel (1), member_rel (2), anchor_gen (3, FileGen). One row
+ * of a LinkTaskBatch; appends to it->links (mirrors dec_dir_meta's growth of
+ * it->dirs for DirFixBatch). */
+static bool dec_link_entry(const uint8_t *p, size_t n, struct shard_item *it,
+                           size_t *cap)
 {
     pb_cur c;
     pb_cur_init(&c, p, n);
     uint32_t f;
     int wt;
+    struct linkfix lf = {0};
+    const uint8_t *sp;
+    size_t sn;
+    while (pb_next(&c, &f, &wt)) {
+        switch (f) {
+        case 1:
+            if (!pb_get_len(&c, &sp, &sn))
+                goto fail;
+            free(lf.anchor_rel);
+            lf.anchor_rel = malloc(sn + 1);
+            if (!lf.anchor_rel)
+                goto fail;
+            memcpy(lf.anchor_rel, sp, sn);
+            lf.anchor_rel[sn] = '\0';
+            break;
+        case 2:
+            if (!pb_get_len(&c, &sp, &sn))
+                goto fail;
+            free(lf.member_rel);
+            lf.member_rel = malloc(sn + 1);
+            if (!lf.member_rel)
+                goto fail;
+            memcpy(lf.member_rel, sp, sn);
+            lf.member_rel[sn] = '\0';
+            break;
+        case 3: {
+            if (!pb_get_len(&c, &sp, &sn))
+                goto fail;
+            pb_cur gc;
+            pb_cur_init(&gc, sp, sn);
+            uint32_t gf;
+            int gwt;
+            while (pb_next(&gc, &gf, &gwt)) {
+                switch (gf) {
+                case 1: lf.gen_size = pb_get_varint(&gc); break;
+                case 2: lf.gen_mtime_ns = (int64_t)pb_get_varint(&gc); break;
+                default: pb_skip(&gc, gwt);
+                }
+            }
+            if (gc.err)
+                goto fail;
+            break;
+        }
+        default: pb_skip(&c, wt);
+        }
+    }
+    if (c.err)
+        goto fail;
+    if (it->n_links == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        struct linkfix *nl = realloc(it->links, *cap * sizeof *nl);
+        if (!nl)
+            goto fail; /* originals stay owned by it (freed by caller) */
+        it->links = nl;
+    }
+    it->links[it->n_links++] = lf;
+    return true;
+fail:
+    free(lf.anchor_rel);
+    free(lf.member_rel);
+    return false;
+}
+
+/* LinkTaskBatch { task_id=1, job_id=2, pass_no=3, links=4 (repeated LinkEntry) }. */
+static bool dec_link_task_batch(const uint8_t *p, size_t n, struct shard_item *it)
+{
+    pb_cur c;
+    pb_cur_init(&c, p, n);
+    uint32_t f;
+    int wt;
+    size_t cap = 0;
     const uint8_t *sp;
     size_t sn;
     while (pb_next(&c, &f, &wt)) {
@@ -934,43 +1011,9 @@ static bool dec_link_task(const uint8_t *p, size_t n, struct shard_item *it)
         case 2: it->job_id = pb_get_varint(&c); break;
         case 3: it->pass_no = (uint32_t)pb_get_varint(&c); break;
         case 4:
-            if (!pb_get_len(&c, &sp, &sn))
-                return false;
-            free(it->link.anchor_rel);
-            it->link.anchor_rel = malloc(sn + 1);
-            if (!it->link.anchor_rel)
-                return false;
-            memcpy(it->link.anchor_rel, sp, sn);
-            it->link.anchor_rel[sn] = '\0';
-            break;
-        case 5:
-            if (!pb_get_len(&c, &sp, &sn))
-                return false;
-            free(it->link.member_rel);
-            it->link.member_rel = malloc(sn + 1);
-            if (!it->link.member_rel)
-                return false;
-            memcpy(it->link.member_rel, sp, sn);
-            it->link.member_rel[sn] = '\0';
-            break;
-        case 6: {
-            if (!pb_get_len(&c, &sp, &sn))
-                return false;
-            pb_cur gc;
-            pb_cur_init(&gc, sp, sn);
-            uint32_t gf;
-            int gwt;
-            while (pb_next(&gc, &gf, &gwt)) {
-                switch (gf) {
-                case 1: it->link.gen_size = pb_get_varint(&gc); break;
-                case 2: it->link.gen_mtime_ns = (int64_t)pb_get_varint(&gc); break;
-                default: pb_skip(&gc, gwt);
-                }
-            }
-            if (gc.err)
+            if (!pb_get_len(&c, &sp, &sn) || !dec_link_entry(sp, sn, it, &cap))
                 return false;
             break;
-        }
         default: pb_skip(&c, wt);
         }
     }
@@ -1033,8 +1076,8 @@ static bool dec_work_item(const uint8_t *p, size_t n, struct work_grant *g)
             it.kind = WI_PROBE;
             have_item = true;
             break;
-        case 10:
-            if (!pb_get_len(&c, &sp, &sn) || !dec_link_task(sp, sn, &it))
+        case 11:
+            if (!pb_get_len(&c, &sp, &sn) || !dec_link_task_batch(sp, sn, &it))
                 goto fail;
             it.kind = WI_LINKFIX;
             have_item = true;

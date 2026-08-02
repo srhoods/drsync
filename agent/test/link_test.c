@@ -216,12 +216,66 @@ static void test_eexist_stale_entry_is_replaced(void)
     close(dst_fd);
 }
 
+/* A batch where the middle entry's anchor has drifted must still link the
+ * entries before and after it — one bad member does not abort the rest of
+ * the shard. do_linkfix_batch (link.c) is a plain loop over do_linkfix with
+ * no shared mutable state between iterations beyond ctx's counters/journal,
+ * so calling do_linkfix in a loop here reproduces its behavior exactly
+ * without needing access to the static helper itself. */
+static void test_batch_one_bad_entry_does_not_abort_rest(void)
+{
+    char tmp[] = "/tmp/drsync-link-test-XXXXXX";
+    CHECK(mkdtemp(tmp) != NULL, "mkdtemp failed");
+    int dst_fd = open(tmp, O_RDONLY | O_DIRECTORY);
+    CHECK(dst_fd >= 0, "open dst root failed");
+
+    write_file(dst_fd, "anchor1", "one");
+    write_file(dst_fd, "anchor2", "two-drifted");
+    write_file(dst_fd, "anchor3", "three");
+    struct stat a1, a2, a3;
+    fstatat(dst_fd, "anchor1", &a1, AT_SYMLINK_NOFOLLOW);
+    fstatat(dst_fd, "anchor2", &a2, AT_SYMLINK_NOFOLLOW);
+    fstatat(dst_fd, "anchor3", &a3, AT_SYMLINK_NOFOLLOW);
+
+    struct shard_item it = { .shard_id = 5 };
+    struct walk_ctx ctx = { .it = &it };
+    jrn_init(&ctx);
+
+    struct linkfix links[3] = {
+        { .anchor_rel = (char *)"anchor1", .member_rel = (char *)"member1",
+          .gen_size = (uint64_t)a1.st_size,
+          .gen_mtime_ns = (int64_t)a1.st_mtim.tv_sec * 1000000000 + a1.st_mtim.tv_nsec },
+        { .anchor_rel = (char *)"anchor2", .member_rel = (char *)"member2",
+          .gen_size = 99999, /* wrong on purpose: this entry's anchor "drifted" */
+          .gen_mtime_ns = 1 },
+        { .anchor_rel = (char *)"anchor3", .member_rel = (char *)"member3",
+          .gen_size = (uint64_t)a3.st_size,
+          .gen_mtime_ns = (int64_t)a3.st_mtim.tv_sec * 1000000000 + a3.st_mtim.tv_nsec },
+    };
+    for (size_t i = 0; i < 3; i++)
+        do_linkfix(&ctx, dst_fd, &links[i]);
+
+    CHECK(ctx.c.links_created == 2, "links_created = %llu, want 2 (member1 and member3, not member2)",
+          (unsigned long long)ctx.c.links_created);
+
+    struct stat m1, m2, m3;
+    CHECK(fstatat(dst_fd, "member1", &m1, AT_SYMLINK_NOFOLLOW) == 0 && m1.st_ino == a1.st_ino,
+          "member1 should be linked to anchor1");
+    CHECK(fstatat(dst_fd, "member2", &m2, AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT,
+          "member2 should not exist (its anchor drifted)");
+    CHECK(fstatat(dst_fd, "member3", &m3, AT_SYMLINK_NOFOLLOW) == 0 && m3.st_ino == a3.st_ino,
+          "member3 should be linked to anchor3 despite member2's failure");
+
+    close(dst_fd);
+}
+
 int main(void)
 {
     test_happy_path();
     test_anchor_drift_aborts();
     test_eexist_already_linked_is_idempotent();
     test_eexist_stale_entry_is_replaced();
+    test_batch_one_bad_entry_does_not_abort_rest();
 
     if (failures) {
         fprintf(stderr, "%d link test(s) failed\n", failures);

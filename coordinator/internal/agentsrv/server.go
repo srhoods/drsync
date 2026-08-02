@@ -39,11 +39,20 @@ import (
 // flag) only to deliberately exclude old agents.
 const (
 	ProtoMajor = 1
-	ProtoMinor = 2
+	ProtoMinor = 3
 
 	// MinorInflight is the minor at which agents began reporting per-lease
 	// in-flight detail in the heartbeat.
 	MinorInflight = 1
+
+	// MinorLinkBatch is the minor at which agents can decode LinkTaskBatch
+	// (many linkat entries per shard/lease) — seedLinkfix (passctrl.go) always
+	// seeds this shape now, with no per-link LinkTask fallback. Unlike
+	// MinorInflight, there is no mixed-fleet path for this one: an operator
+	// must raise -min-agent-minor to 3 (Config.MinAgentMinor) before resuming
+	// a job whose LINKFIX phase has pending work, so no agent old enough to
+	// fail decoding LinkTaskBatch is ever granted one.
+	MinorLinkBatch = 3
 )
 
 type Config struct {

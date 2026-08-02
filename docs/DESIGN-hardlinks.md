@@ -189,7 +189,8 @@ At the SCANNING→DIRFIX transition (extend `seedTempReclaim`/`seedDirfix` sibli
   independently by their own shards (§3.4), so nothing is lost — just no dedup for that
   group this pass. Journaled as `LINK_FALLBACK {dev, ino, reason}`.
 
-`LinkTask`:
+`LinkTask` (as originally landed; superseded by `LinkTaskBatch` below — kept in the
+proto, unencoded, only so an old journal/capture still decodes):
 
 ```protobuf
 message LinkTask {
@@ -202,12 +203,111 @@ message LinkTask {
 }
 ```
 
+`LinkTaskBatch` (as landed by the §3.3 follow-up below — this is what `seedLinkfix`
+actually seeds today):
+
+```protobuf
+message LinkEntry {
+  string anchor_rel  = 1;
+  string member_rel  = 2;
+  FileGen anchor_gen = 3;
+}
+
+message LinkTaskBatch {
+  uint64 task_id           = 1;
+  uint64 job_id            = 2;
+  uint32 pass_no           = 3;
+  repeated LinkEntry links = 4;
+}
+```
+
 Executor (`agent/src/link.c`, new): `linkat(dst_fd, anchor_rel, dst_fd, member_rel,
 0)` (both fd-relative under the existing `openat2 RESOLVE_BENEATH` containment, no new
 traversal surface). `EEXIST` on the destination (stale file from a prior pass, or
 independent-copy leftover from a fallback) is resolved by `unlinkat` + retry — same
 pattern as `remove_dst` used for type mismatches (`walker.c:298`). Journals
 `LINK_CREATED {dev, ino, anchor_rel, member_rel}`.
+
+**Follow-up: batched at scale, `LinkTaskBatch` (proto minor 3).** As landed above,
+`seedLinkfix` inserted one `LinkTask` shard per pending member — fine at the group
+sizes/densities this doc's §3.6 scale analysis modeled, but a real 1B-file/500TB job
+with a hardlink-heavy tree seeded ~2.5M individual shards in one LINKFIX phase, from a
+single `InsertShards` call. That call holds the coordinator's one process-wide write
+lock (`store.Store.mu`) for the whole insert, stalling every agent's dispatch —
+including heartbeat lease renewal — for however long the insert took; and the agent side
+independently capped how many held-lease ids it can report per heartbeat
+(`agent/src/main.c`, `AGENT_MAX_LEASES` — sized to the lease table's own 8192-slot
+capacity, previously a much smaller ad hoc constant that a link-heavy agent could
+exceed). Leases that fall off either edge are never renewed, expire under still-running
+work, get requeued and re-granted elsewhere, and the original agent's eventual result
+arrives to find its lease no longer matches — logged as `"dropping stale shard result"`
+— so the phase's queued/leased counts can look like LINKFIX is repeatedly failing to
+drain even though real `linkat` work keeps completing underneath it.
+
+Fixed the same way DIRFIX/VERIFY already bound their own phases: `seedLinkfix` now packs
+up to `linkfixBatchSize` (2000) pending members into one `LinkTaskBatch` shard —
+`LinkEntry{anchor_rel, member_rel, anchor_gen}` repeated, task-level `job_id`/`pass_no`
+carried once per batch instead of once per member — flushing a batch (one `InsertShards`
+call) at a time rather than building the whole pass's shards in memory and inserting
+them in one call. `agent/src/link.c`'s `process_linkfix` now loops `do_linkfix` over a
+batch's entries; one entry's failure (a drifted anchor, a real error) does not abort the
+rest of the batch — the same soft-fail-and-continue discipline DIRFIX's own per-item
+loop already uses — so a single bad member does not force the other ~1999 already-
+succeeded links in its batch to be redone. `do_linkfix` itself (the per-entry `linkat` +
+gen-check + `EEXIST`-retry core) is unchanged.
+
+No mixed-fleet fallback: unlike DIRFIX/VERIFY batching, `LinkTask` (unbatched) is not
+kept as a shape the coordinator still seeds for older agents — `seedLinkfix` always
+seeds `LinkTaskBatch` now. An operator must raise `-min-agent-minor` to 3
+(`Config.MinAgentMinor`, `coordinator/internal/agentsrv`) before resuming a job whose
+LINKFIX phase has pending work, so no agent below minor 3 (unable to decode
+`LinkTaskBatch`) is ever granted one. `LinkTask` itself stays defined in the proto,
+byte-for-byte, as a historical/reference shape only — decoding an old capture or journal
+still works; nothing encodes it anymore.
+
+**A `shards` row seeded before this fix was deployed keeps its old, unbatched `LinkTask`
+payload forever** — there is no in-place migration of already-written bytes. Once the
+coordinator is rebuilt, `buildItem` unconditionally parses `KindLinkfix` payloads as
+`LinkTaskBatch`; an old-shape row fails with `unbuildable payload: proto: cannot parse
+invalid wire-format data` and parks. Recovery is a one-time manual DB fix, not automatic:
+delete the pass's `linkfix` shard rows (and their `splits` rows) and revert every
+`link_members` row still at `state='queued'` back to `'pending'`, so the next tick's
+`seedLinkfix` re-seeds the phase cleanly in the new shape. Deleting the shards is what
+matters — `advance()`'s parked-shard guard (`ShardStateCounts`, unscoped by kind) blocks
+*any* phase of the pass from progressing while so much as one shard sits `parked`,
+regardless of which phase it belongs to, so stale `linkfix` rows left over from a prior
+attempt can silently stall a *different* phase (observed: a pass stuck in `DIRFIX`,
+blocked by `linkfix` rows from an earlier cycle, not by anything DIRFIX itself was
+doing). No corresponding fleet-side action needed — old agents were never able to decode
+either shape's newest form regardless, and `-min-agent-minor` already governs which
+agents are eligible.
+
+**Follow-up: `MarkLinkMembersQueued`'s `IN`-list shape didn't scale — fixed.** Once
+`LinkTaskBatch` was seeding real production volume, `seedLinkfix`'s per-batch
+`MarkLinkMembersQueued(passID, relPaths)` call — `UPDATE link_members SET state =
+'queued' WHERE pass_id = ? AND state = 'pending' AND rel_path IN (...)`, run once per
+~2000-member flush — turned out to cost **~1.3s per call** against a `link_members`
+table with millions of rows for the pass, because `rel_path` is only the trailing column
+of the `(pass_id, dev, ino, rel_path)` primary key: SQLite could narrow to the pass_id
+but then had to scan every one of that pass's rows checking each against the `IN`-list.
+Harmless at the original one-member-at-a-time `LinkTask` seeding (a handful of rows to
+scan); at ~1250 batches for a 2.5M-member pass, ~1.3s each is **20+ cumulative minutes**
+holding the coordinator's single write lock, stalling every agent's dispatch and
+heartbeat renewal fleet-wide — observed live as heartbeats exceeding 50s and shards
+parking on `MaxShardAttempts` after repeated lease expiry, a second, independent
+mechanism producing the same symptom class as §3.3's original heartbeat-cap bug.
+
+Fixed by having `PendingLinkMembers` also return each member's `dev`/`ino` (`LinkMember.Dev/Ino`)
+and switching `MarkLinkMembersQueued` from one `IN`-list statement to one prepared
+`UPDATE ... WHERE pass_id = ? AND dev = ? AND ino = ? AND rel_path = ? AND state =
+'pending'` executed per member inside a single transaction — a true primary-key seek,
+not a scan. Measured: ~10ms for the same 2000-row batch against the same table (~120x),
+pinned by `TestMarkLinkMembersQueuedStaysFastAtScale`
+(`coordinator/internal/store/link_test.go`). An index on `(pass_id, state)`
+(`link_members_pending`) was added alongside this for `PendingLinkMembers`' own query
+shape, though it turned out not to be sufficient by itself for the `IN`-list query —
+SQLite's planner did not choose to seek per `IN`-list value even with that index present,
+which is what made the per-row PK-seek rewrite necessary rather than optional.
 
 ### 3.4 Why the anchor is copied *speculatively*, not gated
 
@@ -373,6 +473,22 @@ merged) — see §4.
    `hardlinks_max_group_scan` falls back). These caught two real bugs no unit test
    had exercised — see the implementation-status note at the top of this doc — both
    fixed before landing, with unit tests added afterward to pin the fixes.
+6. `LinkTaskBatch` (proto minor 3, §3.3 follow-up): batched LINKFIX seeding/execution
+   after a real 1B-file production job exposed the unbatched design's two scale
+   ceilings (coordinator lock hold time, agent heartbeat-reportable lease count) —
+   see §3.3 for the mechanism. `agent/src/agent.h`'s self-reported `PROTO_MINOR` was
+   also corrected to 3 here; it had never been bumped past 1 despite minor 2 (item 2
+   above) already landing, an unrelated pre-existing gap this follow-up's own
+   `MinAgentMinor` gating depends on being accurate. A production redeploy of this
+   fix surfaced two more issues, both closed within the same follow-up (§3.3): shard
+   rows seeded before the redeploy carried the old unbatched payload shape and parked
+   as unparseable (fixed manually per pass via a documented DB repair, no code fix
+   possible for bytes already written), and `MarkLinkMembersQueued`'s `rel_path
+   IN (...)` shape turned out to cost ~1.3s per call against a multi-million-row
+   `link_members` table — no index could prune it, since `rel_path` is only the
+   trailing primary-key column — fixed by switching to one primary-key-seeked
+   `UPDATE` per member in a single transaction (~120x faster, pinned by
+   `TestMarkLinkMembersQueuedStaysFastAtScale`).
 
 **D11 — Hardlinks preserved via a pass-scoped link registry, opt-in, superseding D3's
 blanket "not preserved" for jobs that request it.** D3's rationale (no *durable* global

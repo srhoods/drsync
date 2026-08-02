@@ -335,7 +335,7 @@ struct outmsg *out_take_priority(void)
  * enough to starve the heartbeat with no trace on the network or coordinator
  * side (Send-Q, dispatch timing, store-lock timing all stayed clean). See
  * docs/DESIGN-agent.md §3.5. */
-#define MAX_LEASES 8192
+#define MAX_LEASES AGENT_MAX_LEASES /* see agent.h: kept in sync with lease_snapshot callers */
 #define LEASE_HASH_BUCKETS 16384 /* power of 2, > MAX_LEASES for a low load factor */
 static struct lease_entry leases[MAX_LEASES];
 static int                free_head = 0;   /* index of first free slot, -1 = table full */

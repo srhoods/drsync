@@ -526,8 +526,18 @@ static void fmt_lease_ids(char *buf, size_t cap, const uint64_t *held, size_t n,
 
 static int send_heartbeat(void)
 {
-    uint64_t held[1024];
-    size_t n = lease_snapshot(held, 1024);
+    /* Sized to AGENT_MAX_LEASES (the lease table's own capacity), not an
+     * independent guess: LINKFIX seeds one shard per hardlink-group member
+     * (unbatched), so a fast-completing backlog can leave an agent holding
+     * many thousands of leases at once, well past what (workers +
+     * copy_threads) * 2 assumes for walk/chunk work. A cap smaller than the
+     * table silently drops the tail of the held-lease list from every
+     * heartbeat, so those leases are never renewed, expire under a still-busy
+     * agent, and get requeued/re-granted elsewhere while the original result
+     * arrives too late and is dropped as stale (ErrLeaseMismatch) — seen in
+     * production as LINKFIX repeatedly failing to drain on a 1B-file job. */
+    static uint64_t held[AGENT_MAX_LEASES];
+    size_t n = lease_snapshot(held, AGENT_MAX_LEASES);
     static struct inflight_view inflight[HB_INFLIGHT_MAX]; /* control thread only */
     size_t n_inflight = lease_inflight(inflight, HB_INFLIGHT_MAX);
     pb_buf b;

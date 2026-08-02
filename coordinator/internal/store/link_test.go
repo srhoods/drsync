@@ -1,6 +1,11 @@
 package store
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
 
 // TestRecordLinkSightingsFirstIsAnchor: the first sighting of a (dev,ino)
 // group becomes its anchor (state 'copied' immediately — the speculative-
@@ -240,7 +245,10 @@ func TestMarkLinkMembersQueuedIsScopedToPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.MarkLinkMembersQueued(passID, []string{"a/one", "b/two"}); err != nil {
+	if err := s.MarkLinkMembersQueued(passID, []LinkMemberKey{
+		{Dev: 1, Ino: 100, RelPath: "a/one"},
+		{Dev: 1, Ino: 100, RelPath: "b/two"},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -258,5 +266,123 @@ func TestMarkLinkMembersQueuedIsScopedToPending(t *testing.T) {
 	}
 	if memberState != "queued" {
 		t.Errorf("pending member state = %q, want queued", memberState)
+	}
+}
+
+// TestMarkLinkMembersQueuedStaysFastAtScale is the regression pin for the
+// production incident this fixed: a link_members table with millions of
+// unrelated pending rows for the same pass_id made a single
+// MarkLinkMembersQueued call (then an UPDATE ... WHERE rel_path IN (...)
+// list) take ~1.3s, because rel_path has no supporting index outside the
+// tail of the (pass_id, dev, ino, rel_path) primary key — SQLite could only
+// narrow to pass_id, then scan every one of that pass's rows checking the
+// IN-list. Run once per LinkTaskBatch flush (~1250 times for a 2.5M-member
+// pass), that held the coordinator's single write lock for a cumulative
+// ~20+ minutes, stalling every agent's heartbeat renewal fleet-wide.
+//
+// Seeds link_members directly (bypassing RecordSplit/ShardSplit — not what
+// this test is about) since the real bug only manifests at a row count
+// RecordSplit's per-sighting path would take far too long to build in a
+// unit test. Measures the pre-fix IN-list query directly, in the same
+// process against the same table, as a same-hardware baseline, then asserts
+// MarkLinkMembersQueued beats it by a wide margin — a relative comparison,
+// not an absolute wall-clock bound, so it isn't sensitive to how fast or
+// slow the machine running the test happens to be (an earlier version of
+// this test used a fixed 200ms cutoff and flaked on slower CI hardware,
+// having measured ~10ms locally).
+func TestMarkLinkMembersQueuedStaysFastAtScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test; skipped with -short")
+	}
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	// The baseline (pre-fix) query scales linearly with totalRows — it scans
+	// every row of the pass checking the IN-list — while the fix stays flat
+	// (a real seek doesn't care how big the table is). Measured directly at
+	// this file's row counts: ~0.6x at 100K, ~1.4x at 500K, ~12.7x at 2.5M —
+	// the gap only becomes a reliable signal at real production scale, which
+	// is exactly why 500K (this test's first version) flaked: the two costs
+	// hadn't diverged enough yet to leave any real margin.
+	const totalRows = 2_500_000
+	const batchSize = 2000
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO link_members (pass_id, dev, ino, rel_path, state)
+		VALUES (?, ?, ?, ?, 'pending')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < totalRows; i++ {
+		if _, err := stmt.Exec(passID, 1, i, fmt.Sprintf("member/%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two disjoint batches from the middle of the table (a scan-based plan
+	// pays roughly the same regardless of position; a seek-based plan should
+	// too, which is exactly what this test distinguishes): one for the
+	// baseline (the exact pre-fix UPDATE ... IN (...) shape, run directly so
+	// this test measures it on this same table on this same machine, not a
+	// number from a different incident's hardware), one for the real
+	// MarkLinkMembersQueued call under test. Both are real writes so the
+	// comparison is apples to apples — an earlier version of this test used
+	// a read-only SELECT as the "baseline", which turned out not to cost the
+	// same as the write the incident actually measured.
+	keys := make([]LinkMemberKey, batchSize)
+	baselinePaths := make([]any, 0, batchSize+1)
+	baselinePaths = append(baselinePaths, passID)
+	for i := 0; i < batchSize; i++ {
+		n := totalRows/2 + i
+		keys[i] = LinkMemberKey{Dev: 1, Ino: uint64(n), RelPath: fmt.Sprintf("member/%d", n)}
+		bn := totalRows/4 + i
+		baselinePaths = append(baselinePaths, fmt.Sprintf("member/%d", bn))
+	}
+
+	ph := strings.TrimSuffix(strings.Repeat("?,", batchSize), ",")
+	baselineStart := time.Now()
+	res, err := s.db.Exec(`UPDATE link_members SET state = 'queued'
+		WHERE pass_id = ? AND state = 'pending' AND rel_path IN (`+ph+`)`, baselinePaths...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := time.Since(baselineStart)
+	if n, _ := res.RowsAffected(); n != batchSize {
+		t.Fatalf("baseline IN-list update affected %d rows, want %d", n, batchSize)
+	}
+
+	start := time.Now()
+	if err := s.MarkLinkMembersQueued(passID, keys); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	t.Logf("baseline IN-list update: %v; MarkLinkMembersQueued (PK-seek): %v", baseline, elapsed)
+	// Measured ~12.7x at this exact row count/batch size (file-based WAL db,
+	// matching production's Open()). Require 3x: comfortable margin below
+	// the measured gap so ordinary hardware/scheduling noise can't flake
+	// this, while still failing hard if the fix regresses back to a
+	// scan-based plan (which would put the ratio near 1x, not comfortably
+	// above 3x).
+	if elapsed*3 > baseline {
+		t.Errorf("MarkLinkMembersQueued(%d keys) against %d rows took %v, "+
+			"want well under the %v IN-list baseline (3x margin) — "+
+			"looks like a scan-based plan regressed back in", batchSize, totalRows, elapsed, baseline)
+	}
+
+	var queued int
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_members
+		WHERE pass_id = ? AND state = 'queued'`, passID).Scan(&queued); err != nil {
+		t.Fatal(err)
+	}
+	// Two disjoint batches were queued: the baseline's IN-list update and the
+	// real MarkLinkMembersQueued call under test.
+	if want := 2 * batchSize; queued != want {
+		t.Errorf("queued count = %d, want %d", queued, want)
 	}
 }

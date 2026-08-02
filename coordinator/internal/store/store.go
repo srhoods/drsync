@@ -265,6 +265,20 @@ CREATE TABLE IF NOT EXISTS link_members (
   PRIMARY KEY (pass_id, dev, ino, rel_path)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS link_members_group ON link_members (pass_id, dev, ino);
+-- Both PendingLinkMembers (WHERE pass_id = ? AND state = 'pending') and
+-- MarkLinkMembersQueued (same predicate, plus an IN(rel_path) list) filter on
+-- state with no supporting index beyond the (pass_id, dev, ino, rel_path)
+-- primary key — which only lets SQLite narrow to this pass_id, then scan
+-- every one of its rows checking state row by row. Harmless at the
+-- original one-member-at-a-time LinkTask seeding (a handful of rows to
+-- scan), but LinkTaskBatch's ~2000-row batches turned this into a real
+-- bottleneck: ~1.3s per MarkLinkMembersQueued call against 2.5M link_members
+-- rows, run once per batch (~1250 times for a 2.5M-member pass) — over
+-- 20 minutes of cumulative time holding the coordinator's single write lock,
+-- stalling every agent's heartbeat renewal fleet-wide. This index lets both
+-- queries seek directly to the pending rows for a pass instead of scanning
+-- every row the pass has ever recorded.
+CREATE INDEX IF NOT EXISTS link_members_pending ON link_members (pass_id, state);
 
 -- journal_type_counts is the per-(pass, journal record type) histogram —
 -- what "drsync journal cat --summary" reports — computed once by
@@ -1179,8 +1193,11 @@ func (s *Store) UnfinalizedChunkTemps(passID int64) ([]ChunkTemp, error) {
 // LinkMember is one hardlink-group member still awaiting a LinkTask, joined
 // with the group's anchor path and the (size, mtime) gen it was copied at —
 // everything seedLinkfix needs to build the LinkTask directly, no second query
-// per row.
+// per row. Dev/Ino are carried through so MarkLinkMembersQueued can flip this
+// exact row's state via the link_members primary key (pass_id, dev, ino,
+// rel_path) — a real index seek — instead of an unindexed rel_path lookup.
 type LinkMember struct {
+	Dev, Ino      uint64
 	RelPath       string
 	AnchorRelPath string
 	AnchorSize    uint64
@@ -1197,7 +1214,7 @@ type LinkMember struct {
 // speculatively.
 func (s *Store) PendingLinkMembers(passID int64) ([]LinkMember, error) {
 	rows, err := s.rdb.Query(`
-		SELECT m.rel_path, g.anchor_rel_path, g.anchor_size, g.anchor_mtime_ns
+		SELECT m.dev, m.ino, m.rel_path, g.anchor_rel_path, g.anchor_size, g.anchor_mtime_ns
 		FROM link_members m
 		JOIN link_groups g ON g.pass_id = m.pass_id AND g.dev = m.dev AND g.ino = m.ino
 		WHERE m.pass_id = ? AND m.state = 'pending' AND g.anchor_state = 'copied'`,
@@ -1209,14 +1226,24 @@ func (s *Store) PendingLinkMembers(passID int64) ([]LinkMember, error) {
 	var out []LinkMember
 	for rows.Next() {
 		var m LinkMember
-		var anchorSize int64 // see recordLinkSightingsTx: stored via int64(sg.Size)
-		if err := rows.Scan(&m.RelPath, &m.AnchorRelPath, &anchorSize, &m.AnchorMtimeNs); err != nil {
+		var dev, ino, anchorSize int64 // see recordLinkSightingsTx: bit-preserving reinterpret
+		if err := rows.Scan(&dev, &ino, &m.RelPath, &m.AnchorRelPath, &anchorSize, &m.AnchorMtimeNs); err != nil {
 			return nil, err
 		}
+		m.Dev = uint64(dev)
+		m.Ino = uint64(ino)
 		m.AnchorSize = uint64(anchorSize)
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// LinkMemberKey identifies one link_members row by its full primary key
+// (minus pass_id, supplied separately) — enough for MarkLinkMembersQueued to
+// seek directly to the row instead of scanning for it by rel_path alone.
+type LinkMemberKey struct {
+	Dev, Ino uint64
+	RelPath  string
 }
 
 // MarkLinkMembersQueued flips 'pending' members to 'queued' once seedLinkfix
@@ -1224,21 +1251,43 @@ func (s *Store) PendingLinkMembers(passID int64) ([]LinkMember, error) {
 // none on the current call path — advance() only reaches PendingLinkMembers
 // once per pass, at the DIRFIX→LINKFIX transition — but the same table would
 // otherwise silently double-seed if that ever changed) sees nothing left to do.
-func (s *Store) MarkLinkMembersQueued(passID int64, relPaths []string) error {
-	if len(relPaths) == 0 {
+//
+// One prepared UPDATE executed once per member, addressed by the full
+// link_members primary key (pass_id, dev, ino, rel_path), inside a single
+// transaction — not one UPDATE with a rel_path IN (...) list. The IN-list
+// shape (kept until this was measured against a production-scale
+// link_members table) cannot use any index to prune by rel_path alone
+// (rel_path is only the trailing PK column, and a WITHOUT ROWID table has no
+// separate rowid to index it by), so SQLite fell back to scanning every
+// pending row for the pass checking each against the IN-list — ~1.3s per
+// 2000-member call against 2.5M rows, run once per LinkTaskBatch flush
+// (~1250 times for a 2.5M-member pass), all of it under s.mu. Per-row PK
+// updates measured at ~10ms for the same 2000 rows — a ~120x improvement —
+// since dev/ino narrow straight to the exact row via the primary key's own
+// index, the same one link_members_group already provides.
+func (s *Store) MarkLinkMembersQueued(passID int64, members []LinkMemberKey) error {
+	if len(members) == 0 {
 		return nil
 	}
 	s.lockTimed("MarkLinkMembersQueued")
 	defer s.mu.Unlock()
-	ph := strings.TrimSuffix(strings.Repeat("?,", len(relPaths)), ",")
-	args := make([]any, 0, len(relPaths)+1)
-	args = append(args, passID)
-	for _, p := range relPaths {
-		args = append(args, p)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	_, err := s.db.Exec(`UPDATE link_members SET state = 'queued'
-		WHERE pass_id = ? AND state = 'pending' AND rel_path IN (`+ph+`)`, args...)
-	return err
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE link_members SET state = 'queued'
+		WHERE pass_id = ? AND dev = ? AND ino = ? AND rel_path = ? AND state = 'pending'`)
+	if err != nil {
+		return fmt.Errorf("MarkLinkMembersQueued prepare: %w", err)
+	}
+	defer stmt.Close()
+	for _, m := range members {
+		if _, err := stmt.Exec(passID, int64(m.Dev), int64(m.Ino), m.RelPath); err != nil {
+			return fmt.Errorf("MarkLinkMembersQueued (members=%d): %w", len(members), err)
+		}
+	}
+	return tx.Commit()
 }
 
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for
@@ -1526,6 +1575,9 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 // just a stale-by-a-beat snapshot), so the caller logs matched vs requested
 // rather than treating any gap as automatically wrong; a *sustained* gap for
 // one specific id across consecutive heartbeats is the real signal.
+// One bind parameter per lease ID plus 3 fixed args. Bounded by
+// AGENT_MAX_LEASES (agent/src/agent.h) + 3 in practice, well under sqlite's
+// compiled-in SQLITE_MAX_VARIABLE_NUMBER (32766, modernc.org/sqlite v1.53.0).
 func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Duration) (matched int64, err error) {
 	if len(leaseIDs) == 0 {
 		return 0, nil
@@ -1545,7 +1597,7 @@ func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Durat
 	res, err := s.db.Exec(`UPDATE shards SET lease_expiry = ?
 		WHERE state = ? AND lease_agent = ? AND lease_id IN (`+string(ph)+`)`, args...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("RenewLeasesByID agent=%s (leaseIDs=%d): %w", agentID, len(leaseIDs), err)
 	}
 	matched, err = res.RowsAffected()
 	return matched, err
@@ -1610,7 +1662,7 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 	rows, err := tx.Query(`SELECT id FROM shards WHERE pass_id = ? AND state = ? AND kind IN (`+ph+`)
 		LIMIT ?`, args...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ReapDoneShards select (kinds=%d args=%d): %w", len(kinds), len(args), err)
 	}
 	var ids []int64
 	for rows.Next() {
@@ -1635,11 +1687,11 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 		idArgs[i] = id
 	}
 	if _, err := tx.Exec(`DELETE FROM splits WHERE parent_shard_id IN (`+idPh+`)`, idArgs...); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ReapDoneShards delete splits (ids=%d): %w", len(idArgs), err)
 	}
 	n, err := execCountTx(tx, `DELETE FROM shards WHERE id IN (`+idPh+`)`, idArgs...)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ReapDoneShards delete shards (ids=%d): %w", len(idArgs), err)
 	}
 	if _, err := tx.Exec(`UPDATE passes SET shards_reaped = shards_reaped + ? WHERE id = ?`,
 		n, passID); err != nil {

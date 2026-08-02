@@ -1,9 +1,9 @@
 /* Hardlink-group member linking (docs/DESIGN-hardlinks.md §3.3, LINKFIX phase).
  *
- * A LinkTask names one member of a hardlink group whose anchor — the first
- * member of the group, copied in full when it was first discovered
+ * A LinkTaskBatch names many members of hardlink groups whose anchor — the
+ * first member of its group, copied in full when it was first discovered
  * (speculative-anchor design, §3.4) — has been confirmed landed. Rather than
- * copy the member's data again, this just creates the destination directory
+ * copy each member's data again, this just creates its destination directory
  * entry: linkat(anchor, member). Both paths are resolved beneath the
  * destination root under the same containment discipline as the walker
  * (component-wise O_NOFOLLOW, no traversal outside the job's roots).
@@ -108,6 +108,27 @@ int do_linkfix(struct walk_ctx *ctx, int dst_fd, const struct linkfix *lf)
     return RES_OK;
 }
 
+/* Runs do_linkfix for every entry in the batch. A single entry's failure
+ * (RES_ERROR: walk_err already counted+journaled it; RES_SRC_CHANGED:
+ * do_linkfix already journaled JR_SRC_CHANGED) does not abort the rest of the
+ * batch — the same soft-fail-and-continue discipline process_dirfix uses for
+ * its own per-item loop, and for the same reason: one bad member out of
+ * (potentially) linkfixBatchSize should not force every other member in the
+ * batch to be requeued and re-attempted, since re-linking an already-linked
+ * member is redundant work, not free. The aggregate ShardResult stays RES_OK
+ * even when some entries failed — same as process_dirfix, which never
+ * inspects a per-item outcome for its own returned status either — since
+ * per-entry outcomes are already fully accounted for via ctx.c.errors/
+ * links_created and the journal; RES_ERROR/RES_SRC_CHANGED as the *shard's*
+ * status is reserved for something preventing the batch from running at all
+ * (see process_linkfix). */
+static void do_linkfix_batch(struct walk_ctx *ctx, int dst_fd,
+                             const struct linkfix *links, size_t n_links)
+{
+    for (size_t i = 0; i < n_links && !ctx->fatal; i++)
+        do_linkfix(ctx, dst_fd, &links[i]);
+}
+
 void process_linkfix(const struct shard_item *it)
 {
     struct timespec t0, t1;
@@ -126,7 +147,7 @@ void process_linkfix(const struct shard_item *it)
     if (ctx.oe->o.dry_run)
         goto out; /* nothing is linked in a dry run */
 
-    status = do_linkfix(&ctx, ctx.oe->dst_fd, &it->link);
+    do_linkfix_batch(&ctx, ctx.oe->dst_fd, it->links, it->n_links);
 
 out:
     jrn_flush(&ctx);

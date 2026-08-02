@@ -160,7 +160,14 @@ enum {
     WI_CHUNK = 4,     /* ChunkTask: one byte range of a big file, or its finalize */
     WI_PROBE = 5,     /* ProbeTask: verify this agent's src/dst mounts before work */
     WI_DIRFIX = 6,    /* DirFixBatch: re-apply directory metadata after all copies */
-    WI_LINKFIX = 7,   /* LinkTask: linkat a hardlink-group member to its anchor */
+    WI_LINKFIX = 7,   /* LinkTaskBatch (proto minor 3): linkat a batch of
+                       * hardlink-group members to their anchors. There is no
+                       * decoder for the older per-link LinkTask left here —
+                       * the coordinator (passctrl.seedLinkfix) only ever
+                       * seeds the batch shape as of minor 3, gated by
+                       * Config.MinAgentMinor at connect time, so an agent new
+                       * enough to be granted a WI_LINKFIX item is always new
+                       * enough to decode this. */
 };
 
 /* Per-shard walk overrides (proto WalkOverrides). The coordinator sends these
@@ -201,12 +208,13 @@ struct dirmeta {
     int64_t  atime_ns, mtime_ns;
 };
 
-/* WI_LINKFIX (proto LinkTask): create one destination directory entry for a
- * hardlink-group member by linking it to the group's anchor — the member
- * that was already copied in full when this group was first discovered
- * (docs/DESIGN-hardlinks.md §3.3/§3.4) — instead of copying data again.
- * anchor_gen is the anchor's (size, mtime) at copy time, re-checked before
- * linking so a drifted anchor aborts rather than propagating stale data. */
+/* WI_LINKFIX (proto LinkEntry, one row of a LinkTaskBatch): create one
+ * destination directory entry for a hardlink-group member by linking it to
+ * the group's anchor — the member that was already copied in full when this
+ * group was first discovered (docs/DESIGN-hardlinks.md §3.3/§3.4) — instead
+ * of copying data again. anchor_gen is the anchor's (size, mtime) at copy
+ * time, re-checked before linking so a drifted anchor aborts rather than
+ * propagating stale data. */
 struct linkfix {
     char    *anchor_rel; /* malloc'd; owner frees */
     char    *member_rel; /* malloc'd; owner frees */
@@ -227,7 +235,8 @@ struct shard_item {
     size_t   n_paths;
     struct dirmeta *dirs;     /* WI_DIRFIX: malloc'd array; owner frees */
     size_t   n_dirs;
-    struct linkfix link;      /* WI_LINKFIX */
+    struct linkfix *links;    /* WI_LINKFIX: malloc'd array; owner frees */
+    size_t   n_links;
     struct walk_overrides ov; /* WI_SHARD/WI_ENTRYLIST */
     struct chunk_info chunk;  /* WI_CHUNK */
 };
