@@ -159,6 +159,17 @@ CREATE TABLE IF NOT EXISTS shards (
 );
 CREATE INDEX IF NOT EXISTS shards_sched ON shards (state, priority DESC, id);
 CREATE INDEX IF NOT EXISTS shards_pass  ON shards (pass_id, state);
+-- ExpireLeases' select and both its follow-up UPDATEs filter on exactly
+-- (state = 'leased' AND lease_expiry < ?), run fleet-wide on every sweep tick
+-- (leaseTTL/3, 10s by default). shards_sched's (state, priority DESC, id)
+-- narrows to the leased set but can't prune by lease_expiry, so a large
+-- concurrently-leased set (tens of thousands of shards across a busy fleet —
+-- plausible even outside a LINKFIX-scale event) makes every sweep scan all of
+-- it looking for the handful actually expired. Measured directly: ~295ms per
+-- sweep at 50K leased shards without this index, ~90µs with it — the same
+-- shape of bug link_members_pending fixed for MarkLinkMembersQueued/
+-- PendingLinkMembers, caught by the same kind of audit after that incident.
+CREATE INDEX IF NOT EXISTS shards_lease_expiry ON shards (state, lease_expiry);
 
 -- shard_counts is an incrementally-maintained rollup of shards by
 -- (pass_id, kind, state), so the queue/pass-progress views are O(states)
