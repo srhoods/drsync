@@ -23,9 +23,18 @@
  * coordinator exactly — bumping it locks out the whole fleet until every agent
  * is upgraded. Minor is additive: bump it when this agent starts populating a
  * newly added field, so the coordinator can tell "not reported" from "zero".
- * minor 1: Heartbeat.inflight. */
+ * minor 1: Heartbeat.inflight.
+ * minor 2: dec_link_task (LinkTask) — should have bumped this and did not;
+ *          left uncorrected here since minor 3 (below) supersedes it anyway
+ *          and nothing in this codebase branches on exactly-2.
+ * minor 3: dec_link_task_batch (LinkTaskBatch) — coordinator/internal/
+ *          agentsrv.MinorLinkBatch gates LINKFIX shard grants on this; an
+ *          agent that self-reports below 3 while a job's LINKFIX phase has
+ *          pending work is refused only if the operator has raised
+ *          -min-agent-minor to 3 (there is no automatic per-shard fallback,
+ *          see docs/DESIGN-hardlinks.md §3.3). */
 #define PROTO_MAJOR 1
-#define PROTO_MINOR 1
+#define PROTO_MINOR 3
 
 /* ---- logging ---- */
 void log_line(const char *level, const char *fmt, ...)
@@ -110,6 +119,11 @@ struct lease_entry {
     int             free_next;                 /* intrusive singly-linked free list, -1 = none */
     int             hash_next;                 /* intrusive singly-linked hash-bucket chain, -1 = none */
 };
+
+/* Mirrors state.c's MAX_LEASES (lease table capacity) so callers sizing a
+ * lease_snapshot buffer can guarantee the held-lease list is never truncated,
+ * instead of picking an independent cap that has to be kept in sync by hand. */
+#define AGENT_MAX_LEASES 8192
 
 /* Control thread: record a granted lease. Copies what it needs from it, so the
  * caller may hand it->rel_path to the work queue afterwards. */
@@ -375,12 +389,16 @@ void process_probe(const struct shard_item *it);
 void process_dirfix(const struct shard_item *it);
 
 /* ---- linkfix executor (link.c) ----
- * Executes one LinkTask: linkat a hardlink-group member to its group's
- * already-copied anchor instead of copying data again
- * (docs/DESIGN-hardlinks.md §3.3, LINKFIX phase). */
+ * Executes one LinkTaskBatch shard: linkat every member in it->links[] to its
+ * group's already-copied anchor instead of copying data again
+ * (docs/DESIGN-hardlinks.md §3.3, LINKFIX phase). One bad entry (source
+ * drift, a real error) does not abort the rest of the batch — same
+ * soft-fail-and-continue discipline as process_dirfix — the shard reports one
+ * aggregate ShardResult once every entry has been attempted. */
 void process_linkfix(const struct shard_item *it);
-/* Core linkat logic (anchor gen re-check, linkat, EEXIST retry), factored out
- * for unit testing without the coordinator-protocol machinery. */
+/* Core linkat logic for ONE entry (anchor gen re-check, linkat, EEXIST
+ * retry), factored out of process_linkfix's per-entry loop so it stays unit-
+ * testable without the coordinator-protocol machinery. */
 int do_linkfix(struct walk_ctx *ctx, int dst_fd, const struct linkfix *lf);
 
 /* ---- walker (walker.c) ---- */

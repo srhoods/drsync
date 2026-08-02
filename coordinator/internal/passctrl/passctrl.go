@@ -33,6 +33,20 @@ const verifyBatchSize = 500
 // dirfixBatchSize bounds directories per DirFixBatch task.
 const dirfixBatchSize = 1000
 
+// linkfixBatchSize bounds hardlink-group members per LinkTaskBatch task.
+// Before this existed, seedLinkfix inserted one shard (and therefore one
+// held lease) per pending member — fine at ordinary hardlink density, but at
+// millions of members in a single LINKFIX phase it produced millions of
+// shard rows from one InsertShards call (holding the coordinator's single
+// write lock for the whole insert, stalling every agent's dispatch/heartbeat
+// fleet-wide) and could leave one agent holding more concurrent leases than
+// its heartbeat can report in one frame (agent/src/main.c AGENT_MAX_LEASES),
+// so leases past that cap were never renewed and expired out from under
+// still-running work. Matches dirfixBatchSize/verifyBatchSize in kind, not
+// value — a LinkEntry is smaller than a DirMeta/VerifyEntry, so this can run
+// higher before approaching WIRE_MAX_FRAME (16 MiB).
+const linkfixBatchSize = 2000
+
 type Controller struct {
 	st          *store.Store
 	journalRoot string
@@ -612,19 +626,28 @@ func (c *Controller) seedTempReclaim(pass *store.Pass) (int, error) {
 	return len(shards), nil
 }
 
-// seedLinkfix builds one LinkTask shard per hardlink-group member whose
-// group's anchor copy has confirmed landed (docs/DESIGN-hardlinks.md §3.3).
-// Called only once the DIRFIX phase has drained: LinkSightings arrive on
-// ShardSplit alongside every other kind of shard discovery, so a sighting
-// from any still-queued or still-leased shard could still add a pending
-// member after this point — draining SCANNING (checked long before DIRFIX
-// even starts) already proves no such shard remains, which is the same
-// completeness argument seedTempReclaim relies on for chunk residue.
+// seedLinkfix builds LinkTaskBatch shards — up to linkfixBatchSize members
+// each — for every hardlink-group member whose group's anchor copy has
+// confirmed landed (docs/DESIGN-hardlinks.md §3.3). Called only once the
+// DIRFIX phase has drained: LinkSightings arrive on ShardSplit alongside
+// every other kind of shard discovery, so a sighting from any still-queued or
+// still-leased shard could still add a pending member after this point —
+// draining SCANNING (checked long before DIRFIX even starts) already proves
+// no such shard remains, which is the same completeness argument
+// seedTempReclaim relies on for chunk residue.
 //
 // A group whose anchor never reached 'copied' contributes no rows — its
 // members already have independent copies from the speculative-anchor walk
 // (§3.4), so there is nothing to do for them here; that outcome is counted at
 // journal time as LINK_FALLBACK, not here.
+//
+// Batched like seedDirfix/seedVerify (one InsertShards call per batch, not
+// one call for every member): at hardlink-heavy scale a single-call,
+// one-shard-per-member seed could hold InsertShards' store lock for the
+// whole insert and leave one agent holding more concurrently-leased shards
+// than its heartbeat can report — see linkfixBatchSize's comment. Requires a
+// minor-3+ fleet (Config.MinAgentMinor): unlike DIRFIX/VERIFY batching, there
+// is no older unbatched shape seeded as a fallback for pre-batch agents.
 func (c *Controller) seedLinkfix(pass *store.Pass) (int, error) {
 	members, err := c.st.PendingLinkMembers(pass.ID)
 	if err != nil {
@@ -633,30 +656,50 @@ func (c *Controller) seedLinkfix(pass *store.Pass) (int, error) {
 	if len(members) == 0 {
 		return 0, nil
 	}
-	shards := make([]store.NewShard, 0, len(members))
-	relPaths := make([]string, 0, len(members))
+	total := 0
+	batchEntries := make([]*drsyncpb.LinkEntry, 0, linkfixBatchSize)
+	batchPaths := make([]string, 0, linkfixBatchSize)
+	flush := func() error {
+		if len(batchEntries) == 0 {
+			return nil
+		}
+		payload, err := proto.Marshal(&drsyncpb.LinkTaskBatch{
+			JobId:  uint64(pass.JobID),
+			PassNo: uint32(pass.PassNo),
+			Links:  batchEntries,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := c.st.InsertShards(pass.ID, 0,
+			[]store.NewShard{{Kind: model.KindLinkfix, Payload: payload}}); err != nil {
+			return err
+		}
+		if err := c.st.MarkLinkMembersQueued(pass.ID, batchPaths); err != nil {
+			return err
+		}
+		total += len(batchEntries)
+		batchEntries = batchEntries[:0]
+		batchPaths = batchPaths[:0]
+		return nil
+	}
 	for _, m := range members {
-		payload, err := proto.Marshal(&drsyncpb.LinkTask{
-			JobId:     uint64(pass.JobID),
-			PassNo:    uint32(pass.PassNo),
+		batchEntries = append(batchEntries, &drsyncpb.LinkEntry{
 			AnchorRel: m.AnchorRelPath,
 			MemberRel: m.RelPath,
 			AnchorGen: &drsyncpb.FileGen{Size: m.AnchorSize, MtimeNs: m.AnchorMtimeNs},
 		})
-		if err != nil {
-			return 0, err
+		batchPaths = append(batchPaths, m.RelPath)
+		if len(batchEntries) >= linkfixBatchSize {
+			if err := flush(); err != nil {
+				return total, err
+			}
 		}
-		shards = append(shards, store.NewShard{
-			Kind: model.KindLinkfix, RelPath: m.RelPath, Payload: payload})
-		relPaths = append(relPaths, m.RelPath)
 	}
-	if _, err := c.st.InsertShards(pass.ID, 0, shards); err != nil {
-		return 0, err
+	if err := flush(); err != nil {
+		return total, err
 	}
-	if err := c.st.MarkLinkMembersQueued(pass.ID, relPaths); err != nil {
-		return 0, err
-	}
-	return len(shards), nil
+	return total, nil
 }
 
 func (c *Controller) seedDirfix(job *store.Job, pass *store.Pass) (int, error) {

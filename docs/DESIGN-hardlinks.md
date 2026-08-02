@@ -189,7 +189,8 @@ At the SCANNING→DIRFIX transition (extend `seedTempReclaim`/`seedDirfix` sibli
   independently by their own shards (§3.4), so nothing is lost — just no dedup for that
   group this pass. Journaled as `LINK_FALLBACK {dev, ino, reason}`.
 
-`LinkTask`:
+`LinkTask` (as originally landed; superseded by `LinkTaskBatch` below — kept in the
+proto, unencoded, only so an old journal/capture still decodes):
 
 ```protobuf
 message LinkTask {
@@ -202,12 +203,67 @@ message LinkTask {
 }
 ```
 
+`LinkTaskBatch` (as landed by the §3.3 follow-up below — this is what `seedLinkfix`
+actually seeds today):
+
+```protobuf
+message LinkEntry {
+  string anchor_rel  = 1;
+  string member_rel  = 2;
+  FileGen anchor_gen = 3;
+}
+
+message LinkTaskBatch {
+  uint64 task_id           = 1;
+  uint64 job_id            = 2;
+  uint32 pass_no           = 3;
+  repeated LinkEntry links = 4;
+}
+```
+
 Executor (`agent/src/link.c`, new): `linkat(dst_fd, anchor_rel, dst_fd, member_rel,
 0)` (both fd-relative under the existing `openat2 RESOLVE_BENEATH` containment, no new
 traversal surface). `EEXIST` on the destination (stale file from a prior pass, or
 independent-copy leftover from a fallback) is resolved by `unlinkat` + retry — same
 pattern as `remove_dst` used for type mismatches (`walker.c:298`). Journals
 `LINK_CREATED {dev, ino, anchor_rel, member_rel}`.
+
+**Follow-up: batched at scale, `LinkTaskBatch` (proto minor 3).** As landed above,
+`seedLinkfix` inserted one `LinkTask` shard per pending member — fine at the group
+sizes/densities this doc's §3.6 scale analysis modeled, but a real 1B-file/500TB job
+with a hardlink-heavy tree seeded ~2.5M individual shards in one LINKFIX phase, from a
+single `InsertShards` call. That call holds the coordinator's one process-wide write
+lock (`store.Store.mu`) for the whole insert, stalling every agent's dispatch —
+including heartbeat lease renewal — for however long the insert took; and the agent side
+independently capped how many held-lease ids it can report per heartbeat
+(`agent/src/main.c`, `AGENT_MAX_LEASES` — sized to the lease table's own 8192-slot
+capacity, previously a much smaller ad hoc constant that a link-heavy agent could
+exceed). Leases that fall off either edge are never renewed, expire under still-running
+work, get requeued and re-granted elsewhere, and the original agent's eventual result
+arrives to find its lease no longer matches — logged as `"dropping stale shard result"`
+— so the phase's queued/leased counts can look like LINKFIX is repeatedly failing to
+drain even though real `linkat` work keeps completing underneath it.
+
+Fixed the same way DIRFIX/VERIFY already bound their own phases: `seedLinkfix` now packs
+up to `linkfixBatchSize` (2000) pending members into one `LinkTaskBatch` shard —
+`LinkEntry{anchor_rel, member_rel, anchor_gen}` repeated, task-level `job_id`/`pass_no`
+carried once per batch instead of once per member — flushing a batch (one `InsertShards`
+call) at a time rather than building the whole pass's shards in memory and inserting
+them in one call. `agent/src/link.c`'s `process_linkfix` now loops `do_linkfix` over a
+batch's entries; one entry's failure (a drifted anchor, a real error) does not abort the
+rest of the batch — the same soft-fail-and-continue discipline DIRFIX's own per-item
+loop already uses — so a single bad member does not force the other ~1999 already-
+succeeded links in its batch to be redone. `do_linkfix` itself (the per-entry `linkat` +
+gen-check + `EEXIST`-retry core) is unchanged.
+
+No mixed-fleet fallback: unlike DIRFIX/VERIFY batching, `LinkTask` (unbatched) is not
+kept as a shape the coordinator still seeds for older agents — `seedLinkfix` always
+seeds `LinkTaskBatch` now. An operator must raise `-min-agent-minor` to 3
+(`Config.MinAgentMinor`, `coordinator/internal/agentsrv`) before resuming a job whose
+LINKFIX phase has pending work, so no agent below minor 3 (unable to decode
+`LinkTaskBatch`) is ever granted one. `LinkTask` itself stays defined in the proto,
+byte-for-byte, as a historical/reference shape only — decoding an old capture or journal
+still works; nothing encodes it anymore.
 
 ### 3.4 Why the anchor is copied *speculatively*, not gated
 
@@ -373,6 +429,13 @@ merged) — see §4.
    `hardlinks_max_group_scan` falls back). These caught two real bugs no unit test
    had exercised — see the implementation-status note at the top of this doc — both
    fixed before landing, with unit tests added afterward to pin the fixes.
+6. `LinkTaskBatch` (proto minor 3, §3.3 follow-up): batched LINKFIX seeding/execution
+   after a real 1B-file production job exposed the unbatched design's two scale
+   ceilings (coordinator lock hold time, agent heartbeat-reportable lease count) —
+   see §3.3 for the mechanism. `agent/src/agent.h`'s self-reported `PROTO_MINOR` was
+   also corrected to 3 here; it had never been bumped past 1 despite minor 2 (item 2
+   above) already landing, an unrelated pre-existing gap this follow-up's own
+   `MinAgentMinor` gating depends on being accurate.
 
 **D11 — Hardlinks preserved via a pass-scoped link registry, opt-in, superseding D3's
 blanket "not preserved" for jobs that request it.** D3's rationale (no *durable* global

@@ -1526,6 +1526,9 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 // just a stale-by-a-beat snapshot), so the caller logs matched vs requested
 // rather than treating any gap as automatically wrong; a *sustained* gap for
 // one specific id across consecutive heartbeats is the real signal.
+// One bind parameter per lease ID plus 3 fixed args. Bounded by
+// AGENT_MAX_LEASES (agent/src/agent.h) + 3 in practice, well under sqlite's
+// compiled-in SQLITE_MAX_VARIABLE_NUMBER (32766, modernc.org/sqlite v1.53.0).
 func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Duration) (matched int64, err error) {
 	if len(leaseIDs) == 0 {
 		return 0, nil

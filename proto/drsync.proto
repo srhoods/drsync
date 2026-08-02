@@ -19,6 +19,11 @@
 //          links_created/link_anchor_races/link_fallback, JournalRecord
 //          JR_LINK_CREATED/JR_LINK_FALLBACK — hardlink preservation wire
 //          types (docs/DESIGN-hardlinks.md); additive only.
+// minor 3: LinkTaskBatch (WorkItem) — many LinkEntry rows per shard, replacing
+//          one-shard-per-link seeding for LINKFIX. LinkTask (minor 2) is kept
+//          byte-for-byte unchanged and still sent to agents below minor 3, so
+//          a rolling upgrade never breaks an old agent mid-fleet; additive
+//          only.
 
 syntax = "proto3";
 
@@ -406,6 +411,11 @@ message ProbeTask {
 // linking it to the group's anchor (the first member of the group already
 // copied in full) instead of copying data again. See docs/DESIGN-hardlinks.md
 // §3.3. Seeded only once the anchor's copy is confirmed landed.
+//
+// Superseded by LinkTaskBatch (minor 3) for agents that support it — kept
+// unchanged, byte-for-byte, so the coordinator can still send it to any agent
+// below minor 3 during a rolling upgrade. Do not add fields here; extend
+// LinkEntry instead.
 message LinkTask {
   uint64 task_id     = 1;
   uint64 job_id      = 2;
@@ -414,6 +424,30 @@ message LinkTask {
   string member_rel  = 5;  // destination path to linkat into existence
   FileGen anchor_gen = 6;  // size/mtime the anchor had when copied; re-checked
                            // before linking so a drifted anchor is caught
+}
+
+// One member's linkat instruction within a LinkTaskBatch — the per-item
+// fields of LinkTask, minus the task-level id/job_id/pass_no now carried once
+// per batch instead of once per link.
+message LinkEntry {
+  string anchor_rel  = 1;
+  string member_rel  = 2;
+  FileGen anchor_gen = 3;
+}
+
+// Many LinkEntry rows executed as one shard/lease (docs/DESIGN-hardlinks.md
+// §3.3). Replaces one-LinkTask-shard-per-link seeding: at hardlink-heavy
+// scale (millions of members in one LINKFIX phase) that produced one row in
+// the shards table and one held lease per link, which could exceed both the
+// agent's heartbeat-reportable lease count and the coordinator's single
+// InsertShards call's lock-hold time. Batching bounds both the same way
+// DirFixBatch/VerifyBatch already bound DIRFIX/VERIFY. Agents below minor 3
+// never receive this — see LinkTask.
+message LinkTaskBatch {
+  uint64 task_id     = 1;
+  uint64 job_id      = 2;
+  uint32 pass_no     = 3;
+  repeated LinkEntry links = 4;
 }
 
 message WorkItem {
@@ -428,6 +462,7 @@ message WorkItem {
     DeleteBatch    delete     = 8;
     ProbeTask      probe      = 9;
     LinkTask       link       = 10;
+    LinkTaskBatch  link_batch = 11;
   }
 }
 
