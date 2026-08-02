@@ -942,6 +942,96 @@ func TestLeaseExpiryRequeuesThenParks(t *testing.T) {
 	}
 }
 
+// TestExpireLeasesUsesLeaseExpiryIndexAtScale pins the shards_lease_expiry
+// index added alongside link_members_pending (same class of gap, found by
+// auditing every high-write table's query patterns after the LINKFIX
+// incident): ExpireLeases' select and both its follow-up UPDATEs filter on
+// (state = 'leased' AND lease_expiry < ?), run fleet-wide on every sweep tick
+// (leaseTTL/3, 10s by default). Without an index on lease_expiry,
+// shards_sched's (state, priority DESC, id) can narrow to the leased set but
+// then has to check every leased row's expiry individually — fine when few
+// shards are leased at once, but a busy fleet can easily have tens of
+// thousands concurrently leased (this is exactly the shape LINKFIX at scale
+// produced before batching). Measured directly: ~295ms per sweep at 50K
+// leased shards without this index, ~90µs with it.
+//
+// Asserts via EXPLAIN QUERY PLAN rather than a wall-clock bound — an earlier
+// scale test in this package (TestMarkLinkMembersQueuedStaysFastAtScale)
+// flaked on slower CI hardware with an absolute cutoff; asserting the query
+// plan directly is immune to hardware speed entirely, and is exactly what
+// distinguishes "seeks the index" from "scans and filters" regardless of how
+// fast either happens to run on a given machine.
+func TestExpireLeasesUsesLeaseExpiryIndexAtScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test; skipped with -short")
+	}
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO shards
+		(pass_id, kind, state, lease_agent, lease_expiry, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).UnixMilli()
+	const leasedCount = 50_000
+	for i := 0; i < leasedCount; i++ {
+		if _, err := stmt.Exec(passID, "linkfix", string(model.ShardLeased), "agent-a", future, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A handful of genuinely expired leases mixed in, so ExpireLeases has real
+	// work to do and this test also pins correctness, not just the plan.
+	past := time.Now().Add(-time.Minute).UnixMilli()
+	const expiredCount = 3
+	for i := 0; i < expiredCount; i++ {
+		if _, err := stmt.Exec(passID, "linkfix", string(model.ShardLeased), "agent-b", past, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var planUsesIndex bool
+	prows, err := s.rdb.Query(`EXPLAIN QUERY PLAN SELECT s.id FROM shards s
+		JOIN passes p ON p.id = s.pass_id JOIN jobs j ON j.id = p.job_id
+		WHERE s.state = ? AND s.lease_expiry < ? ORDER BY s.id`,
+		string(model.ShardLeased), time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for prows.Next() {
+		var a, b, c int
+		var detail string
+		if err := prows.Scan(&a, &b, &c, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "shards_lease_expiry") {
+			planUsesIndex = true
+		}
+	}
+	prows.Close()
+	if !planUsesIndex {
+		t.Fatal("ExpireLeases' select did not use shards_lease_expiry — " +
+			"looks like a scan-based plan regressed back in")
+	}
+
+	expired, err := s.ExpireLeases(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != expiredCount {
+		t.Fatalf("ExpireLeases returned %d, want %d", len(expired), expiredCount)
+	}
+}
+
 func TestSplitIdempotency(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)

@@ -173,6 +173,26 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   `auto_vacuum=INCREMENTAL` and a periodic `PRAGMA incremental_vacuum` pump reclaims
   the pages the reaper frees, so deleting rows actually shrinks the file instead of
   leaving freed-but-unreturned pages in it forever.
+- **Indexing discipline for high-write tables:** every predicate a hot-path query
+  filters or joins on needs an index that actually serves it — not just "an index
+  exists on the table." A single-writer store makes this load-bearing in a way a
+  connection-pooled RDBMS would only partially mask: a query that falls back to
+  scanning-and-filtering holds `store.Store.mu` for the scan's full duration, and
+  that lock is shared by every agent's grant/renew/complete call, not just the slow
+  query's own caller. Found twice, both in the LINKFIX hardlink-batching incident's
+  aftermath (docs/DESIGN-hardlinks.md §3.3 has the full account): `link_members`
+  had no index reachable by `rel_path` alone (only the tail of its primary key),
+  costing ~1.3s per `MarkLinkMembersQueued` call at 2.5M rows; `shards` had no
+  index on `lease_expiry`, costing ~295ms per `ExpireLeases` sweep (every
+  `leaseTTL/3`, so continuously, not just once per incident) at 50K concurrently
+  leased shards. Both fixed by adding the missing index and, for the first case,
+  switching from an `IN (...)`-list statement to a primary-key seek per row (the
+  index alone did not change the query planner's handling of a large `IN` list).
+  The rest of the schema was audited table-by-table against every query site after
+  finding these two and came back clean — see `TestMarkLinkMembersQueuedStaysFastAtScale`
+  and `TestExpireLeasesUsesLeaseExpiryIndexAtScale` (`coordinator/internal/store`)
+  for the regression pins, and re-run that audit whenever a new hot-path query is
+  added to a table this store expects to grow large.
 
 ## 4. Scheduler
 
