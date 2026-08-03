@@ -18,3 +18,12 @@ drsync_agent_uring_enabled: true
 drsync_agent_work_stealing_enabled: true
 drsync_agent_nofile_limit: 1048576
 drsync_agent_fix_io_uring_sysctl: true
+
+# Backstop, not a sizing knob: the agent's own thread pools are bounded by
+# -w/-C, but each io_uring ring's kernel-side io-wq offload pool is capped
+# per-ring (IORING_REGISTER_IOWQ_MAX_WORKERS, agent/src/uring.c and
+# ucopy.c) rather than disabled, so a kernel that ignores the cap or a
+# future ring added without one should hit a hard, visible limit — a
+# service restart — instead of silently climbing past the systemd default
+# (usually ~15% of kernel.pid_max) over a long run.
+drsync_agent_tasks_max: 4096

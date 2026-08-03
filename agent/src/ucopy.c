@@ -65,6 +65,22 @@ static int sys_register(int fd, unsigned op, const void *arg, unsigned nr)
     return (int)syscall(SYS_io_uring_register, fd, op, arg, nr);
 }
 
+/* Cap this ring's io-wq offload pool. Every copy-pool thread lazily builds
+ * and keeps its own ring for the process lifetime (see file header); reads
+ * and writes against a slow/contended NFS mount block in-kernel, and with no
+ * cap the bounded io-wq pool grows one worker per stalled call with nothing
+ * to shrink it back down under sustained load — each is a real kernel task
+ * under /proc/<pid>/task, not a pthread this code created. Two bounded
+ * workers cover the read+write pair this engine keeps in flight at once
+ * (ucopy_run's ping-pong submits both per iteration). Best-effort: older
+ * kernels (pre-5.15) don't support this opcode, so a failure here is not
+ * fatal to the ring. */
+static void ring_cap_iowq(struct ucopy_ring *r)
+{
+    unsigned max[2] = { 2, 2 }; /* [IO_WQ_BOUND], [IO_WQ_UNBOUND] */
+    sys_register(r->fd, IORING_REGISTER_IOWQ_MAX_WORKERS, max, 2);
+}
+
 static void ring_free(struct ucopy_ring *r)
 {
     for (int i = 0; i < UCOPY_NBUF; i++)
@@ -122,6 +138,7 @@ static int ring_map(struct ucopy_ring *r)
     r->cq_tail = (unsigned *)(cq + p.cq_off.tail);
     r->cq_mask = (unsigned *)(cq + p.cq_off.ring_mask);
     r->cqes = (struct io_uring_cqe *)(cq + p.cq_off.cqes);
+    ring_cap_iowq(r);
     return 0;
 fail:
     ring_free(r);
