@@ -39,6 +39,11 @@ RestartSec=2
 # concurrent copies); systemd services bypass pam_limits entirely, so
 # /etc/security/limits.conf has no effect here — this is the only lever.
 LimitNOFILE={{ drsync_agent_nofile_limit }}
+# Backstop against unbounded io-wq worker growth (each ring's kernel-side
+# offload pool is capped at the source, see drsync_agent_tasks_max in
+# defaults/main.yml) — a runaway agent gets restarted loudly by systemd
+# instead of degrading silently for hours.
+TasksMax={{ drsync_agent_tasks_max }}
 
 [Install]
 WantedBy=multi-user.target

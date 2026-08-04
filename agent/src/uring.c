@@ -71,6 +71,27 @@ static int sys_enter(int fd, unsigned to_submit, unsigned min_complete)
                         IORING_ENTER_GETEVENTS, NULL, 0);
 }
 
+static int sys_register(int fd, unsigned op, const void *arg, unsigned nr)
+{
+    return (int)syscall(SYS_io_uring_register, fd, op, arg, nr);
+}
+
+/* Cap this ring's io-wq offload pool. Every walker thread lazily builds and
+ * keeps its own ring for the process lifetime (see file header); statx
+ * against NFS blocks in-kernel, and with no cap the bounded io-wq pool grows
+ * one worker per stalled call with nothing to shrink it back down under
+ * sustained load — each is a real kernel task under /proc/<pid>/task, not a
+ * pthread this code created, so it doesn't show up in a thread-creation
+ * audit. One bounded worker is enough: statx submissions on this ring are
+ * always serialized by ring_statx's own submit/reap loop, so there is never
+ * more than one in flight to offload. Best-effort: older kernels (pre-5.15)
+ * don't support this opcode, so a failure here is not fatal to the ring. */
+static void ring_cap_iowq(struct ring *r)
+{
+    unsigned max[2] = { 1, 1 }; /* [IO_WQ_BOUND], [IO_WQ_UNBOUND] */
+    sys_register(r->fd, IORING_REGISTER_IOWQ_MAX_WORKERS, max, 2);
+}
+
 static void ring_destroy(struct ring *r)
 {
     if (r->sqe_ptr && r->sqe_ptr != MAP_FAILED)
@@ -126,6 +147,7 @@ static int ring_init(struct ring *r)
     r->cq_tail = (unsigned *)(cq + p.cq_off.tail);
     r->cq_mask = (unsigned *)(cq + p.cq_off.ring_mask);
     r->cqes = (struct io_uring_cqe *)(cq + p.cq_off.cqes);
+    ring_cap_iowq(r);
     return 0;
 fail:
     ring_destroy(r);
