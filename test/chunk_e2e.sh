@@ -170,5 +170,5 @@ p2() { curl -sf -H "$AUTH" "$API/api/v1/jobs/chunk/passes/$1" \
 [[ "$(p2 2 errors)" -eq 0 ]] || fail "pass 2 reported errors"
 [[ "$(p2 1 verify_fail)" -eq 0 ]] || fail "checksum verify failed on the chunked file"
 
-echo "PASS: 40 MiB file → $NCHUNK chunk shards across $NAGENTS agents; byte-exact; meta preserved; converged"
+echo "PASS: 40 MiB file → $NCHUNKS_GROUP data chunks + finalize across $NAGENTS agents; byte-exact; meta preserved; converged"
 PASS=1
