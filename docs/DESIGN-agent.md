@@ -826,6 +826,60 @@ ordinary filesystem (no GPFS mount in CI to exercise the true-positive path)
 and survives a tunables-only options update untouched, proving the flag lives
 outside the embedded `job_options` struct that update path overwrites.
 
+### 3.10 Root cause: unbounded per-thread malloc arenas — fixed
+
+Live report: an agent's RSS creeps past 1 GiB over sustained heavy use, and
+stays there — still elevated 20 minutes after the agent is drained and sits
+fully idle. Read as a leak, but a manual `malloc`/`free` audit of every
+allocation site in `agent/src` (walker batch buffers, journal/outbox
+`pb_buf`s, the lease table, `opts_tab`, `ucopy`/`verify`'s per-thread
+buffers) found every path correctly paired, including every error/early-
+return branch — nothing unreachable is being held. Confirmed empirically too:
+a standalone repro (32 threads, 200×64 KiB alloc+free each, glibc 2.34, this
+host) reproduced the "grows, stays grown" shape from *correctly freed*
+allocations alone, with zero real leak involved.
+
+The actual mechanism is glibc's default per-thread arena scaling (up to 8x
+the core count on 64-bit): once enough threads allocate under contention,
+each gets its own private heap, sized to that thread's own historical peak.
+`free()` only returns memory to *that thread's arena's* free list, never to
+the OS, and nothing in this process ever asked glibc to give pages back —
+no `mallopt`, no `malloc_trim` anywhere in `agent/src` before this fix. A
+fleet's usual `-w`/`-C` combined thread count (tens to over a hundred;
+`ansible/roles/drsync_agent` sizes both from `ansible_processor_vcpus`)
+multiplies that into real memory: `ucopy.c` and `verify.c` alone put a
+permanent 1 MiB `static __thread` buffer on every copy-pool thread (by
+design — see §3.9's sibling ring in `uring.c` for the same pattern on walker
+threads), and glibc's own arena bookkeeping and fragmentation compounds on
+top. None of it is unreachable, and none of it comes back once the thread
+that grew it goes idle after a drain (`worker_main`'s `wq_pop` just blocks
+waiting for more work — drain does not exit or reset any thread).
+
+Fixed in `main.c` with two additions, verified together against the
+standalone repro before landing (measured there: `M_ARENA_MAX=1` let a
+subsequent `malloc_trim(0)` reclaim effectively all of what 32 threads had
+grown; `M_ARENA_MAX=2` only gave back about half; 3+ gave back next to
+nothing — each arena beyond the one `malloc_trim` reaches is just more
+unreclaimable heap, so partial caps were not a viable middle ground):
+
+- `tune_malloc_arenas` (startup, alongside `raise_nofile`): `mallopt(M_ARENA_MAX,
+  1)`. All `-w`/`-C` threads now share one arena instead of one each. The
+  cost is every allocating thread now contends on that arena's malloc lock,
+  accepted here because the point of this fix is idle RSS, not allocator
+  throughput during a run, and this process already serializes several
+  heavier paths through their own locks (`wq_mu`, `ob_mu`, `lease_mu`).
+- `idle_trim` (the 1 Hz control-thread tick): once `g_inflight == 0` and both
+  the shard queue and copy queue are empty for `IDLE_TRIM_AFTER_S` (10)
+  consecutive ticks, calls `malloc_trim(0)` and logs what it recovered, then
+  waits out another full idle window before trimming again — so a normal
+  between-grants lull never triggers it, only a real drain/idle period does.
+
+Verified live, not just in the standalone repro: a real coordinator + agent
+run (3000 files, two passes to convergence) followed by `drsync agent
+disable` produced `"draining: handed back 0 queued shard(s)"` followed by
+`idle: malloc_trim released ... KiB` on the very next 1 Hz tick, RSS
+settling lower than its in-run peak and staying there.
+
 ## 4. Special Entry Types
 
 | Type | Handling |
