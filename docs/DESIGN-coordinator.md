@@ -173,6 +173,44 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   `auto_vacuum=INCREMENTAL` and a periodic `PRAGMA incremental_vacuum` pump reclaims
   the pages the reaper frees, so deleting rows actually shrinks the file instead of
   leaving freed-but-unreturned pages in it forever.
+- **Eager SCANNING reap:** the transition-time reap above still leaves SCANNING's own
+  DONE probe/dir/entrylist/chunk rows sitting in `shards` (and their `splits` rows)
+  for the entire scan, since that phase alone can run for most of a large job's wall
+  time — `shards`/`splits` grow to that phase's full peak before the very first reap
+  ever fires. `passctrl.advance()` now also reaps these kinds on every tick a
+  SCANNING pass has any DONE row of them, not just at the SCANNING→DIRFIX
+  transition — the same `reapPhase`/`ReapDoneShards` call, just no longer gated on
+  the whole phase having drained first. Safe because of the agent protocol's own
+  ordering invariant (agent/src/walker.c `ship_split`/`await_split`, protocol doc
+  §4.2): every `ShardSplit` for a shard is acked — and durably recorded in `splits`
+  via `RecordSplit`'s `(parent_shard_id, seq)` idempotency key — *before* that
+  shard's own `ShardResult` is ever sent, so a DONE shard can never again be
+  referenced as a split parent by a retransmit; and `ExpireLeases` only ever touches
+  `LEASED` rows, so a DONE shard can never be requeued either. Nothing else reads a
+  DONE `dir`/`entrylist`/`chunk` row after the fact: DIRFIX/VERIFY seeding
+  (`seedDirfix`/`seedVerify`) read the pass's on-disk journal, not `shards`, and the
+  operator-facing counts read the `shard_counts` rollup, which the reap's deletes
+  already drain correctly regardless of timing. The phase itself still only
+  transitions once every queued/leased shard drains (unchanged) — this only stops
+  *already-finished* shards from sitting around for the rest of the phase.
+- **WAL checkpointing is explicit, not automatic:** the write connection opens with
+  `wal_autocheckpoint(0)`, disabling SQLite's own trigger (by default, a `PASSIVE`
+  checkpoint fires the instant the WAL crosses 1000 pages). That trigger runs inline
+  on whichever write commits the page that crosses the threshold — i.e. under
+  `store.Store.mu`, blocking every agent's grant/renew/complete call for however long
+  copying WAL frames back to the main db file takes, which at a large database and
+  million-write history can be tens of ms — long enough on its own, and worse when it
+  compounds with this store's other `s.mu` holders (`ReapDoneShards`,
+  `ExpireLeases`), to delay a heartbeat renewal past the lease TTL. The same
+  "degrades under sustained load, a restart clears it" shape as the `shards`-table
+  growth (Shard Reaper, above) and the missing `jobs(state)` index
+  (`SchedulerCounts`'s full scan of `shard_counts`) — accumulation correlated with
+  write volume, not random contention, and a restart resets it because SQLite
+  performs a full checkpoint on clean shutdown. `store.RunWALCheckpoint`, started
+  from `main.go` on a 5-minute interval, replaces the disabled trigger with an
+  explicit `PRAGMA wal_checkpoint(PASSIVE)` this process schedules itself, so the WAL
+  still gets bounded — just predictably, instead of at whatever moment a write
+  happens to cross SQLite's own page-count threshold.
 - **Indexing discipline for high-write tables:** every predicate a hot-path query
   filters or joins on needs an index that actually serves it — not just "an index
   exists on the table." A single-writer store makes this load-bearing in a way a

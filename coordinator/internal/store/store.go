@@ -333,7 +333,27 @@ CREATE TABLE IF NOT EXISTS journal_type_counts (
 `
 
 func Open(path string) (*Store, error) {
-	base := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
+	// wal_autocheckpoint=0 disables SQLite's own trigger (default: fire a
+	// PASSIVE checkpoint the moment the WAL passes 1000 pages). That trigger
+	// runs inline, on whichever write commits the page that crosses the
+	// threshold — i.e. on this connection, under s.mu, blocking every agent's
+	// grant/renew/complete call for however long copying WAL frames back to
+	// the main db file takes. At million-shard scale with a large db file
+	// that can be tens of ms, which compounds with this store's other s.mu
+	// holders (ReapDoneShards, ExpireLeases, ordinary shard-transition
+	// writes) to delay a heartbeat renewal past the lease TTL — the same
+	// "degrades over time, a restart fixes it" shape as the shard_counts scan
+	// (jobs_state index) and the shards-table growth (Shard Reaper) fixes:
+	// accumulation, not random contention, correlated with write volume
+	// rather than concurrency. A restart "fixing" it is consistent with this
+	// exact mechanism — SQLite does a full checkpoint closing every
+	// connection cleanly, so the WAL starts the next run empty and the
+	// runaway auto-checkpoint has nothing to fire on for a while.
+	// RunWALCheckpoint (below) replaces the disabled trigger with an explicit
+	// PASSIVE checkpoint on a fixed interval, so the same work still happens
+	// — predictably scheduled and independently observable, instead of
+	// firing at whatever moment a write happens to cross 1000 WAL pages.
+	base := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=wal_autocheckpoint(0)"
 	db, err := sql.Open("sqlite", base)
 	if err != nil {
 		return nil, err
@@ -1769,6 +1789,55 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 		case <-t.C:
 			if err := s.IncrementalVacuum(incrementalVacuumPages); err != nil {
 				slog.Error("incremental vacuum failed", "err", err)
+			}
+		}
+	}
+}
+
+// WALCheckpoint runs a PASSIVE wal_checkpoint: copies as many WAL frames back
+// into the main db file as it can without blocking any other connection
+// (readers on s.rdb keep running; it simply checkpoints less than a FULL/
+// RESTART/TRUNCATE mode would if a reader is holding an old snapshot open).
+// Still takes s.mu — the copy itself briefly holds SQLite's own internal WAL
+// lock against this connection's next write either way, so there is no
+// benefit to letting a write race in during it, only a busy-timeout retry to
+// pay for. Called on a fixed interval (RunWALCheckpoint) now that
+// wal_autocheckpoint is disabled at Open (see its comment there) — this is
+// what actually keeps the WAL from growing unbounded, just on a schedule this
+// process controls instead of one SQLite's internal page-count trigger
+// picked. Logs at info when a checkpoint does real work (checkpointed > 0) so
+// the interval and WAL growth rate can be sanity-checked from operator logs
+// without extra tooling; silent when there is nothing to do, which is the
+// common case between busy stretches.
+func (s *Store) WALCheckpoint() error {
+	s.lockTimed("WALCheckpoint")
+	defer s.mu.Unlock()
+	var busy, log, checkpointed int
+	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(PASSIVE)`).
+		Scan(&busy, &log, &checkpointed); err != nil {
+		return err
+	}
+	if checkpointed > 0 {
+		slog.Info("wal checkpoint", "busy", busy != 0, "wal_pages", log,
+			"checkpointed_pages", checkpointed)
+	}
+	return nil
+}
+
+// RunWALCheckpoint periodically checkpoints the WAL until ctx is done. See
+// WALCheckpoint and the wal_autocheckpoint(0) comment in Open for why this
+// exists: with SQLite's own auto-checkpoint trigger disabled, nothing else
+// keeps the WAL bounded.
+func (s *Store) RunWALCheckpoint(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := s.WALCheckpoint(); err != nil {
+				slog.Error("wal checkpoint failed", "err", err)
 			}
 		}
 	}

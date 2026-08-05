@@ -95,31 +95,40 @@ EOF
 "$DRSYNC" job submit "$WORK/job.yaml" --start >/dev/null || fail "submit failed"
 
 # --- 1. chunks ran, spread across more than one agent ------------------------
-# Sampled WHILE pass 1 is still scanning, not after the job completes: the
-# Shard Reaper deletes a pass's DONE chunk shards the moment its own drain
-# check proves the SCANNING phase finished (same commit as the SCANNING→DIRFIX
-# transition), so by the time the job reaches COMPLETED those rows are already
-# gone — querying them post-completion would always read back zero, not
-# because nothing ran but because the evidence was correctly reaped. Track the
-# high-water mark across the whole run instead of reading it once at the end,
-# mirroring how chunk_abort_reclaim_e2e.sh polls chunk_groups.n_done mid-flight
-# for the same reason.
-NCHUNK=0
+# Two different signals, for two different reasons:
+#
+# Agent spread (NAGENTS) is sampled WHILE pass 1 is still scanning, not after
+# the job completes: DONE chunk shards are reaped — first at the
+# SCANNING→DIRFIX transition, and (as of the eager SCANNING reap,
+# docs/DESIGN-coordinator.md §3) continuously while SCANNING runs, as soon as
+# each chunk shard's own DONE row is no longer needed — so by the time the job
+# reaches COMPLETED those rows are already gone. Track the high-water mark of
+# distinct lease_agent values across the whole run instead of reading it once
+# at the end, mirroring how chunk_abort_reclaim_e2e.sh polls chunk_groups.n_done
+# mid-flight for the same reason.
+#
+# Total chunk count (10 data + finalize) is NOT read from live shard rows for
+# this same reason, but more acutely: on a file this small the finalize shard
+# is often seeded and completed within a single reap tick of the last data
+# chunk, so a poll can land in a window where 10 data chunks were visible
+# (finalize not yet seeded) or where all 11 are already reaped — but never
+# reliably in the narrow window where all 11 coexist. chunk_groups is not
+# reaped (only shards/splits are), so its n_chunks/state columns are the
+# correct source for "how many chunks this file used, and did finalize run" —
+# durable regardless of how fast reaping catches up to a small fixture.
 NAGENTS=0
 STATE=""
 for _ in $(seq 1 240); do
-    read -r n a < <(python3 - "$WORK/coord/state.db" <<'PY'
+    a=$(python3 - "$WORK/coord/state.db" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 rows = con.execute("""
-    SELECT s.lease_agent, COUNT(*) FROM shards s
+    SELECT COUNT(DISTINCT s.lease_agent) FROM shards s
     JOIN passes p ON p.id = s.pass_id JOIN jobs j ON j.id = p.job_id
-    WHERE j.name='chunk' AND p.pass_no=1 AND s.kind='chunk' AND s.lease_agent IS NOT NULL
-    GROUP BY s.lease_agent""").fetchall()
-print(sum(n for _, n in rows), len(rows))
+    WHERE j.name='chunk' AND p.pass_no=1 AND s.kind='chunk' AND s.lease_agent IS NOT NULL""").fetchone()
+print(rows[0])
 PY
 )
-    [[ "${n:-0}" -gt "$NCHUNK" ]] && NCHUNK=$n
     [[ "${a:-0}" -gt "$NAGENTS" ]] && NAGENTS=$a
     STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/chunk" | grep -o '"state":"[A-Z]*"' | head -1)
     [[ "$STATE" == '"state":"COMPLETED"' ]] && break
@@ -127,8 +136,20 @@ PY
 done
 [[ "$STATE" == '"state":"COMPLETED"' ]] || {
     tail -8 "$WORK"/coord.log "$WORK"/chunk-*.log; fail "did not converge (state=$STATE)"; }
-[[ "$NCHUNK" -ge 11 ]] || fail "expected >=11 chunk shards (10 data + finalize), got $NCHUNK"
 [[ "$NAGENTS" -ge 2 ]] || fail "chunks did not spread: ran on $NAGENTS agent(s)"
+
+read -r NCHUNKS_GROUP GROUP_STATE < <(python3 - "$WORK/coord/state.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = con.execute("""
+    SELECT cg.n_chunks, cg.state FROM chunk_groups cg
+    JOIN passes p ON p.id = cg.pass_id JOIN jobs j ON j.id = p.job_id
+    WHERE j.name='chunk' AND p.pass_no=1 AND cg.rel_path='huge.bin'""").fetchone()
+print(row[0] if row else 0, row[1] if row else "missing")
+PY
+)
+[[ "$NCHUNKS_GROUP" -eq 10 ]] || fail "expected 10 data chunks in chunk_groups, got $NCHUNKS_GROUP"
+[[ "$GROUP_STATE" == "done" ]] || fail "chunk_groups state = $GROUP_STATE, want done (finalize did not run)"
 
 # --- 2. the file is byte-exact and metadata survived finalize ----------------
 [[ "$(sha256sum "$DST/huge.bin" | cut -d' ' -f1)" == "$HUGE_SUM" ]] \
@@ -149,5 +170,5 @@ p2() { curl -sf -H "$AUTH" "$API/api/v1/jobs/chunk/passes/$1" \
 [[ "$(p2 2 errors)" -eq 0 ]] || fail "pass 2 reported errors"
 [[ "$(p2 1 verify_fail)" -eq 0 ]] || fail "checksum verify failed on the chunked file"
 
-echo "PASS: 40 MiB file → $NCHUNK chunk shards across $NAGENTS agents; byte-exact; meta preserved; converged"
+echo "PASS: 40 MiB file → $NCHUNKS_GROUP data chunks + finalize across $NAGENTS agents; byte-exact; meta preserved; converged"
 PASS=1

@@ -377,6 +377,27 @@ func (c *Controller) advance(job *store.Job) error {
 	if err != nil {
 		return err
 	}
+	// Eager reap: a DONE probe/dir/entrylist/chunk shard is safe to delete the
+	// instant it lands, not just once the whole SCANNING phase drains. The
+	// agent's own protocol invariant is what makes this safe (agent/src/
+	// walker.c ship_split/await_split, protocol doc §4.2): every ShardSplit
+	// for a shard is acked — and therefore durably recorded in the splits
+	// table via RecordSplit's (parent_shard_id, seq) idempotency key — BEFORE
+	// that shard's own ShardResult is ever sent, so once a shard reaches DONE
+	// no further split traffic can reference it as a parent. ExpireLeases
+	// only ever touches LEASED rows, so a DONE shard is never requeued either
+	// — nothing can make it QUEUED/LEASED again. That is the same safety
+	// reapPhase already relies on at the phase-drain point (below); this just
+	// stops waiting for the whole phase to finish before applying it, so
+	// shards/splits stop growing to their SCANNING-phase peak on a large
+	// tree. Runs every tick a SCANNING pass has any DONE row of these kinds —
+	// counts is already fetched above for the drain check, so this costs one
+	// extra ReapDoneShards call, not an extra query, when there's nothing to
+	// reap. reapPhase's own batching/budget/shards_reaped accounting applies
+	// unchanged; this is the same call, just gated differently.
+	if pass.State == model.PassScanning && counts[model.ShardDone] > 0 {
+		c.reapPhase(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
+	}
 	inFlight := counts[model.ShardQueued] + counts[model.ShardLeased]
 	if inFlight > 0 {
 		return nil // phase still draining
@@ -425,13 +446,14 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassDirfix); err != nil {
 			return err
 		}
-		// The drain check above proves every probe/dir/entrylist/chunk shard of
-		// this pass is now DONE (dir/entrylist/chunk can otherwise recur all
-		// through SCANNING via recursive directory fan-out, which is exactly why
-		// nowhere earlier than this — the one point the whole phase is proven
-		// drained — is safe). This is the scan phase's own shard volume: on a
-		// large tree it dwarfs every later phase, so reaping it here is the
-		// single biggest win against the shards table growing unbounded.
+		// The eager reap above (this function, before the drain check) already
+		// deletes these kinds' DONE rows continuously while SCANNING runs, so by
+		// the time a tick proves the phase fully drained there is normally
+		// little or nothing left here. Kept as the final catch-all regardless:
+		// it is the same call with the same batching/budget, so a trailing
+		// remainder the eager pass hasn't caught up to yet (e.g. this tick is
+		// the one where inFlight first hits zero) still gets cleared before the
+		// phase transition completes, rather than carrying over into DIRFIX.
 		c.reapPhase(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
 		return nil
 	case model.PassDirfix:
