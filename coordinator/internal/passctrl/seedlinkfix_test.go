@@ -201,3 +201,77 @@ func TestAdvanceGoesThroughLinkfixBetweenDirfixAndVerify(t *testing.T) {
 		t.Fatalf("pass state after LINKFIX advance = %s, want VERIFY", pass.State)
 	}
 }
+
+// TestAdvanceReapsLinkRegistryOnLinkfixTransition: seedLinkfix is the only
+// reader of link_groups/link_members anywhere in the coordinator, and it has
+// run by the time advance() flips DIRFIX->LINKFIX — so both tables' rows for
+// this pass must be gone right after that one advance() call, same tick as
+// the phase transition itself, not deferred to job purge
+// (docs/DESIGN-hardlinks.md §3.5-3.6, store.ReapLinkRegistry).
+func TestAdvanceReapsLinkRegistryOnLinkfixTransition(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassDirfix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := c.st.InsertShards(pass.ID, 0, []store.NewShard{{Kind: model.KindDir}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shardID := root[0]
+
+	// A real group with a pending member, so seedLinkfix has genuine work to
+	// consume before the reap runs (an empty registry reaping to zero rows
+	// either way would not distinguish "reaped" from "never had anything").
+	if _, err := c.st.RecordSplit(shardID, 1, nil, nil, []store.NewLinkSighting{
+		{Dev: 1, Ino: 100, RelPath: "a/anchor", Nlink: 2, Size: 10, MtimeNs: 1},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.st.RecordSplit(shardID, 2, nil, nil, []store.NewLinkSighting{
+		{Dev: 1, Ino: 100, RelPath: "a/member", Nlink: 2, Size: 10, MtimeNs: 1},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// advance()'s drain check blocks the DIRFIX->LINKFIX transition while any
+	// shard of this pass is still queued/leased — settle the root dirfix
+	// shard RecordSplit used as a sighting parent above.
+	leased, err := c.st.LeaseShards("agent-a", 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("leased %d shards, want 1", len(leased))
+	}
+	if err := c.st.CompleteShard(leased[0].ID, leased[0].LeaseID, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.advance(job); err != nil {
+		t.Fatal(err)
+	}
+	pass, err = c.st.PassByNo(job.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass.State != model.PassLinkfix {
+		t.Fatalf("pass state after DIRFIX advance = %s, want LINKFIX", pass.State)
+	}
+
+	// ReapLinkRegistry returns how many link_groups rows it deleted — calling
+	// it again here and getting 0 back is proof there was nothing left for it
+	// to find, i.e. advance()'s own call already reaped the group seeded
+	// above (store.ReapLinkRegistry's own tests, TestReapLinkRegistryDeletesBothTables/
+	// TestReapLinkRegistryBatches, cover that a nonzero backlog is correctly
+	// counted and fully deleted — this test only needs to prove advance()
+	// actually calls it at this transition).
+	n, err := c.st.ReapLinkRegistry(pass.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("ReapLinkRegistry after DIRFIX->LINKFIX advance found %d groups still present, want 0 (reaped already)", n)
+	}
+}

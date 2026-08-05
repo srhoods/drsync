@@ -1756,6 +1756,65 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 	return n, tx.Commit()
 }
 
+// LinkRegistryReapBatchSize bounds how many link_groups (and each group's
+// link_members rows) ReapLinkRegistry deletes per call — the same reasoning
+// as ReapBatchSize: a hardlink-dense pass can leave millions of rows behind,
+// and deleting them all in one transaction would hold s.mu (and therefore
+// every agent's grant/renew/complete call) for however long that delete
+// takes.
+const LinkRegistryReapBatchSize = 20000
+
+// ReapLinkRegistry deletes up to LinkRegistryReapBatchSize link_groups (and
+// every link_members row belonging to them) for one pass, and returns how
+// many groups were deleted.
+//
+// link_groups/link_members are disposable per-pass scratch (docs/DESIGN-
+// hardlinks.md §3.5): a group is identified by (dev, ino), unique only within
+// one pass's walk, not a durable cross-pass inode map. The only reader of
+// either table anywhere in the coordinator is passctrl.seedLinkfix, called
+// exactly once per pass at the DIRFIX->LINKFIX transition (PendingLinkMembers
+// to read, MarkLinkMembersQueued to mark rows consumed) — nothing reads them
+// again afterward for that pass. The only writer is recordLinkSightingsTx,
+// reached from RecordSplit (the ShardSplit handler), which can only add rows
+// for a pass while its SCANNING phase is still accepting split traffic — the
+// same protocol invariant that makes the eager SCANNING shard reap safe
+// (every ShardSplit is acked, and its sightings recorded, before that
+// shard's own ShardResult is sent) means no sighting for this pass can ever
+// arrive after SCANNING is proven drained, which happens well before DIRFIX
+// even starts. So by the time seedLinkfix has run for a pass, both tables'
+// rows for it are permanently settled: safe to delete right after the
+// DIRFIX->LINKFIX SetPassState commits (see passctrl.advance), same
+// placement as reapPhase(KindDirfix) there.
+//
+// Callers must only call this once seedLinkfix has run for the pass (i.e.
+// from the DIRFIX->LINKFIX transition, after SetPassState succeeds) — same
+// contract as ReapDoneShards' "only call at a phase's own transition", just
+// keyed to when the registry itself was last read rather than a queued+leased
+// drain check (there is no live shard state to check: the registry's
+// consumer is a one-shot seed, not an ongoing queue).
+func (s *Store) ReapLinkRegistry(passID int64) (int64, error) {
+	s.lockTimed("ReapLinkRegistry")
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM link_members WHERE pass_id = ? AND (dev, ino) IN (
+		SELECT dev, ino FROM link_groups WHERE pass_id = ? LIMIT ?)`,
+		passID, passID, LinkRegistryReapBatchSize); err != nil {
+		return 0, fmt.Errorf("ReapLinkRegistry delete link_members: %w", err)
+	}
+	n, err := execCountTx(tx, `DELETE FROM link_groups WHERE pass_id = ? AND (dev, ino) IN (
+		SELECT dev, ino FROM link_groups WHERE pass_id = ? LIMIT ?)`,
+		passID, passID, LinkRegistryReapBatchSize)
+	if err != nil {
+		return 0, fmt.Errorf("ReapLinkRegistry delete link_groups: %w", err)
+	}
+	return n, tx.Commit()
+}
+
 // incrementalVacuumPages bounds how many freed pages IncrementalVacuum
 // reclaims per call — small enough that the write-lock hold is negligible
 // next to a normal shard-completion write, run often enough (RunIncrementalVacuum)

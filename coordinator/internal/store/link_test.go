@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"drsync/coordinator/internal/model"
 )
 
 // TestRecordLinkSightingsFirstIsAnchor: the first sighting of a (dev,ino)
@@ -384,5 +386,156 @@ func TestMarkLinkMembersQueuedStaysFastAtScale(t *testing.T) {
 	// real MarkLinkMembersQueued call under test.
 	if want := 2 * batchSize; queued != want {
 		t.Errorf("queued count = %d, want %d", queued, want)
+	}
+}
+
+// TestReapLinkRegistryDeletesBothTables: a reap removes both the link_groups
+// row and every link_members row of that group (anchor + pending members
+// alike), and never touches a different pass's rows — the same
+// other-pass-untouched guarantee TestAdvanceReapsScanningOnDirfixTransition
+// pins for the shard reaper.
+func TestReapLinkRegistryDeletesBothTables(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, shardID := seed(t, s)
+
+	// One group of 3 (anchor + 2 pending members).
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, []NewLinkSighting{
+		{Dev: 1, Ino: 100, RelPath: "a/anchor", Nlink: 3, Size: 10, MtimeNs: 1},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordSplit(shardID, 2, nil, nil, []NewLinkSighting{
+		{Dev: 1, Ino: 100, RelPath: "a/member1", Nlink: 3, Size: 10, MtimeNs: 1},
+		{Dev: 1, Ino: 100, RelPath: "a/member2", Nlink: 3, Size: 10, MtimeNs: 1},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second pass on the same job, with its own group — link_groups/
+	// link_members are keyed by pass_id, so this is the scoping that matters
+	// (a different job would use a fresh pass_id too; no extra coverage).
+	otherPass, err := s.CreatePass(jobID, 2, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPassID := otherPass.ID
+	otherShardIDs, err := s.InsertShards(otherPassID, 0, []NewShard{{Kind: model.KindDir, RelPath: ""}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordSplit(otherShardIDs[0], 1, nil, nil, []NewLinkSighting{
+		{Dev: 2, Ino: 200, RelPath: "b/anchor", Nlink: 1, Size: 10, MtimeNs: 1},
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.ReapLinkRegistry(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ReapLinkRegistry returned %d groups reaped, want 1", n)
+	}
+
+	var groups, members int
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_groups WHERE pass_id = ?`, passID).
+		Scan(&groups); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_members WHERE pass_id = ?`, passID).
+		Scan(&members); err != nil {
+		t.Fatal(err)
+	}
+	if groups != 0 {
+		t.Errorf("link_groups for reaped pass = %d, want 0", groups)
+	}
+	if members != 0 {
+		t.Errorf("link_members for reaped pass = %d, want 0", members)
+	}
+
+	var otherGroups, otherMembers int
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_groups WHERE pass_id = ?`, otherPassID).
+		Scan(&otherGroups); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_members WHERE pass_id = ?`, otherPassID).
+		Scan(&otherMembers); err != nil {
+		t.Fatal(err)
+	}
+	if otherGroups != 1 || otherMembers != 1 {
+		t.Errorf("other pass's link_groups/link_members = %d/%d, want 1/1 (untouched)",
+			otherGroups, otherMembers)
+	}
+}
+
+// TestReapLinkRegistryBatches: a backlog larger than one
+// LinkRegistryReapBatchSize needs more than one call to fully drain — pins
+// the batching contract passctrl.reapLinkRegistry's loop relies on (mirrors
+// ReapDoneShards' own "batch comes back short" exhaustion signal).
+func TestReapLinkRegistryBatches(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test; skipped with -short")
+	}
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+
+	// Seed directly (bypassing RecordSplit) for speed, same shape
+	// TestMarkLinkMembersQueuedStaysFastAtScale uses: one single-member group
+	// per (dev, ino) is enough to exercise the batch boundary — this test is
+	// about ReapLinkRegistry's LIMIT/loop behavior, not sighting semantics.
+	const totalGroups = LinkRegistryReapBatchSize + 5000
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gStmt, err := tx.Prepare(`INSERT INTO link_groups
+		(pass_id, dev, ino, nlink_expected, anchor_state, updated_at) VALUES (?, 1, ?, 1, 'copied', 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mStmt, err := tx.Prepare(`INSERT INTO link_members
+		(pass_id, dev, ino, rel_path, state) VALUES (?, 1, ?, ?, 'anchor')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < totalGroups; i++ {
+		if _, err := gStmt.Exec(passID, i); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mStmt.Exec(passID, i, fmt.Sprintf("f/%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gStmt.Close()
+	mStmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.ReapLinkRegistry(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != LinkRegistryReapBatchSize {
+		t.Fatalf("first ReapLinkRegistry call reaped %d, want exactly %d (one full batch)",
+			first, LinkRegistryReapBatchSize)
+	}
+
+	second, err := s.ReapLinkRegistry(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != totalGroups-LinkRegistryReapBatchSize {
+		t.Fatalf("second ReapLinkRegistry call reaped %d, want %d (the remainder)",
+			second, totalGroups-LinkRegistryReapBatchSize)
+	}
+
+	var remaining int
+	if err := s.rdb.QueryRow(`SELECT COUNT(*) FROM link_groups WHERE pass_id = ?`, passID).
+		Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Errorf("link_groups remaining after draining the backlog = %d, want 0", remaining)
 	}
 }

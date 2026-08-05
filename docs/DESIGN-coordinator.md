@@ -147,7 +147,7 @@ chunk_groups (pass_id, rel_path, temp_name, size, mtime_ns,
 link_groups  (pass_id, dev, ino, nlink_expected, members_seen,
               anchor_rel_path, anchor_size, anchor_mtime_ns,
               anchor_state, updated_at)              -- D11 hardlink correlation, pass-scoped;
-link_members (pass_id, dev, ino, rel_path, state)    -- cleaned up at job purge like chunk_groups
+link_members (pass_id, dev, ino, rel_path, state)    -- reaped at DIRFIX->LINKFIX, see §3
 journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control/dedup
 ```
 
@@ -193,6 +193,23 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   already drain correctly regardless of timing. The phase itself still only
   transitions once every queued/leased shard drains (unchanged) — this only stops
   *already-finished* shards from sitting around for the rest of the phase.
+- **link_groups/link_members reap:** these two tables (D11 hardlink correlation,
+  `docs/DESIGN-hardlinks.md` §3) shipped with a job-purge-only lifecycle, the same as
+  `chunk_groups` — no per-pass reap. Unlike `chunk_groups` (small in practice; chunk
+  fan-out only happens for genuinely huge files), a hardlink-dense tree does not stay
+  small: closed after a live 400M-file job accumulated 10M `link_groups` / 18.5M
+  `link_members` rows under that lifecycle. `store.ReapLinkRegistry`, called from
+  `passctrl.advance()` right after the DIRFIX→LINKFIX `SetPassState` commits (same
+  tick as `reapPhase(KindDirfix)` there), deletes a pass's `link_groups` rows and every
+  `link_members` row belonging to them (via the `link_members_group` index), batched
+  like `ReapDoneShards`. Safe because `passctrl.seedLinkfix` — called immediately
+  before, in the same transition — is the *only* reader of either table anywhere in
+  the coordinator, and the same split-before-result protocol invariant that makes the
+  eager SCANNING reap above safe (a `ShardSplit`'s sightings, via `RecordSplit`, are
+  always recorded before that shard's own `ShardResult`) means no sighting for this
+  pass can arrive after SCANNING is proven drained — well before DIRFIX even starts,
+  let alone LINKFIX. By the time `seedLinkfix` has run, a pass's registry rows are
+  permanently settled.
 - **WAL checkpointing is explicit, not automatic:** the write connection opens with
   `wal_autocheckpoint(0)`, disabling SQLite's own trigger (by default, a `PASSIVE`
   checkpoint fires the instant the WAL crosses 1000 pages). That trigger runs inline
