@@ -85,6 +85,21 @@ var phaseRank = map[PassState]int{
 	PassComplete: 7,
 }
 
+// NonTerminalPassStates lists every PassState except PassComplete — the only
+// terminal one. A single source of truth for "not yet complete" so a SQL
+// query needing that as a positive, index-seekable membership test (rather
+// than a `!=`, which SQLite cannot seek an index on) doesn't hardcode its own
+// copy of the enum and silently drift if a phase is ever added or removed.
+func NonTerminalPassStates() []PassState {
+	out := make([]PassState, 0, len(phaseRank)-1)
+	for st := range phaseRank {
+		if st != PassComplete {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
 // phaseOfKind maps a shard kind to the pass phase it belongs to, for shard
 // kinds whose mere presence in the queue proves the pass has reached that
 // phase (dir/entrylist/chunk/probe shards can appear again mid-SCANNING via
