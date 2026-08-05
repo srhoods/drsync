@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -2096,5 +2097,70 @@ func TestJobSummariesReportsLiveShardKindOverStaleState(t *testing.T) {
 	if got.LatestPassState != model.PassDirfix {
 		t.Fatalf("LatestPassState = %s, want DIRFIX (stored state is still SCANNING, "+
 			"but dirfix shards are already queued)", got.LatestPassState)
+	}
+}
+
+// TestWALAutocheckpointDisabled pins Open's wal_autocheckpoint(0): SQLite's
+// own auto-checkpoint trigger fires inline on whichever write crosses its WAL
+// page threshold, under s.mu, blocking every agent's grant/renew/complete
+// call for however long copying WAL frames back to the main db file takes.
+// RunWALCheckpoint (driven from main.go on a fixed interval) is meant to be
+// the only thing that ever checkpoints this database; if this pragma silently
+// stopped applying (a DSN typo, a modernc.org/sqlite version that parses
+// _pragma= differently), the auto-checkpoint would start firing again with no
+// other signal until it showed up as the exact "degrades under sustained
+// load, a restart clears it" symptom this exists to prevent.
+func TestWALAutocheckpointDisabled(t *testing.T) {
+	s := openTest(t)
+	var n int
+	if err := s.db.QueryRow(`PRAGMA wal_autocheckpoint`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("wal_autocheckpoint = %d, want 0 (disabled — RunWALCheckpoint should be the only checkpointer)", n)
+	}
+}
+
+// TestWALCheckpointRuns exercises WALCheckpoint end-to-end against a real
+// write connection: writes enough rows to guarantee the WAL is non-empty,
+// then asserts the checkpoint pragma itself runs without error. It cannot
+// assert wal_pages/checkpointed_pages are non-zero without depending on
+// modernc.org/sqlite's exact WAL page-count behavior at a given row count —
+// what matters here is that WALCheckpoint's query/scan shape (PRAGMA
+// wal_checkpoint(PASSIVE) returning busy, log, checkpointed) is correct
+// against the real driver, not the exact numbers it reports.
+func TestWALCheckpointRuns(t *testing.T) {
+	s := openTest(t)
+	_, passID, _ := seed(t, s)
+	batch := make([]NewShard, 500)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%03d", i)}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WALCheckpoint(); err != nil {
+		t.Fatalf("WALCheckpoint: %v", err)
+	}
+}
+
+// TestRunWALCheckpointStopsOnContextCancel: the background loop exits
+// promptly when its context is cancelled, same select{ctx.Done(): return}
+// shape as RunIncrementalVacuum/scheduler.RunSweeper — a goroutine that
+// outlives its caller would leak across tests (and, in production, across a
+// graceful shutdown that starts a fresh Store on restart).
+func TestRunWALCheckpointStopsOnContextCancel(t *testing.T) {
+	s := openTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		s.RunWALCheckpoint(ctx, time.Millisecond)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunWALCheckpoint did not stop after context cancellation")
 	}
 }

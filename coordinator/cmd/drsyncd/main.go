@@ -235,6 +235,14 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 
 	go sched.RunSweeper(ctx, leaseTTL/3)
 	go st.RunIncrementalVacuum(ctx, 30*time.Second)
+	// wal_autocheckpoint is disabled at Open (store.go) — this replaces it on
+	// a schedule this process controls, instead of firing inline on whichever
+	// write happens to cross SQLite's own WAL-page threshold and blocking
+	// s.mu (and therefore every agent's grant/renew/complete call) for
+	// however long that copy takes. 5 minutes: frequent enough that the WAL
+	// never approaches the size where a single checkpoint's own cost becomes
+	// the problem it exists to avoid.
+	go st.RunWALCheckpoint(ctx, 5*time.Minute)
 	go pc.Run(ctx, 2*time.Second)
 	go poller.Run(ctx, time.Second)
 	// Journal durability: fsync persisted batches, then ack each agent up to its

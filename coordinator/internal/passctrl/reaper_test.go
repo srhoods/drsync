@@ -232,11 +232,22 @@ func TestAdvanceReapsDeleteOnJobComplete(t *testing.T) {
 	assertAllGone(t, c, "delete-phase DONE shards", doneDelete)
 }
 
-// TestAdvanceDoesNotReapWhilePhaseStillDraining: advance() must not reap
-// anything when the phase hasn't actually drained (queued/leased work
-// remains) — reaping is gated on the same drain proof that gates the phase
-// transition itself, never on a timer or a DONE count alone.
-func TestAdvanceDoesNotReapWhilePhaseStillDraining(t *testing.T) {
+// TestAdvanceEagerlyReapsScanningWhilePhaseStillDraining: unlike every other
+// phase, SCANNING's DONE probe/dir/entrylist/chunk shards are reaped as they
+// land, not just once the whole phase drains — this is what stops
+// shards/splits from growing to the scan's full peak on a large tree, since
+// SCANNING is the phase that "can put millions of rows through" per
+// ReapBatchSize's doc comment. Safe because of the agent protocol's own
+// ordering invariant (agent/src/walker.c ship_split/await_split, protocol
+// doc §4.2): every ShardSplit for a shard is acked, and therefore durably
+// recorded in splits via RecordSplit's (parent_shard_id, seq) idempotency
+// key, BEFORE that shard's own ShardResult is ever sent — so a DONE shard can
+// never again be referenced as a split parent, and ExpireLeases only ever
+// touches LEASED rows, so a DONE shard can never be requeued either. The
+// phase itself still does not transition until every queued/leased shard
+// drains (docs/DESIGN-coordinator.md §2.2) — this test's pass stays in
+// SCANNING throughout, only the already-finished shards' rows are gone.
+func TestAdvanceEagerlyReapsScanningWhilePhaseStillDraining(t *testing.T) {
 	c := newController(t)
 	job := makeJob(t, c, []byte(baseSpec))
 	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
@@ -260,7 +271,41 @@ func TestAdvanceDoesNotReapWhilePhaseStillDraining(t *testing.T) {
 	if pass.State != model.PassScanning {
 		t.Fatalf("pass state = %s, want still SCANNING (phase not drained)", pass.State)
 	}
-	assertNoneGone(t, c, "DONE shards while phase still draining", doneDir)
+	assertAllGone(t, c, "SCANNING's DONE shards, eagerly reaped mid-phase", doneDir)
+}
+
+// TestAdvanceDoesNotEagerlyReapOutsideScanning: the eager mid-phase reap only
+// applies to SCANNING (see TestAdvanceEagerlyReapsScanningWhilePhaseStillDraining) —
+// every other phase keeps the original behavior, reaping only at its own
+// transition (TestAdvanceReapsDirfixOnLinkfixTransition et al.), never while
+// still draining. Uses DIRFIX: it has DONE shards of its own kind plus
+// remaining queued work, the same shape the SCANNING test exercises, so this
+// pins that the gate is on pass.State, not merely "some DONE rows exist".
+func TestAdvanceDoesNotEagerlyReapOutsideScanning(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassDirfix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneDirfix := seedDoneShards(t, c, pass.ID, model.KindDirfix, 10)
+	// One shard still queued: the phase has not drained.
+	if _, err := c.st.InsertShards(pass.ID, 0,
+		[]store.NewShard{{Kind: model.KindDirfix}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.advance(job); err != nil {
+		t.Fatal(err)
+	}
+	pass, err = c.st.PassByNo(job.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass.State != model.PassDirfix {
+		t.Fatalf("pass state = %s, want still DIRFIX (phase not drained)", pass.State)
+	}
+	assertNoneGone(t, c, "DIRFIX's DONE shards while phase still draining", doneDirfix)
 }
 
 // TestReapPhaseIncrementsMetric: reapPhase reports how much it reaped to the
