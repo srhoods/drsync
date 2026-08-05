@@ -188,11 +188,33 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   leased shards. Both fixed by adding the missing index and, for the first case,
   switching from an `IN (...)`-list statement to a primary-key seek per row (the
   index alone did not change the query planner's handling of a large `IN` list).
-  The rest of the schema was audited table-by-table against every query site after
-  finding these two and came back clean — see `TestMarkLinkMembersQueuedStaysFastAtScale`
-  and `TestExpireLeasesUsesLeaseExpiryIndexAtScale` (`coordinator/internal/store`)
-  for the regression pins, and re-run that audit whenever a new hot-path query is
-  added to a table this store expects to grow large.
+  A third instance surfaced later, missed by that audit because it targeted
+  directly-hot-written tables (`shards`, `link_members`) rather than a
+  trigger-maintained rollup: `SchedulerCounts` (and `QueueSummary`) join
+  `shard_counts` -> `passes` -> `jobs` filtered on job state, but `shard_counts`
+  has no bound on its own row count -- it accumulates one row per
+  `(pass_id, kind, state)` ever seen and is only cleared by an explicit
+  `DeleteJob` purge (no auto-purge policy exists), so a coordinator with a long
+  uptime and job history carries it indefinitely. With no index to seek `jobs`
+  by state, the planner had nothing to drive the join from but a full scan of
+  `shard_counts` -- and `SchedulerCounts` runs on every `Grant` call (refreshed
+  every `countsTTL`, section 4), fleet-wide, continuously. Found chasing a live
+  "leases start expiring and shards park under sustained load, a `drsyncd`
+  restart clears it" report at ~400M files walked in one job: the current
+  job's shard volume was unremarkable, but the coordinator's cumulative
+  history of prior jobs had grown `shard_counts` large enough that the
+  per-`Grant` scan itself became slow enough, held `Scheduler.mu` long enough,
+  to push lease renewals past their TTL. Fixed with a `jobs(state)` index --
+  `passes` already had (`job_id`, `pass_no`) uniquely indexed, so that alone
+  let the planner drive `jobs` -> `passes` -> `shard_counts` instead of
+  scanning the rollup. The rest of the schema was audited table-by-table
+  against every query site after finding these -- see
+  `TestMarkLinkMembersQueuedStaysFastAtScale`,
+  `TestExpireLeasesUsesLeaseExpiryIndexAtScale`, and
+  `TestSchedulerCountsUsesJobsStateIndexAtScale` (`coordinator/internal/store`)
+  for the regression pins, and re-run that audit -- including rollup tables fed
+  by triggers, not just directly-written ones -- whenever a new hot-path query
+  is added to a table this store expects to grow large.
 
 ## 4. Scheduler
 

@@ -1032,6 +1032,146 @@ func TestExpireLeasesUsesLeaseExpiryIndexAtScale(t *testing.T) {
 	}
 }
 
+// TestSchedulerCountsUsesJobsStateIndexAtScale pins the jobs_state index
+// added alongside shards_lease_expiry's fix (same class of gap, found chasing
+// a live "leases start expiring and shards park under sustained load, a
+// drsyncd restart clears it" report at ~400M files walked in one job):
+// SchedulerCounts (and QueueSummary) join shard_counts -> passes -> jobs
+// filtered on job state, but shard_counts has no bound on its row count — it
+// accumulates one row per (pass_id, kind, state) ever seen, across every job
+// the coordinator has ever run, and is only cleared by an explicit DeleteJob
+// purge. Without an index to seek jobs by state, the planner has nothing to
+// drive the join from but a full scan of shard_counts, the largest table in
+// it — and SchedulerCounts runs on every Grant call (refreshed every
+// countsTTL, scheduler.go), fleet-wide, for the coordinator's entire uptime,
+// so that cost is paid continuously and grows with cumulative historical
+// shard volume, not the size of whatever job is currently running.
+//
+// Asserts via EXPLAIN QUERY PLAN, same reasoning as
+// TestExpireLeasesUsesLeaseExpiryIndexAtScale: immune to hardware speed,
+// where a wall-clock cutoff has flaked on slower CI before.
+func TestSchedulerCountsUsesJobsStateIndexAtScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test; skipped with -short")
+	}
+	s := openTest(t)
+
+	// Simulate a long coordinator uptime: many terminal jobs' shard_counts
+	// rows left behind (no auto-purge), each with rows across every
+	// kind/state a pass can reach, plus one currently RUNNING job — the case
+	// SchedulerCounts actually needs to answer fast.
+	const terminalJobs = 2000
+	kinds := []string{"dir", "entrylist", "chunk", "dirfix", "linkfix", "verify"}
+	states := []string{"queued", "leased", "done", "parked"}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobStmt, err := tx.Prepare(`INSERT INTO jobs (name, spec_yaml, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passStmt, err := tx.Prepare(`INSERT INTO passes (job_id, pass_no, state) VALUES (?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countStmt, err := tx.Prepare(`INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := nowMS()
+	for i := 0; i < terminalJobs; i++ {
+		res, err := jobStmt.Exec(fmt.Sprintf("done-job-%d", i), []byte(specYAML),
+			string(model.JobCompleted), now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobID, err := res.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pres, err := passStmt.Exec(jobID, 1, string(model.PassComplete))
+		if err != nil {
+			t.Fatal(err)
+		}
+		passID, err := pres.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range kinds {
+			for _, st := range states {
+				// Reflects reality: reaping/counts trend to 0 but the rollup
+				// row itself is never deleted short of a job purge.
+				if _, err := countStmt.Exec(passID, k, st, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	jobStmt.Close()
+	passStmt.Close()
+	countStmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The one RUNNING job SchedulerCounts actually needs to total up. seed()
+	// already inserts a root dir shard, which the shard_counts trigger counts
+	// as (dir, queued, 1); top it up to a distinctive number so the assert
+	// below can't pass by accident.
+	_, passID, _ := seed(t, s)
+	if _, err := s.db.Exec(`UPDATE shard_counts SET n = 7
+		WHERE pass_id = ? AND kind = ? AND state = ?`,
+		passID, string(model.KindDir), string(model.ShardQueued)); err != nil {
+		t.Fatal(err)
+	}
+
+	var planUsesIndex, planScansShardCounts bool
+	prows, err := s.rdb.Query(`EXPLAIN QUERY PLAN SELECT
+		COALESCE(SUM(CASE WHEN sc.kind IN (?,?) AND sc.state IN (?,?) THEN sc.n ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN sc.state = ? THEN sc.n ELSE 0 END), 0)
+		FROM shard_counts sc
+		JOIN passes p ON p.id = sc.pass_id
+		JOIN jobs   j ON j.id = p.job_id
+		WHERE j.state = ?`,
+		string(model.KindDir), string(model.KindEntryList),
+		string(model.ShardQueued), string(model.ShardLeased),
+		string(model.ShardQueued), string(model.JobRunning))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for prows.Next() {
+		var a, b, c int
+		var detail string
+		if err := prows.Scan(&a, &b, &c, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "jobs_state") {
+			planUsesIndex = true
+		}
+		if strings.Contains(detail, "SCAN sc") {
+			planScansShardCounts = true
+		}
+	}
+	prows.Close()
+	if !planUsesIndex {
+		t.Fatal("SchedulerCounts did not use jobs_state — looks like a scan-based plan regressed back in")
+	}
+	if planScansShardCounts {
+		t.Fatal("SchedulerCounts scans shard_counts despite jobs_state existing")
+	}
+
+	counts, err := s.SchedulerCounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.WalkPending != 7 || counts.Queued != 7 {
+		t.Fatalf("SchedulerCounts = %+v, want WalkPending=7 Queued=7 (only the running job's row)", counts)
+	}
+}
+
 func TestSplitIdempotency(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)

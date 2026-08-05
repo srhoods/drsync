@@ -110,6 +110,23 @@ CREATE TABLE IF NOT EXISTS jobs (
   -- still RUNNING is just now - running_since_ms.
   running_since_ms INTEGER
 );
+-- SchedulerCounts and QueueSummary both join shard_counts -> passes -> jobs
+-- filtered on job state (running, or not-yet-complete). jobs.id and passes'
+-- own (job_id, pass_no) unique constraint already index the join's other two
+-- legs, but without this index the planner has nothing to seek jobs by state
+-- with, and falls back to a full scan of shard_counts instead — the biggest
+-- table in the join, and one with no bound on its row count: it accumulates
+-- one row per (pass_id, kind, state) ever seen and is only cleared by an
+-- explicit DeleteJob purge (docs/PROJECT-SUMMARY.md §10, "no automatic
+-- job-history purge policy was added deliberately"). SchedulerCounts runs on
+-- every Grant call (refreshed every countsTTL, scheduler.go), fleet-wide, for
+-- the coordinator's entire uptime, so that scan's cost is paid continuously
+-- and grows with cumulative historical shard volume, not just the current
+-- job's size — the same class of gap shards_lease_expiry closed for
+-- ExpireLeases, found chasing a live "leases start expiring and shards park
+-- under sustained load, a drsyncd restart clears it" report at ~400M files
+-- walked in one job.
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs (state);
 CREATE TABLE IF NOT EXISTS passes (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   job_id      INTEGER NOT NULL REFERENCES jobs(id),
