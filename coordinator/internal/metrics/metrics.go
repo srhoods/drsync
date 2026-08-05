@@ -25,13 +25,14 @@ type Metrics struct {
 	ShardDuration *prometheus.HistogramVec
 
 	// Coordinator-side.
-	ShardQueueDepth *prometheus.GaugeVec
-	LeaseExpiries   prometheus.Counter
-	ShardsParked    prometheus.Counter
-	JournalBatches  prometheus.Counter
-	JournalFsyncErr prometheus.Counter
-	Grants          prometheus.Counter
-	ShardsReaped    prometheus.Counter
+	ShardQueueDepth  *prometheus.GaugeVec
+	LeaseExpiries    prometheus.Counter
+	ShardsParked     prometheus.Counter
+	JournalBatches   prometheus.Counter
+	JournalFsyncErr  prometheus.Counter
+	Grants           prometheus.Counter
+	ShardsReaped     prometheus.Counter
+	LinkGroupsReaped prometheus.Counter
 
 	// LeaseExpiriesByAgent is LeaseExpiries broken out by which agent held the
 	// lease at expiry (not who it re-grants to) and shard kind, so "is this one
@@ -86,6 +87,9 @@ func New() *Metrics {
 		ShardsReaped: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "drsync_shards_reaped_total",
 			Help: "DONE shard rows deleted by the Shard Reaper once their phase drains."}),
+		LinkGroupsReaped: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "drsync_link_groups_reaped_total",
+			Help: "link_groups rows (and their link_members) deleted once a pass's LINKFIX seeding has consumed them."}),
 		LeaseExpiriesByAgent: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "drsync_lease_expiries_by_agent_total",
 			Help: "Expired shard leases by the agent that held the lease, shard kind, and outcome (requeued|parked)."},
@@ -93,7 +97,7 @@ func New() *Metrics {
 	}
 	reg.MustRegister(m.ScanEntries, m.CopyFiles, m.CopyBytes, m.AgentUp, m.AgentRSS,
 		m.ShardDuration, m.ShardQueueDepth, m.LeaseExpiries, m.ShardsParked,
-		m.JournalBatches, m.JournalFsyncErr, m.Grants, m.ShardsReaped,
+		m.JournalBatches, m.JournalFsyncErr, m.Grants, m.ShardsReaped, m.LinkGroupsReaped,
 		m.LeaseExpiriesByAgent)
 	return m
 }

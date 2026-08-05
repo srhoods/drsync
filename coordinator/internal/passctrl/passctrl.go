@@ -471,6 +471,13 @@ func (c *Controller) advance(job *store.Job) error {
 			return err
 		}
 		c.reapPhase(job, pass, model.KindDirfix)
+		// seedLinkfix (above) is the only reader of link_groups/link_members
+		// anywhere in the coordinator, and it has now run for this pass — the
+		// registry rows it consumed are permanently settled (see
+		// store.ReapLinkRegistry's comment for why no later split/sighting
+		// traffic for this pass can still arrive). Safe to reap now, not
+		// deferred to job purge.
+		c.reapLinkRegistry(job, pass)
 		return nil
 	case model.PassLinkfix:
 		n, err := c.seedVerify(job, pass)
@@ -562,6 +569,39 @@ func (c *Controller) reapPhase(job *store.Job, pass *store.Pass, kinds ...model.
 			"kinds", kinds, "reaped", total)
 		if c.met != nil {
 			c.met.ShardsReaped.Add(float64(total))
+		}
+	}
+}
+
+// reapLinkRegistry deletes a pass's now-fully-consumed link_groups/
+// link_members rows, looping store.ReapLinkRegistry batches until the
+// backlog is exhausted or reapPhaseBudget elapses (same budget, same
+// reasoning as reapPhase — this call site is likewise only ever reached once
+// per pass, at the DIRFIX->LINKFIX transition, so a remainder left behind by
+// hitting the budget on a truly enormous registry is picked up in full next
+// time, which for this call site means "not until the job is purged"; rare
+// at LinkRegistryReapBatchSize). Best-effort: a reap failure must not stop
+// the phase transition that already committed above it.
+func (c *Controller) reapLinkRegistry(job *store.Job, pass *store.Pass) {
+	deadline := time.Now().Add(reapPhaseBudget)
+	var total int64
+	for time.Now().Before(deadline) {
+		n, err := c.st.ReapLinkRegistry(pass.ID)
+		if err != nil {
+			slog.Warn("link registry reap failed", "job", job.Name, "pass", pass.PassNo,
+				"reaped_before_error", total, "err", err)
+			break
+		}
+		total += n
+		if n < store.LinkRegistryReapBatchSize {
+			break // batch came back short: backlog exhausted
+		}
+	}
+	if total > 0 {
+		slog.Info("reaped link registry", "job", job.Name, "pass", pass.PassNo,
+			"link_groups_reaped", total)
+		if c.met != nil {
+			c.met.LinkGroupsReaped.Add(float64(total))
 		}
 	}
 }
