@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <malloc.h>
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
@@ -363,6 +364,40 @@ static uint64_t read_rss(void)
     int rc = fscanf(f, "%llu %llu", &total, &resident);
     fclose(f);
     return rc == 2 ? resident * (uint64_t)sysconf(_SC_PAGESIZE) : 0;
+}
+
+/* Seconds of continuous idleness (no leased work, both queues empty) before
+ * idle_trim gives pages back — long enough that a normal lull between grants
+ * (the agent asks for more work every tick anyway, maybe_request_work) never
+ * triggers it, short enough that a real drain sees it within the same
+ * ballpark as the "still >1GiB 20 minutes later" symptom this exists for. */
+#define IDLE_TRIM_AFTER_S 10
+
+/* Called once per 1Hz control-loop tick. Tracks consecutive idle ticks and
+ * calls malloc_trim(0) after IDLE_TRIM_AFTER_S of them, then resets the
+ * counter — so it fires once per idle period, not every tick a drained agent
+ * sits parked. tune_malloc_arenas (startup) bounds how many private arenas
+ * -w/-C's threads can grow in the first place; this is what actually returns
+ * pages once nothing is using them, which an arena cap alone does not do —
+ * glibc never trims on its own just because a thread went idle. */
+static void idle_trim(void)
+{
+    static int idle_ticks;
+    bool idle = atomic_load(&g_inflight) == 0 && wq_depth() == 0 && cp_depth() == 0;
+    if (!idle) {
+        idle_ticks = 0;
+        return;
+    }
+    if (++idle_ticks < IDLE_TRIM_AFTER_S)
+        return;
+    idle_ticks = 0;
+    uint64_t before = read_rss();
+    malloc_trim(0);
+    uint64_t after = read_rss();
+    if (before > after)
+        LOGI("idle: malloc_trim released %llu KiB (RSS %llu -> %llu KiB)",
+             (unsigned long long)(before - after) / 1024,
+             (unsigned long long)before / 1024, (unsigned long long)after / 1024);
 }
 
 /* Resolves and connects hostport, copying the bare host (for TLS verification)
@@ -790,6 +825,38 @@ static void raise_nofile(void)
              (uintmax_t)rl.rlim_cur);
 }
 
+/* glibc's default per-thread arena scaling (up to 8x the core count on
+ * 64-bit) gives every one of this process's -w/-C worker/copy threads its
+ * own private heap once it allocates under contention. Each thread's arena
+ * is sized to that thread's own peak usage and is never consolidated or
+ * shrunk back down on its own — idle threads (parked in wq_pop after a
+ * drain, per worker_main) just sit on whatever they grew to. At a fleet's
+ * usual -w/-C combined thread count (tens to over a hundred, ansible's
+ * drsync_agent role sizes both from vCPUs) that multiplies into hundreds of
+ * MiB to >1GiB of heap the OS never sees back, which reads as "RSS creeps up
+ * and never comes down even 20 minutes idle after drain" even though nothing
+ * is actually leaked — every allocation this process makes is freed, see the
+ * malloc/free audit that preceded this fix.
+ *
+ * Capped at 1, not left at glibc's default or some intermediate value:
+ * malloc_trim(0) (idle_trim, below) only reliably reclaims a non-arena
+ * process's *entire* heap. Measured directly (standalone repro: 32 threads,
+ * 200x64KiB allocated+freed each, glibc 2.34) — M_ARENA_MAX=1 grew to ~20MiB
+ * mid-run under contention but trim recovered effectively all of it back to
+ * baseline; M_ARENA_MAX=2 only gave back about half of what it grew to; 3 or
+ * more gave back next to nothing (each extra arena beyond the one trim
+ * reaches is just more unreclaimable heap). A single shared arena does mean
+ * every allocating thread now contends on the same malloc lock, but that
+ * lock is one of several this process already serializes heavy paths
+ * through (wq_mu, ob_mu, lease_mu) — worth it here since the point of this
+ * fix is specifically to get idle RSS back down, not to optimize allocator
+ * throughput during a run. */
+static void tune_malloc_arenas(void)
+{
+    if (mallopt(M_ARENA_MAX, 1) != 1)
+        LOGW("mallopt(M_ARENA_MAX) failed; per-thread arena growth is uncapped");
+}
+
 int main(int argc, char **argv)
 {
     strcpy(cfg.coordinator, "127.0.0.1:7440");
@@ -850,6 +917,7 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal); /* clean drain on Ctrl-C / systemd stop */
     signal(SIGTERM, on_signal);
     raise_nofile();
+    tune_malloc_arenas();
     uring_probe(!cfg.no_uring);
 
     /* mTLS: all three of CA, cert and key together, or none (plaintext dev). */
@@ -989,6 +1057,7 @@ int main(int argc, char **argv)
                 if (tick / g_hb_interval_s != prev_tick / g_hb_interval_s)
                     send_heartbeat();
                 maybe_request_work(true);
+                idle_trim();
             }
 
             if (pfds[2].revents & POLLIN) { /* writer thread reported a send failure */
