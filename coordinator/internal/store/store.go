@@ -156,6 +156,8 @@ CREATE TABLE IF NOT EXISTS passes (
   shards_reaped INTEGER NOT NULL DEFAULT 0,
   UNIQUE (job_id, pass_no)
 );
+-- QueueSummary's non-terminal-pass leg (see below) seeks this by state.
+CREATE INDEX IF NOT EXISTS passes_state ON passes (state);
 CREATE TABLE IF NOT EXISTS shards (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   pass_id         INTEGER NOT NULL REFERENCES passes(id),
@@ -199,6 +201,12 @@ CREATE TABLE IF NOT EXISTS shard_counts (
   n       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (pass_id, kind, state)
 ) WITHOUT ROWID;
+-- The PK is (pass_id, kind, state), so it can't serve a lookup by state
+-- alone. QueueSummary's parked-shard leg (see below) needs exactly that —
+-- without this index that leg falls back to scanning shard_counts in full,
+-- same failure mode jobs_state above fixes for SchedulerCounts, just on the
+-- other join leg.
+CREATE INDEX IF NOT EXISTS shard_counts_state ON shard_counts (state);
 CREATE TRIGGER IF NOT EXISTS shard_counts_ai AFTER INSERT ON shards BEGIN
   INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (NEW.pass_id, NEW.kind, NEW.state, 1)
     ON CONFLICT (pass_id, kind, state) DO UPDATE SET n = n + 1;
@@ -1981,17 +1989,42 @@ type QueueRow struct {
 	Count  int64
 }
 
-// QueueSummary reports shard counts by state across every non-terminal pass —
-// the /api/v1/queue depth view. Served from the shard_counts rollup on the read
+// QueueSummary reports shard counts by state across every non-terminal pass,
+// plus parked shards on a pass that has otherwise completed — the
+// /api/v1/queue depth view. Served from the shard_counts rollup on the read
 // pool, so it is O(rollup rows) rather than a GROUP BY over every live shard.
+//
+// The two conditions are UNIONed rather than OR'd in one query: `p.state !=
+// COMPLETE` is a negation, which SQLite cannot serve with an index seek no
+// matter what exists on passes.state, so the single-query OR form always
+// falls back to scanning shard_counts in full regardless of jobs_state/
+// shard_counts_state below (confirmed via EXPLAIN QUERY PLAN — same failure
+// mode as SchedulerCounts, just immune to that fix since it's a different
+// join leg). Recast as a positive membership test — non-terminal states,
+// model.NonTerminalPassStates so this can't drift from the enum — each leg
+// becomes independently index-seekable: the first drives off passes_state,
+// the second off shard_counts_state.
 func (s *Store) QueueSummary() ([]QueueRow, error) {
+	nonTerminal := model.NonTerminalPassStates()
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(nonTerminal)), ",")
+	args := make([]any, 0, len(nonTerminal))
+	for _, st := range nonTerminal {
+		args = append(args, string(st))
+	}
+	args = append(args, string(model.ShardParked))
+
 	rows, err := s.rdb.Query(`SELECT j.name, p.pass_no, sc.kind, sc.state, sc.n
 		FROM shard_counts sc
 		JOIN passes p ON p.id = sc.pass_id
 		JOIN jobs   j ON j.id = p.job_id
-		WHERE sc.n > 0 AND (p.state != ? OR sc.state = ?)
-		ORDER BY j.name, p.pass_no`,
-		string(model.PassComplete), string(model.ShardParked))
+		WHERE sc.n > 0 AND p.state IN (`+ph+`)
+		UNION
+		SELECT j.name, p.pass_no, sc.kind, sc.state, sc.n
+		FROM shard_counts sc
+		JOIN passes p ON p.id = sc.pass_id
+		JOIN jobs   j ON j.id = p.job_id
+		WHERE sc.n > 0 AND sc.state = ?
+		ORDER BY 1, 2`, args...)
 	if err != nil {
 		return nil, err
 	}

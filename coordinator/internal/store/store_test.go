@@ -1172,6 +1172,239 @@ func TestSchedulerCountsUsesJobsStateIndexAtScale(t *testing.T) {
 	}
 }
 
+// TestQueueSummaryContents pins QueueSummary's semantics across its rewrite
+// from a single OR'd query to a UNION of two index-seekable legs (see the
+// scale test below for why): every non-terminal pass's non-zero buckets, plus
+// parked buckets even on a pass that has otherwise completed, each row
+// reported exactly once — including a shard that is both (parked, on a
+// non-terminal pass), which lands in both UNION legs and must be deduped, not
+// doubled.
+func TestQueueSummaryContents(t *testing.T) {
+	s := openTest(t)
+	spec := func(name, dst string) []byte {
+		return []byte("apiVersion: drsync/v1\nkind: Job\nmetadata: { name: " + name +
+			" }\nspec:\n  source: { path: /src }\n  destination: { path: " + dst + " }\n")
+	}
+
+	// Pass A: SCANNING (non-terminal), one queued dir bucket and one parked
+	// bucket — the parked one exercises the dedup case, present in both legs.
+	jobA, err := s.CreateJob("job-a", spec("job-a", "/dst-a"), false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	passA, err := s.CreatePass(jobA.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InsertShards(passA.ID, 0, []NewShard{{Kind: model.KindDir, RelPath: "a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (?, ?, ?, ?)`,
+		passA.ID, string(model.KindVerify), string(model.ShardParked), 3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass B: COMPLETE, with a leftover parked bucket (the case the original
+	// OR's second arm exists for) and a non-parked bucket that must NOT show.
+	jobB, err := s.CreateJob("job-b", spec("job-b", "/dst-b"), false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	passB, err := s.CreatePass(jobB.ID, 1, model.PassComplete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (?, ?, ?, ?)`,
+		passB.ID, string(model.KindVerify), string(model.ShardParked), 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (?, ?, ?, ?)`,
+		passB.ID, string(model.KindVerify), string(model.ShardDone), 100); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.QueueSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byBucket := map[[4]string]int64{}
+	for _, r := range rows {
+		key := [4]string{r.Job, fmt.Sprint(r.PassNo), string(r.Kind), string(r.State)}
+		if _, dup := byBucket[key]; dup {
+			t.Fatalf("bucket %v reported more than once: %+v", key, rows)
+		}
+		byBucket[key] = r.Count
+	}
+
+	want := map[[4]string]int64{
+		{"job-a", "1", string(model.KindDir), string(model.ShardQueued)}:    1,
+		{"job-a", "1", string(model.KindVerify), string(model.ShardParked)}: 3,
+		{"job-b", "1", string(model.KindVerify), string(model.ShardParked)}: 2,
+	}
+	if len(byBucket) != len(want) {
+		t.Fatalf("QueueSummary returned %d buckets, want %d: got %+v", len(byBucket), len(want), rows)
+	}
+	for key, n := range want {
+		got, ok := byBucket[key]
+		if !ok {
+			t.Errorf("missing bucket %v", key)
+			continue
+		}
+		if got != n {
+			t.Errorf("bucket %v = %d, want %d", key, got, n)
+		}
+	}
+	if _, present := byBucket[[4]string{"job-b", "1", string(model.KindVerify), string(model.ShardDone)}]; present {
+		t.Fatalf("job-b's DONE bucket on a COMPLETE pass should not appear: %+v", rows)
+	}
+}
+
+// TestQueueSummaryUsesIndexesAtScale pins the passes_state/shard_counts_state
+// indexes: QueueSummary's original single query OR'd `p.state != COMPLETE`
+// with `sc.state = 'parked'`, but SQLite cannot serve a `!=` with an index
+// seek no matter what exists on passes.state, so that form always fell back
+// to a full scan of shard_counts regardless of the jobs_state index added for
+// SchedulerCounts (same underlying growth problem — shard_counts has no
+// bound on its own row count, see that test — different join leg). Recast as
+// a UNION of two positive membership tests, each leg is independently
+// seekable. Found alongside SchedulerCounts' fix, same live "leases start
+// expiring and shards park, a drsyncd restart clears it" report.
+func TestQueueSummaryUsesIndexesAtScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test; skipped with -short")
+	}
+	s := openTest(t)
+
+	const terminalJobs = 2000
+	kinds := []string{"dir", "entrylist", "chunk", "dirfix", "linkfix", "verify"}
+	states := []string{"queued", "leased", "done", "parked"}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobStmt, err := tx.Prepare(`INSERT INTO jobs (name, spec_yaml, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passStmt, err := tx.Prepare(`INSERT INTO passes (job_id, pass_no, state) VALUES (?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countStmt, err := tx.Prepare(`INSERT INTO shard_counts (pass_id, kind, state, n) VALUES (?, ?, ?, ?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := nowMS()
+	for i := 0; i < terminalJobs; i++ {
+		res, err := jobStmt.Exec(fmt.Sprintf("done-job-%d", i), []byte(specYAML),
+			string(model.JobCompleted), now, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobID, err := res.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pres, err := passStmt.Exec(jobID, 1, string(model.PassComplete))
+		if err != nil {
+			t.Fatal(err)
+		}
+		passID, err := pres.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range kinds {
+			for _, st := range states {
+				if _, err := countStmt.Exec(passID, k, st, 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	jobStmt.Close()
+	passStmt.Close()
+	countStmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One running job's queued bucket (non-terminal leg) and one parked
+	// bucket on an otherwise-complete pass (parked leg).
+	_, passID, _ := seed(t, s)
+	if _, err := s.db.Exec(`UPDATE shard_counts SET n = 5
+		WHERE pass_id = ? AND kind = ? AND state = ?`,
+		passID, string(model.KindDir), string(model.ShardQueued)); err != nil {
+		t.Fatal(err)
+	}
+
+	nonTerminal := model.NonTerminalPassStates()
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(nonTerminal)), ",")
+	args := make([]any, 0, len(nonTerminal))
+	for _, st := range nonTerminal {
+		args = append(args, string(st))
+	}
+	args = append(args, string(model.ShardParked))
+
+	prows, err := s.rdb.Query(`EXPLAIN QUERY PLAN SELECT j.name, p.pass_no, sc.kind, sc.state, sc.n
+		FROM shard_counts sc
+		JOIN passes p ON p.id = sc.pass_id
+		JOIN jobs   j ON j.id = p.job_id
+		WHERE sc.n > 0 AND p.state IN (`+ph+`)
+		UNION
+		SELECT j.name, p.pass_no, sc.kind, sc.state, sc.n
+		FROM shard_counts sc
+		JOIN passes p ON p.id = sc.pass_id
+		JOIN jobs   j ON j.id = p.job_id
+		WHERE sc.n > 0 AND sc.state = ?
+		ORDER BY 1, 2`, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var planScans bool
+	var sawPassesState, sawShardCountsState bool
+	for prows.Next() {
+		var a, b, c int
+		var detail string
+		if err := prows.Scan(&a, &b, &c, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(detail, "SCAN sc") {
+			planScans = true
+		}
+		if strings.Contains(detail, "passes_state") {
+			sawPassesState = true
+		}
+		if strings.Contains(detail, "shard_counts_state") {
+			sawShardCountsState = true
+		}
+	}
+	prows.Close()
+	if planScans {
+		t.Fatal("QueueSummary scans shard_counts despite passes_state/shard_counts_state existing")
+	}
+	if !sawPassesState || !sawShardCountsState {
+		t.Fatalf("QueueSummary did not seek both indexes: passes_state=%v shard_counts_state=%v",
+			sawPassesState, sawShardCountsState)
+	}
+
+	rows, err := s.QueueSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawQueued bool
+	for _, r := range rows {
+		if r.Kind == model.KindDir && r.State == model.ShardQueued && r.Count == 5 {
+			sawQueued = true
+		}
+	}
+	if !sawQueued {
+		t.Fatalf("QueueSummary missing the running job's queued dir bucket: %+v", rows)
+	}
+}
+
 func TestSplitIdempotency(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)

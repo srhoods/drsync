@@ -207,13 +207,27 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   to push lease renewals past their TTL. Fixed with a `jobs(state)` index --
   `passes` already had (`job_id`, `pass_no`) uniquely indexed, so that alone
   let the planner drive `jobs` -> `passes` -> `shard_counts` instead of
-  scanning the rollup. The rest of the schema was audited table-by-table
+  scanning the rollup. `QueueSummary` shares the join but not the fix: its
+  predicate was `p.state != COMPLETE OR sc.state = 'parked'`, and SQLite
+  cannot serve a `!=` with an index seek regardless of what exists on
+  `passes.state`, so it kept scanning `shard_counts` even after `jobs_state`
+  landed. Recast as a `UNION` of two positive membership tests -- non-terminal
+  pass states (`model.NonTerminalPassStates()`, kept in sync with the
+  `PassState` enum rather than a hardcoded SQL list) for the first leg, parked
+  shards for the second -- each independently seekable, backed by a new
+  `passes(state)` index and a `shard_counts(state)` index (`shard_counts`'
+  own primary key is `(pass_id, kind, state)`, which can't serve a `state`-only
+  lookup). `UNION` (not `UNION ALL`) dedups the case where a shard is both
+  parked and on a non-terminal pass, landing in both legs.
+  The rest of the schema was audited table-by-table
   against every query site after finding these -- see
   `TestMarkLinkMembersQueuedStaysFastAtScale`,
-  `TestExpireLeasesUsesLeaseExpiryIndexAtScale`, and
-  `TestSchedulerCountsUsesJobsStateIndexAtScale` (`coordinator/internal/store`)
+  `TestExpireLeasesUsesLeaseExpiryIndexAtScale`,
+  `TestSchedulerCountsUsesJobsStateIndexAtScale`, and
+  `TestQueueSummaryUsesIndexesAtScale` (`coordinator/internal/store`)
   for the regression pins, and re-run that audit -- including rollup tables fed
-  by triggers, not just directly-written ones -- whenever a new hot-path query
+  by triggers, not just directly-written ones, and checking whether a `!=`/`OR`
+  predicate defeats an otherwise-correct index -- whenever a new hot-path query
   is added to a table this store expects to grow large.
 
 ## 4. Scheduler
