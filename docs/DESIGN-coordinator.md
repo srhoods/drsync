@@ -405,13 +405,36 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
     same way inside the actual reap (one goroutine at a time instead of
     contending with itself across jobs' `tick()` iterations), but never blocks
     unrelated coordinator work upstream of it.
+  - A fourth, found from live lock-wait counts *after* the first three
+    shipped (`RecordSplit` still the top caller by volume, `shardTransition:DONE`
+    and `AccumulatePassCounters` firing in an almost 1:1, back-to-back
+    pattern): `onShardResult` — the handler for every successful `ShardResult`
+    frame, the single highest-volume event in the coordinator — called
+    `CompleteShard`/`CompleteDataChunk`/`CompleteFinalizeChunk` (their own
+    `s.mu` acquisition to update shard state) and then, separately,
+    `AccumulatePassCounters` (a second `s.mu` acquisition to update the
+    pass's running totals) for every successful shard. Two lock round-trips
+    where the two updates could just as well be one transaction. `CompleteShard`
+    and the two chunk-completion methods now take an optional
+    `*drsyncpb.ShardCounters` and fold the counters `UPDATE` into the same
+    transaction as the shard-state `UPDATE`, under one `s.mu` acquisition;
+    `AccumulatePassCounters` itself is unchanged for callers that only ever
+    need the counters update on its own. The merge is genuinely atomic, not
+    just "called from the same function": a rejected transition (stale
+    lease, `ErrLeaseMismatch`) rolls the whole transaction back, so counters
+    from a stale/duplicate result are never applied either — same guarantee
+    the two-call version gave by only calling `AccumulatePassCounters` after
+    `CompleteShard` returned success, just without paying for a second lock
+    acquisition on the (overwhelmingly common) success path.
 
-  None of these three needed a schema change or a new index — the fix in each
+  None of these four needed a schema change or a new index — the fix in each
   case was moving avoidable work to a place that does not hold `s.mu` while
-  doing it. See `TestRecordSplitPreChecksDoNotBlockOnWriteConnection`,
-  `TestHeartbeatDefersStoreWriteToFlusher`, and
-  `TestAdvanceDoesNotBlockOnReap`/`TestAdvanceDedupsReapRequests` for the
-  regression pins.
+  doing it, or collapsing two lock acquisitions that were always going to
+  succeed or fail together into one. See
+  `TestRecordSplitPreChecksDoNotBlockOnWriteConnection`,
+  `TestHeartbeatDefersStoreWriteToFlusher`,
+  `TestAdvanceDoesNotBlockOnReap`/`TestAdvanceDedupsReapRequests`, and
+  `TestCompleteShardMergesCounterUpdateAtomically` for the regression pins.
 
 ## 4. Scheduler
 

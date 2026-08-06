@@ -247,7 +247,7 @@ func TestAdvanceReapsLinkRegistryOnLinkfixTransition(t *testing.T) {
 	if len(leased) != 1 {
 		t.Fatalf("leased %d shards, want 1", len(leased))
 	}
-	if err := c.st.CompleteShard(leased[0].ID, leased[0].LeaseID, nil); err != nil {
+	if err := c.st.CompleteShard(leased[0].ID, leased[0].LeaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

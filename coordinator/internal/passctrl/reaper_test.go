@@ -37,7 +37,7 @@ func seedDoneShards(t *testing.T, c *Controller, passID int64, kind model.ShardK
 			t.Fatalf("seedDoneShards: stuck with %d of %d %s shards still ungranted", remaining, n, kind)
 		}
 		for _, r := range rows {
-			if err := c.st.CompleteShard(r.ID, r.LeaseID, nil); err != nil {
+			if err := c.st.CompleteShard(r.ID, r.LeaseID, 0, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			remaining--

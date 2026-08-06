@@ -872,13 +872,34 @@ func (s *Store) SetPassState(passID int64, st model.PassState) error {
 	return err
 }
 
+// AccumulatePassCounters takes s.mu itself for a standalone call. Call sites
+// that already hold an open tx under s.mu for a related write (shardTransition,
+// CompleteDataChunk, CompleteFinalizeChunk) should use accumulatePassCountersTx
+// instead, folding the counters update into that same transaction rather than
+// paying for a second lock acquisition — onShardResult is the highest-volume
+// call site in the coordinator (one per successful ShardResult frame from
+// every agent), so this split is what let CompleteShard merge the two.
 func (s *Store) AccumulatePassCounters(passID int64, c *drsyncpb.ShardCounters) error {
 	if c == nil {
 		return nil
 	}
 	s.lockTimed("AccumulatePassCounters")
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE passes SET
+	return accumulatePassCountersTx(s.db, passID, c)
+}
+
+// dbOrTx is the subset of *sql.DB and *sql.Tx that accumulatePassCountersTx
+// needs, so it can run either standalone (AccumulatePassCounters) or folded
+// into a caller's existing transaction.
+type dbOrTx interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func accumulatePassCountersTx(x dbOrTx, passID int64, c *drsyncpb.ShardCounters) error {
+	if c == nil {
+		return nil
+	}
+	_, err := x.Exec(`UPDATE passes SET
 		entries_walked  = entries_walked  + ?,
 		files_copied    = files_copied    + ?,
 		bytes_copied    = bytes_copied    + ?,
@@ -1400,7 +1421,10 @@ func (s *Store) ShardMeta(shardID int64) (passID int64, kind model.ShardKind, pa
 // finalize queued, which would let passctrl advance the phase past a file that
 // is not yet renamed into place. Returns whether the finalize shard was seeded.
 // An aborted group (source drifted under another chunk) seeds nothing.
-func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string, finalizeShard NewShard) (seeded bool, err error) {
+// counters folds the pass-counter accumulation into this same transaction —
+// see CompleteShard's doc comment for why (onShardResult's chunk path is the
+// other half of the same highest-volume call site).
+func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string, finalizeShard NewShard, counters *drsyncpb.ShardCounters) (seeded bool, err error) {
 	s.lockTimed("CompleteDataChunk")
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -1417,6 +1441,9 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 	}
 	if n == 0 {
 		return false, ErrLeaseMismatch // stale/duplicate result; drop it
+	}
+	if err := accumulatePassCountersTx(tx, passID, counters); err != nil {
+		return false, err
 	}
 
 	var nChunks, nDone int
@@ -1436,7 +1463,9 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 }
 
 // CompleteFinalizeChunk marks the finalize shard DONE and closes its group.
-func (s *Store) CompleteFinalizeChunk(shardID, leaseID, passID int64, relPath string) error {
+// counters folds the pass-counter accumulation into this same transaction —
+// see CompleteShard's doc comment for why.
+func (s *Store) CompleteFinalizeChunk(shardID, leaseID, passID int64, relPath string, counters *drsyncpb.ShardCounters) error {
 	s.lockTimed("CompleteFinalizeChunk")
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -1452,6 +1481,9 @@ func (s *Store) CompleteFinalizeChunk(shardID, leaseID, passID int64, relPath st
 	}
 	if n == 0 {
 		return ErrLeaseMismatch
+	}
+	if err := accumulatePassCountersTx(tx, passID, counters); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(`UPDATE chunk_groups SET state = 'done'
 		WHERE pass_id = ? AND rel_path = ?`, passID, relPath); err != nil {
@@ -2046,33 +2078,65 @@ func execCountTx(tx *sql.Tx, q string, args ...any) (int64, error) {
 	return res.RowsAffected()
 }
 
-func (s *Store) shardTransition(shardID, leaseID int64, to model.ShardState, result []byte, errMsg string, requeue bool) error {
+// shardTransition applies the shard-state UPDATE and, when counters is
+// non-nil, accumulates it onto passID's running totals in the same
+// transaction — one s.mu acquisition instead of two. Only CompleteShard ever
+// passes counters (RequeueShard/ReleaseShard/ParkShard never accumulate); see
+// its doc comment for why this merge exists.
+func (s *Store) shardTransition(shardID, leaseID int64, to model.ShardState, result []byte, errMsg string, requeue bool, passID int64, counters *drsyncpb.ShardCounters) error {
 	s.lockTimed("shardTransition:" + string(to))
 	defer s.mu.Unlock()
-	q := `UPDATE shards SET state = ?, result = COALESCE(?, result),
+	if counters == nil {
+		q := `UPDATE shards SET state = ?, result = COALESCE(?, result),
+			error = COALESCE(NULLIF(?, ''), error), lease_id = NULL, updated_at = ?
+			WHERE id = ? AND state = ? AND lease_id = ?`
+		n, err := s.execCount(q, string(to), result, errMsg, nowMS(),
+			shardID, string(model.ShardLeased), leaseID)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrLeaseMismatch
+		}
+		_ = requeue
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	n, err := execCountTx(tx, `UPDATE shards SET state = ?, result = COALESCE(?, result),
 		error = COALESCE(NULLIF(?, ''), error), lease_id = NULL, updated_at = ?
-		WHERE id = ? AND state = ? AND lease_id = ?`
-	n, err := s.execCount(q, string(to), result, errMsg, nowMS(),
-		shardID, string(model.ShardLeased), leaseID)
+		WHERE id = ? AND state = ? AND lease_id = ?`,
+		string(to), result, errMsg, nowMS(), shardID, string(model.ShardLeased), leaseID)
 	if err != nil {
 		return err
 	}
 	if n == 0 {
 		return ErrLeaseMismatch
 	}
-	_ = requeue
-	return nil
+	if err := accumulatePassCountersTx(tx, passID, counters); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// CompleteShard marks a leased shard DONE (lease must match: stale results
-// from an expired lease are rejected and the caller drops them).
-func (s *Store) CompleteShard(shardID, leaseID int64, result []byte) error {
-	return s.shardTransition(shardID, leaseID, model.ShardDone, result, "", false)
+// CompleteShard marks a leased shard DONE and, when counters is non-nil,
+// accumulates it onto passID in the same transaction (one s.mu acquisition
+// instead of the two separate CompleteShard+AccumulatePassCounters calls this
+// replaced — onShardResult is the single highest-volume call site in the
+// coordinator, one per successful ShardResult frame from every agent, so
+// halving its lock round-trips was worth a wider signature here). Lease must
+// match: stale results from an expired lease are rejected and the caller
+// drops them.
+func (s *Store) CompleteShard(shardID, leaseID, passID int64, result []byte, counters *drsyncpb.ShardCounters) error {
+	return s.shardTransition(shardID, leaseID, model.ShardDone, result, "", false, passID, counters)
 }
 
 // RequeueShard returns a leased shard to the queue (transient failure).
 func (s *Store) RequeueShard(shardID, leaseID int64, errMsg string) error {
-	return s.shardTransition(shardID, leaseID, model.ShardQueued, nil, errMsg, true)
+	return s.shardTransition(shardID, leaseID, model.ShardQueued, nil, errMsg, true, 0, nil)
 }
 
 // ReleaseShard returns an unstarted shard a draining agent handed back to the
@@ -2080,12 +2144,12 @@ func (s *Store) RequeueShard(shardID, leaseID int64, errMsg string) error {
 // not fail; it is simply reassigned to an active agent. Attempt is untouched
 // (it only advances on grant), so a released shard is not penalised.
 func (s *Store) ReleaseShard(shardID, leaseID int64) error {
-	return s.shardTransition(shardID, leaseID, model.ShardQueued, nil, "", true)
+	return s.shardTransition(shardID, leaseID, model.ShardQueued, nil, "", true, 0, nil)
 }
 
 // ParkShard sidelines a shard for operator attention (permanent failure).
 func (s *Store) ParkShard(shardID, leaseID int64, errMsg string) error {
-	return s.shardTransition(shardID, leaseID, model.ShardParked, nil, errMsg, false)
+	return s.shardTransition(shardID, leaseID, model.ShardParked, nil, errMsg, false, 0, nil)
 }
 
 // PassOfShard resolves a shard's pass id.

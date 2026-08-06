@@ -71,7 +71,7 @@ func TestProbeGateTransitionsToScanning(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("probe lease = %+v err=%v", rows, err)
 	}
-	if err := c.st.CompleteShard(rows[0].ID, rows[0].LeaseID, nil); err != nil {
+	if err := c.st.CompleteShard(rows[0].ID, rows[0].LeaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"drsync/coordinator/internal/model"
+	drsyncpb "drsync/proto/gen/drsyncpb"
 )
 
 // TestConcurrentReadsDuringWrites exercises the read pool: monitoring reads run
@@ -139,7 +140,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lease child: %v %v", rows, err)
 	}
-	if err := s.CompleteShard(rows[0].ID, rows[0].LeaseID, nil); err != nil {
+	if err := s.CompleteShard(rows[0].ID, rows[0].LeaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	assertCountsConsistent(t, s, "after complete child (1 DONE)")
@@ -811,7 +812,7 @@ func TestRenewLeasesByIDMatchedCount(t *testing.T) {
 	// Once the shard completes (state != LEASED), the same lease id no longer
 	// matches — this is the "not a bug, the shard just finished" case the
 	// agentsrv warning comment documents, not a data-loss signal on its own.
-	if err := s.CompleteShard(shardID, leaseID, nil); err != nil {
+	if err := s.CompleteShard(shardID, leaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	matched, err = s.RenewLeasesByID("agent-a", []int64{leaseID}, time.Hour)
@@ -903,10 +904,10 @@ func TestLeaseLifecycle(t *testing.T) {
 	}
 
 	// Wrong lease id must be rejected.
-	if err := s.CompleteShard(shardID, lease+1, nil); err != ErrLeaseMismatch {
+	if err := s.CompleteShard(shardID, lease+1, 0, nil, nil); err != ErrLeaseMismatch {
 		t.Fatalf("stale lease accepted: %v", err)
 	}
-	if err := s.CompleteShard(shardID, lease, nil); err != nil {
+	if err := s.CompleteShard(shardID, lease, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, _ := s.ShardStateCounts(passID)
@@ -1513,6 +1514,62 @@ func TestRecordSplitPreChecksDoNotBlockOnWriteConnection(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("RecordSplit's idempotency pre-check blocked on the write connection; " +
 			"it must run on s.rdb before s.mu/s.db are touched")
+	}
+}
+
+// TestCompleteShardMergesCounterUpdateAtomically: CompleteShard used to be two
+// separate calls from the caller — CompleteShard(shard state), then
+// AccumulatePassCounters — which meant two s.mu acquisitions for the single
+// highest-volume event in the coordinator (one per successful ShardResult
+// frame from every agent; live logs showed shardTransition:DONE and
+// AccumulatePassCounters firing in an almost 1:1, back-to-back pattern).
+// Merged into one transaction under one lock. Proves the merge is genuinely
+// atomic, not just "called from the same function": a rejected transition
+// (stale lease) must leave the pass counters completely untouched, and an
+// accepted one must apply both in the same call.
+func TestCompleteShardMergesCounterUpdateAtomically(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, shardID := seed(t, s)
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("lease: rows=%v err=%v", rows, err)
+	}
+	lease := rows[0].LeaseID
+	counters := &drsyncpb.ShardCounters{FilesCopied: 7, BytesCopied: 4096}
+
+	// Stale lease: the transition is rejected, so the counters it carried must
+	// not be applied either — if they were, that would mean the counters
+	// update ran as a separate, unguarded step rather than inside the same
+	// transaction as the (failed) state check.
+	if err := s.CompleteShard(shardID, lease+1, passID, nil, counters); err != ErrLeaseMismatch {
+		t.Fatalf("stale lease = %v, want ErrLeaseMismatch", err)
+	}
+	pass, err := s.LatestPass(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass.FilesCopied != 0 || pass.BytesCopied != 0 {
+		t.Fatalf("counters applied despite ErrLeaseMismatch: files=%d bytes=%d, want 0/0",
+			pass.FilesCopied, pass.BytesCopied)
+	}
+
+	// Genuine completion: both the shard state and the counters land together.
+	if err := s.CompleteShard(shardID, lease, passID, nil, counters); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[model.ShardDone] != 1 {
+		t.Fatalf("shard counts = %+v, want 1 DONE", counts)
+	}
+	pass, err = s.LatestPass(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass.FilesCopied != 7 || pass.BytesCopied != 4096 {
+		t.Fatalf("pass counters = files=%d bytes=%d, want 7/4096", pass.FilesCopied, pass.BytesCopied)
 	}
 }
 
@@ -2219,7 +2276,7 @@ func TestShardKindsPresent(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lease: rows=%v err=%v", rows, err)
 	}
-	if err := s.CompleteShard(shardID, rows[0].LeaseID, nil); err != nil {
+	if err := s.CompleteShard(shardID, rows[0].LeaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	kinds, err = s.ShardKindsPresent(passID)

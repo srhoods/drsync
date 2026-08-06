@@ -61,7 +61,7 @@ func TestSeedTempReclaimOnlyUnfinalized(t *testing.T) {
 		if sh.Kind != model.KindChunk || sh.RelPath != "a/done.bin" {
 			continue
 		}
-		if err := c.st.CompleteFinalizeChunk(sh.ID, sh.LeaseID, pass.ID, sh.RelPath); err != nil {
+		if err := c.st.CompleteFinalizeChunk(sh.ID, sh.LeaseID, pass.ID, sh.RelPath, nil); err != nil {
 			t.Fatal(err)
 		}
 		finalized = true

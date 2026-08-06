@@ -704,9 +704,7 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 			err = s.completeChunk(passID, shardID, leaseID, payload, r)
 		} else {
 			blob, _ := proto.Marshal(r)
-			if err = s.st.CompleteShard(shardID, leaseID, blob); err == nil {
-				err = s.st.AccumulatePassCounters(passID, r.Counters)
-			}
+			err = s.st.CompleteShard(shardID, leaseID, passID, blob, r.Counters)
 		}
 	case drsyncpb.ResultStatus_RESULT_SRC_CHANGED:
 		// A chunk saw the source drift under it: abort the whole file's group.
@@ -746,9 +744,11 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 
 // completeChunk finishes a chunk shard and maintains its group. A data chunk's
 // completion may seed the finalize shard (done atomically in the store); the
-// finalize chunk's completion closes the group. Pass counters are accumulated
-// only after a successful, non-duplicate transition, so a re-delivered result
-// (ErrLeaseMismatch) neither double-counts nor re-seeds.
+// finalize chunk's completion closes the group. Each branch folds the pass
+// counters into its own transaction (see CompleteShard's doc comment) rather
+// than a separate AccumulatePassCounters call after — so a re-delivered
+// result (ErrLeaseMismatch) still neither double-counts nor re-seeds, same as
+// before, just without the second lock acquisition on the success path.
 func (s *Server) completeChunk(passID, shardID, leaseID int64, payload []byte, r *drsyncpb.ShardResult) error {
 	var ct drsyncpb.ChunkTask
 	if err := proto.Unmarshal(payload, &ct); err != nil {
@@ -759,18 +759,13 @@ func (s *Server) completeChunk(passID, shardID, leaseID int64, payload []byte, r
 		// touch n_done (which would re-seed a finalize for a group that has
 		// none) or the group's state. Complete it like any ordinary shard.
 		blob, _ := proto.Marshal(r)
-		if err := s.st.CompleteShard(shardID, leaseID, blob); err != nil {
-			return err
-		}
+		return s.st.CompleteShard(shardID, leaseID, passID, blob, r.Counters)
 	} else if ct.Finalize {
-		if err := s.st.CompleteFinalizeChunk(shardID, leaseID, passID, ct.RelPath); err != nil {
-			return err
-		}
-	} else if _, err := s.st.CompleteDataChunk(shardID, leaseID, passID, ct.RelPath,
-		finalizeShard(ct.RelPath, ct.TempName, ct.Gen)); err != nil {
-		return err
+		return s.st.CompleteFinalizeChunk(shardID, leaseID, passID, ct.RelPath, r.Counters)
 	}
-	return s.st.AccumulatePassCounters(passID, r.Counters)
+	_, err := s.st.CompleteDataChunk(shardID, leaseID, passID, ct.RelPath,
+		finalizeShard(ct.RelPath, ct.TempName, ct.Gen), r.Counters)
+	return err
 }
 
 func (s *Server) onTaskResults(ac *agentConn, batch *drsyncpb.TaskResultBatch) error {
