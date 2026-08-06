@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -2164,6 +2165,58 @@ func TestWALCheckpointRuns(t *testing.T) {
 	}
 	if err := s.WALCheckpoint(); err != nil {
 		t.Fatalf("WALCheckpoint: %v", err)
+	}
+}
+
+// TestWALCheckpointShrinksWALFile pins the fix for a live "the WAL file is
+// now the same size as the main db file" report. PRAGMA wal_checkpoint
+// (PASSIVE) — what WALCheckpoint used to run — fully copies WAL content back
+// to the main db file (correctness is never at risk either way) but leaves
+// the WAL file itself on disk at whatever size it grew to; only TRUNCATE (now
+// what WALCheckpoint runs) actually shrinks the file. This writes enough rows
+// to force real WAL growth, confirms the file is non-trivially sized before
+// checkpointing, then asserts it shrinks back down after.
+func TestWALCheckpointShrinksWALFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	_, passID, _ := seed(t, s)
+	blob := make([]byte, 512)
+	batch := make([]NewShard, 3000)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%05d", i), Payload: blob}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	walPath := path + "-wal"
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL before checkpoint: %v", err)
+	}
+	const minWAL = 64 * 1024 // small margin above SQLite's default page/frame overhead
+	if before.Size() < minWAL {
+		t.Fatalf("WAL only %d bytes before checkpoint, too small to exercise the shrink — "+
+			"increase the write volume above", before.Size())
+	}
+
+	if err := s.WALCheckpoint(); err != nil {
+		t.Fatalf("WALCheckpoint: %v", err)
+	}
+
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL after checkpoint: %v", err)
+	}
+	if after.Size() >= before.Size() {
+		t.Fatalf("WAL file did not shrink: %d bytes before, %d after — "+
+			"checkpoint must use TRUNCATE mode, not PASSIVE, to reclaim WAL file space",
+			before.Size(), after.Size())
 	}
 }
 
