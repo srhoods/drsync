@@ -283,6 +283,142 @@ func TestReadLoopNotBlockedByWrites(t *testing.T) {
 	}
 }
 
+// TestStuckWriterUnwedgesSession is the companion live-incident fix: a peer
+// that stops reading but leaves the TCP connection open (not closed/reset —
+// e.g. a wedged agent process) used to hang the writer goroutine on its
+// blocking wire.WriteFrame call forever. That stalled goroutine then fills
+// ac.out (outBuffer frames) and blocks ac.send() in the read loop, wedging
+// that agent's session permanently instead of tearing it down so the agent
+// can reconnect. A write deadline on every frame bounds this.
+func TestStuckWriterUnwedgesSession(t *testing.T) {
+	orig := writeDeadline
+	writeDeadline = 100 * time.Millisecond
+	t.Cleanup(func() { writeDeadline = orig })
+
+	srv := newTestServer(t)
+	coordSide, agentSide := net.Pipe()
+	defer agentSide.Close()
+	go srv.handle(coordSide)
+
+	a := &fakeAgent{t: t, conn: agentSide}
+	a.send(drsyncpb.FrameType_FRAME_HELLO, &drsyncpb.Hello{
+		AgentId: "stuck", Hostname: "h", ProtoMajor: 1, AgentVersion: "0.0.1"})
+	a.recv(drsyncpb.FrameType_FRAME_HELLO_ACK, &drsyncpb.HelloAck{})
+
+	// Trigger a coordinator->agent write (heartbeat ack) but never read it: on
+	// the unbuffered pipe the writer goroutine's WriteFrame blocks until
+	// something reads, exactly like a peer that stopped draining its socket.
+	// Do not read agentSide again below — reading it would itself satisfy the
+	// pending write and defeat the point of the test.
+	a.send(drsyncpb.FrameType_FRAME_HEARTBEAT, &drsyncpb.Heartbeat{Seq: 1})
+
+	// Wait past the write deadline without ever reading the pending
+	// HEARTBEAT_ACK, then probe with a fresh read: if the deadline fired and
+	// tore the session down, this returns promptly with EOF/closed-pipe rather
+	// than hanging or delivering the stale frame.
+	time.Sleep(3 * writeDeadline)
+	agentSide.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := agentSide.Read(buf); err == nil {
+		t.Fatal("read succeeded after the write deadline elapsed; the coordinator should have closed the session")
+	}
+}
+
+// TestShardSplitForReapedParentIsAcked is the live-incident regression: an
+// agent's outbox can replay a SHARD_SPLIT after a reconnect for a parent shard
+// that has since been reaped (docs/DESIGN-coordinator.md §3, PR #57/#58).
+// Before this fix, onShardSplit's calls into planBigFiles/planLinkSightings
+// and store.RecordSplit all failed with sql.ErrNoRows once the parent's shards
+// row was gone, dispatch() treated that as fatal and closed the session — and
+// because the outbox replays the same unacked frame on every subsequent
+// reconnect, the agent never got past it: a permanent disconnect loop, seen
+// live as repeated "dispatch failed: sql: no rows in result set" on the
+// coordinator and "coordinator sent protocol error" on the agent. The fix
+// treats a missing parent as already-processed and ACKs the split instead of
+// erroring the session.
+func TestShardSplitForReapedParentIsAcked(t *testing.T) {
+	srv := newTestServer(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.Serve(ln)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	a := &fakeAgent{t: t, conn: conn}
+
+	a.send(drsyncpb.FrameType_FRAME_HELLO, &drsyncpb.Hello{
+		AgentId: "agent-test", Hostname: "testhost", ProtoMajor: 1, AgentVersion: "0.0.1"})
+	helloAck := &drsyncpb.HelloAck{}
+	a.recv(drsyncpb.FrameType_FRAME_HELLO_ACK, helloAck)
+	if !helloAck.Accepted {
+		t.Fatalf("hello ack = %+v", helloAck)
+	}
+
+	a.send(drsyncpb.FrameType_FRAME_WORK_REQUEST, &drsyncpb.WorkRequest{ShardCredits: 4})
+	grant := &drsyncpb.WorkGrant{}
+	a.recv(drsyncpb.FrameType_FRAME_WORK_GRANT, grant)
+	if len(grant.Items) != 1 {
+		t.Fatalf("grant items = %d, want 1", len(grant.Items))
+	}
+	root := grant.Items[0].GetShard()
+	lease := grant.Items[0].LeaseId
+
+	// Complete and then reap the root shard — the same path a live shard takes
+	// (eager reap, docs/DESIGN-coordinator.md §3) — so its row is gone by the
+	// time the replayed split below arrives, exactly as it would be after a
+	// disconnect/reconnect racing the reaper.
+	a.send(drsyncpb.FrameType_FRAME_SHARD_RESULT, &drsyncpb.ShardResult{
+		ShardId: root.ShardId, LeaseId: lease, Status: drsyncpb.ResultStatus_RESULT_OK,
+		Counters: &drsyncpb.ShardCounters{},
+	})
+	a.send(drsyncpb.FrameType_FRAME_HEARTBEAT, &drsyncpb.Heartbeat{Seq: 0})
+	a.recv(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, &drsyncpb.HeartbeatAck{})
+
+	job, err := srv.st.GetJob("e2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pass, err := srv.st.ActivePass(job.ID)
+	if err != nil || pass == nil {
+		t.Fatalf("active pass: %v %v", pass, err)
+	}
+	if n, err := srv.st.ReapDoneShards(pass.ID, []model.ShardKind{model.KindDir}); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("reaped %d shards, want 1 (root shard id %d)", n, root.ShardId)
+	}
+
+	// A split carrying a big file (exercises planBigFiles's ShardJobPass call)
+	// plus plain subdirs (exercises store.RecordSplit's own parent lookup).
+	a.send(drsyncpb.FrameType_FRAME_SHARD_SPLIT, &drsyncpb.ShardSplit{
+		ParentShardId: root.ShardId, Seq: 1,
+		Subdirs: []*drsyncpb.ShardSplit_NewShard{{RelPath: []byte("projects")}},
+		BigFiles: []*drsyncpb.ShardSplit_BigFile{
+			{RelPath: []byte("a/big.bin"), Size: 1 << 20, MtimeNs: 1},
+		},
+	})
+
+	// Must be ACKed, not answered with FRAME_ERROR (which would tear the
+	// session down and leave the agent to replay the exact same frame again).
+	splitAck := &drsyncpb.ShardSplitAck{}
+	a.recv(drsyncpb.FrameType_FRAME_SHARD_SPLIT_ACK, splitAck)
+	if len(splitAck.AssignedShardIds) != 0 {
+		t.Fatalf("split ack for reaped parent assigned ids %v, want none", splitAck.AssignedShardIds)
+	}
+
+	// The session must still be alive: a heartbeat round-trip proves dispatch
+	// did not close the connection after the split.
+	a.send(drsyncpb.FrameType_FRAME_HEARTBEAT, &drsyncpb.Heartbeat{Seq: 1})
+	hbAck := &drsyncpb.HeartbeatAck{}
+	a.recv(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, hbAck)
+}
+
 // TestChunkTempNamePassTagged is the "open temp for finalize" regression. A
 // chunk temp lives in the destination directory, with no source counterpart,
 // for the whole multi-host copy — indistinguishable from crash residue to an

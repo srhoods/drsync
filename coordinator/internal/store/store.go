@@ -1169,6 +1169,24 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 
 	var passID int64
 	if err := s.db.QueryRow(`SELECT pass_id FROM shards WHERE id = ?`, parentShardID).Scan(&passID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// The parent shard is gone: either eagerly reaped after it completed
+			// (docs/DESIGN-coordinator.md §3, PR #57/#58) or dropped with its job.
+			// The splits idempotency check above already ruled out "this exact
+			// split was already recorded" — if we're here, this is instead an
+			// outbox replay of a split the agent queued before a disconnect and
+			// is resending on reconnect, for a parent shard that finished (or was
+			// dropped) during the gap. There is no work to insert: whatever this
+			// split would have produced either already ran (as part of the
+			// parent shard's own completion) or belongs to a job that no longer
+			// exists. Returning nil, nil rather than an error lets onShardSplit
+			// ack the split normally instead of tearing the session down (which
+			// would just cause the agent to reconnect and replay the same poison
+			// frame forever — see the dispatch loop in agentsrv/server.go).
+			slog.Warn("split for missing parent shard; treating as already-processed",
+				"parent_shard_id", parentShardID, "seq", seq)
+			return nil, nil
+		}
 		return nil, fmt.Errorf("split parent %d: %w", parentShardID, err)
 	}
 	tx, err := s.db.Begin()
