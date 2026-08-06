@@ -61,6 +61,15 @@ const sessionSecretFile = "session.key"
 // rate on the journal segments stays cheap.
 const journalFlushInterval = 250 * time.Millisecond
 
+// heartbeatFlushInterval bounds how often connected agents' last_heartbeat
+// timestamps are batch-persisted (agentsrv.RunHeartbeatFlusher). Display-only
+// (the operator-facing agents API), so this is a cosmetic staleness window,
+// not a durability concern — wide enough that it costs the write lock only a
+// handful of times a minute regardless of fleet size, tight enough that an
+// operator watching the agents page never sees a stale-looking timestamp on a
+// connection that is actually still healthy.
+const heartbeatFlushInterval = 5 * time.Second
+
 // coordinatorVersion is surfaced in the console header and /api/v1/info.
 const coordinatorVersion = "0.1.1"
 
@@ -249,6 +258,8 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 	// durable high-water. Gating the ack on fsync is what makes JournalAck mean
 	// "durable" — see agentsrv.RunJournalFlusher.
 	go asrv.RunJournalFlusher(ctx, journalFlushInterval)
+	// last_heartbeat batching: see agentsrv.RunHeartbeatFlusher.
+	go asrv.RunHeartbeatFlusher(ctx, heartbeatFlushInterval)
 
 	agentLn, err := net.Listen("tcp", agentAddr)
 	if err != nil {

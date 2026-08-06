@@ -79,6 +79,7 @@ func TestProbeGateTransitionsToScanning(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, _ := c.st.ActivePass(job.ID)
 	if pass.State != model.PassScanning {
 		t.Fatalf("pass state = %s, want SCANNING", pass.State)

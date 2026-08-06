@@ -107,6 +107,12 @@ type agentConn struct {
 	ifMu       sync.Mutex
 	inflight   []*drsyncpb.InflightItem
 	inflightAt time.Time
+
+	// lastHeartbeatMs is set (lock-free) on every heartbeat and periodically
+	// batch-flushed to agents.last_heartbeat by runHeartbeatFlusher, rather
+	// than each heartbeat taking store.mu itself via TouchAgent — see that
+	// flusher's comment for why.
+	lastHeartbeatMs atomic.Int64
 }
 
 // Inflight returns the agent's most recent in-flight snapshot and the time it
@@ -447,9 +453,11 @@ func (s *Server) onHeartbeat(ac *agentConn, hb *drsyncpb.Heartbeat) error {
 		slog.Warn("heartbeat renewal did not match every held lease",
 			"agent", ac.id, "seq", hb.Seq, "requested", len(held), "matched", matched)
 	}
-	if err := s.st.TouchAgent(ac.id); err != nil {
-		return err
-	}
+	// last_heartbeat is display-only (the operator-facing agents API) — nothing
+	// in scheduling or lease logic reads it, so it does not need store.mu on
+	// every single heartbeat. Record it here, lock-free; runHeartbeatFlusher
+	// batches it to the store periodically.
+	ac.lastHeartbeatMs.Store(time.Now().UnixMilli())
 	s.met.AgentRSS.WithLabelValues(ac.id).Set(float64(hb.RssBytes))
 	return ac.send(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, &drsyncpb.HeartbeatAck{
 		Seq: hb.Seq, Pause: ac.pause, Drain: ac.drain.Load(),
@@ -853,6 +861,46 @@ func (s *Server) flushAndAck() {
 		// records (dedup by (shard_id, seq)), so a dropped ack loses nothing.
 		_ = t.ac.send(drsyncpb.FrameType_FRAME_JOURNAL_ACK,
 			&drsyncpb.JournalAck{AckedSeq: t.seq})
+	}
+}
+
+// RunHeartbeatFlusher periodically persists every connected agent's
+// last-heartbeat timestamp in one batch, instead of onHeartbeat calling
+// store.TouchAgent (store.mu) on every single heartbeat frame from every
+// agent (docs/DESIGN-agent.md §3.4 investigation: this was one of several
+// store.mu hot-path calls found serializing the whole fleet's
+// heartbeat/dispatch behind each other under load). last_heartbeat is
+// display-only — nothing in scheduling or lease logic reads it — so a
+// several-second staleness window between an agent's actual heartbeat and
+// this landing in the store is a purely cosmetic tradeoff for taking the
+// write lock a small constant number of times per interval instead of once
+// per heartbeat. Runs until ctx is cancelled, with a final flush so a clean
+// shutdown persists the last interval's timestamps.
+func (s *Server) RunHeartbeatFlusher(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.flushHeartbeats()
+			return
+		case <-t.C:
+			s.flushHeartbeats()
+		}
+	}
+}
+
+func (s *Server) flushHeartbeats() {
+	s.mu.Lock()
+	stamps := make([]store.AgentHeartbeatStamp, 0, len(s.agents))
+	for id, ac := range s.agents {
+		if ms := ac.lastHeartbeatMs.Load(); ms > 0 {
+			stamps = append(stamps, store.AgentHeartbeatStamp{AgentID: id, AtMs: ms})
+		}
+	}
+	s.mu.Unlock()
+	if err := s.st.TouchAgents(stamps); err != nil {
+		slog.Error("heartbeat timestamp flush failed", "err", err)
 	}
 }
 

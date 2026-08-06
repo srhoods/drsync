@@ -1147,8 +1147,6 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 // hardlinks_max_group_scan (0 = unlimited).
 func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	groups []NewChunkGroup, sightings []NewLinkSighting, maxGroupScan uint64) ([]int64, error) {
-	s.lockTimed("RecordSplit")
-	defer s.mu.Unlock()
 	// int64(seq): bit-preserving reinterpret, not a truncation — see
 	// recordLinkSightingsTx's comment. seq is agent-assigned per-parent and in
 	// practice never near 2^63, but binding a uint64 with the high bit set
@@ -1156,8 +1154,22 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	// known-triggering case like dev/ino.
 	seq64 := int64(seq)
 
+	// Both pre-checks below run on s.rdb (the lock-free reader pool), before
+	// s.mu is ever taken: a busy split (many sightings — recordLinkSightingsTx
+	// is 5 statements per sighting) used to hold the single write lock for
+	// this whole lookup-then-decide sequence, serializing every agent's
+	// heartbeat/dispatch behind it (docs/DESIGN-agent.md §3.4 investigation:
+	// "store: long wait for write lock" fired thousands of times with
+	// RecordSplit as a top offender). Neither query needs mu — one is a plain
+	// idempotency lookup, the other resolves passID — so both can run
+	// concurrently with everything else and only the actual INSERTs need the
+	// lock. A retransmit racing itself past this pre-check is not a new risk:
+	// splits' PRIMARY KEY (parent_shard_id, seq) still catches a genuine
+	// double-insert at the INSERT below, and in practice can't happen anyway
+	// — one agent's frames dispatch on a single goroutine, so a second copy of
+	// the same frame is only ever read after the first's RecordSplit returns.
 	var idsJSON string
-	err := s.db.QueryRow(`SELECT assigned_ids FROM splits WHERE parent_shard_id = ? AND seq = ?`,
+	err := s.rdb.QueryRow(`SELECT assigned_ids FROM splits WHERE parent_shard_id = ? AND seq = ?`,
 		parentShardID, seq64).Scan(&idsJSON)
 	if err == nil {
 		var ids []int64
@@ -1168,7 +1180,7 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	}
 
 	var passID int64
-	if err := s.db.QueryRow(`SELECT pass_id FROM shards WHERE id = ?`, parentShardID).Scan(&passID); err != nil {
+	if err := s.rdb.QueryRow(`SELECT pass_id FROM shards WHERE id = ?`, parentShardID).Scan(&passID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// The parent shard is gone: either eagerly reaped after it completed
 			// (docs/DESIGN-coordinator.md §3, PR #57/#58) or dropped with its job.
@@ -1189,6 +1201,14 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 		}
 		return nil, fmt.Errorf("split parent %d: %w", parentShardID, err)
 	}
+
+	// Only the write transaction itself needs mu: passID is a plain value (no
+	// FK back to the parent shard row — parent_shard_id is never re-read once
+	// assigned, see ReapDoneShards), and the pass row it names outlives any
+	// one shard for the whole job, so a lock-free read of it above stays valid
+	// here even if the parent shard itself is reaped in between.
+	s.lockTimed("RecordSplit")
+	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -2383,11 +2403,44 @@ func (s *Store) SetAgentEnabled(id string, enabled bool) error {
 	return nil
 }
 
-func (s *Store) TouchAgent(id string) error {
-	s.lockTimed("TouchAgent")
+// AgentHeartbeatStamp is one agent's last-heartbeat timestamp to persist, as
+// batched by agentsrv's periodic flusher (see its doc comment).
+type AgentHeartbeatStamp struct {
+	AgentID string
+	AtMs    int64
+}
+
+// TouchAgents persists a batch of agents' last_heartbeat in one transaction —
+// display-only (the operator-facing agents API; nothing in scheduling or
+// lease logic reads it), so batching it is purely about lock-hold time, not
+// correctness: this used to be a per-agent call (TouchAgent) taking store.mu
+// on every single heartbeat frame from every connected agent, which at fleet
+// scale meant the write lock's next contender was almost always another
+// TouchAgent, not real work. Here the whole batch runs as one transaction (a
+// prepared statement executed once per stamp), so the lock is held once per
+// flush interval instead of once per heartbeat.
+func (s *Store) TouchAgents(stamps []AgentHeartbeatStamp) error {
+	if len(stamps) == 0 {
+		return nil
+	}
+	s.lockTimed("TouchAgents")
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`UPDATE agents SET last_heartbeat = ? WHERE id = ?`, nowMS(), id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE agents SET last_heartbeat = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, st := range stamps {
+		if _, err := stmt.Exec(st.AtMs, st.AgentID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ListAgents() ([]*Agent, error) {

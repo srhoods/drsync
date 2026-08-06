@@ -179,3 +179,69 @@ func TestDefaultConfigAcceptsOldMinors(t *testing.T) {
 		t.Errorf("default config rejected a minor 0 agent: %s", ack.RejectReason)
 	}
 }
+
+// TestHeartbeatDefersStoreWriteToFlusher is the live-incident regression:
+// onHeartbeat used to call store.TouchAgent (store.mu) on every single
+// heartbeat frame from every connected agent — a top contributor to the
+// "long wait for write lock" contention storm (docs/DESIGN-agent.md §3.4)
+// that showed up live as agents missing their lease TTL in unison. Proves
+// the timestamp is recorded in-memory (survives immediately after the
+// heartbeat, readable via the connection) but does NOT reach the store until
+// flushHeartbeats runs — i.e. onHeartbeat itself no longer takes store.mu.
+func TestHeartbeatDefersStoreWriteToFlusher(t *testing.T) {
+	srv, addr := listenTestServer(t, Config{})
+	a, ack := dialHello(t, addr, "agent-hb", 0)
+	if !ack.Accepted {
+		t.Fatalf("hello rejected: %s", ack.RejectReason)
+	}
+
+	before, err := srv.st.ListAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeStamp int64
+	for _, ag := range before {
+		if ag.ID == "agent-hb" {
+			beforeStamp = ag.LastHeartbeat
+		}
+	}
+
+	// UpsertAgent (at connect, above) and the heartbeat below both stamp with
+	// millisecond resolution; without this gap a fast test run can land both
+	// in the same millisecond and make the "unchanged" assertion below racy
+	// regardless of which code path actually wrote it.
+	time.Sleep(5 * time.Millisecond)
+
+	a.send(drsyncpb.FrameType_FRAME_HEARTBEAT, &drsyncpb.Heartbeat{Seq: 1})
+	hbAck := &drsyncpb.HeartbeatAck{}
+	a.recv(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, hbAck) // proves dispatch finished processing the frame
+
+	afterHeartbeat, err := srv.st.ListAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ag := range afterHeartbeat {
+		if ag.ID == "agent-hb" && ag.LastHeartbeat != beforeStamp {
+			t.Fatalf("store's last_heartbeat changed synchronously from onHeartbeat "+
+				"(before=%d after=%d) — TouchAgent should no longer be called inline",
+				beforeStamp, ag.LastHeartbeat)
+		}
+	}
+
+	// The flusher's batch write is what actually persists it.
+	srv.flushHeartbeats()
+	afterFlush, err := srv.st.ListAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotStamp int64
+	for _, ag := range afterFlush {
+		if ag.ID == "agent-hb" {
+			gotStamp = ag.LastHeartbeat
+		}
+	}
+	if gotStamp <= beforeStamp {
+		t.Fatalf("last_heartbeat after flushHeartbeats = %d, want > %d (the pre-heartbeat stamp)",
+			gotStamp, beforeStamp)
+	}
+}

@@ -180,6 +180,7 @@ func TestAdvanceGoesThroughLinkfixBetweenDirfixAndVerify(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -193,6 +194,7 @@ func TestAdvanceGoesThroughLinkfixBetweenDirfixAndVerify(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -252,6 +254,7 @@ func TestAdvanceReapsLinkRegistryOnLinkfixTransition(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)

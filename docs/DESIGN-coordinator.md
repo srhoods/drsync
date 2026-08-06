@@ -349,6 +349,69 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   by triggers, not just directly-written ones, and checking whether a `!=`/`OR`
   predicate defeats an otherwise-correct index -- whenever a new hot-path query
   is added to a table this store expects to grow large.
+- **Lock-hold time, not caller count, is the recurring failure mode.** Three
+  more instances found live (thousands of "store: long wait for write lock"
+  entries fleet-wide, `dispatch took unusually long` warnings in the hundreds
+  of ms, heartbeat renewal not matching every held lease, and every agent
+  exceeding lease TTL in unison — the same class of symptom as the index
+  findings above, but caused by doing avoidable work *under* `s.mu` rather than
+  by a missing index):
+  - `RecordSplit`'s two pre-checks — the `splits` idempotency lookup and the
+    `SELECT pass_id FROM shards` parent resolve — used to run on `s.db` (the
+    single write connection) while already holding `s.mu`, so a busy split
+    (`recordLinkSightingsTx` is 5 statements per sighting) held the lock for
+    the whole lookup-then-decide sequence, not just the final insert. Both now
+    run on `s.rdb` (the lock-free reader pool) before `s.mu` is ever taken;
+    only the actual `INSERT`s run under the lock. A retransmit racing itself
+    past the now-unlocked pre-check is not a new risk: `splits`' own
+    `PRIMARY KEY (parent_shard_id, seq)` still catches a genuine double-insert
+    at the `INSERT`, and in practice can't happen anyway — one agent's frames
+    dispatch on a single goroutine, so a second copy of the same frame is only
+    ever read after the first `RecordSplit` call returns.
+  - `onHeartbeat` used to call `store.TouchAgent` (`s.mu`) on every single
+    heartbeat frame from every connected agent to persist `last_heartbeat` —
+    at fleet scale, the write lock's next contender was almost always another
+    heartbeat's `TouchAgent`, not real work, even though `last_heartbeat` is
+    purely display-only (the operator-facing agents API; nothing in
+    scheduling or lease logic reads it). Replaced with an in-memory
+    `agentConn.lastHeartbeatMs` (same "sampled state, not history" pattern as
+    the existing in-flight snapshot) set lock-free on every heartbeat, and
+    `agentsrv.RunHeartbeatFlusher` — a periodic goroutine (`heartbeatFlushInterval`,
+    5s) that batches every connected agent's current timestamp into one
+    `store.TouchAgents` transaction. Trades a few seconds of display staleness
+    for taking the write lock a handful of times a minute instead of once per
+    heartbeat.
+  - `passctrl`'s reap calls (`doReapPhase`/`doReapLinkRegistry`, formerly
+    `reapPhase`/`reapLinkRegistry`) used to run inline inside `advance()`,
+    which itself runs on `tick()`'s single goroutine, serially across every
+    running job. A pass with a large reap backlog loops `ReapDoneShards`/
+    `ReapLinkRegistry` batches back-to-back with no yield between them for up
+    to `reapPhaseBudget` (30s) — inline, that meant one job's reap could block
+    every *other* running job's `advance()` call for up to 30 seconds solid,
+    while simultaneously re-acquiring `s.mu` in a tight loop the entire time,
+    directly competing with every connected agent's heartbeat/dispatch call on
+    every single acquisition. Reaping is best-effort by design (each call site
+    already documented that "a reap failure must not stop the phase
+    transition that already committed above it" — nothing downstream of the
+    six `advance()` call sites depends on the reap having finished), so it was
+    moved off the tick goroutine entirely: `advance()` now calls
+    `enqueueReap`/`enqueueReapLinkRegistry`, which hands a request to a
+    channel (`reapCh`, buffered) drained by a dedicated `runReapWorker`
+    goroutine (started alongside `tick()` from `Controller.Run`) and returns
+    immediately. `reapInflight` dedups the channel per `(pass, registry?)` key
+    so the SCANNING eager-reap call site — which re-enters the gate every 2s
+    tick while `counts[ShardDone] > 0` — cannot pile up redundant requests
+    behind a worker that has not caught up yet. The lock is still taken the
+    same way inside the actual reap (one goroutine at a time instead of
+    contending with itself across jobs' `tick()` iterations), but never blocks
+    unrelated coordinator work upstream of it.
+
+  None of these three needed a schema change or a new index — the fix in each
+  case was moving avoidable work to a place that does not hold `s.mu` while
+  doing it. See `TestRecordSplitPreChecksDoNotBlockOnWriteConnection`,
+  `TestHeartbeatDefersStoreWriteToFlusher`, and
+  `TestAdvanceDoesNotBlockOnReap`/`TestAdvanceDedupsReapRequests` for the
+  regression pins.
 
 ## 4. Scheduler
 

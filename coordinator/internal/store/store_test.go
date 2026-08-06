@@ -1458,6 +1458,64 @@ func TestSplitIdempotency(t *testing.T) {
 	}
 }
 
+// TestRecordSplitPreChecksDoNotBlockOnWriteConnection is the live-incident
+// regression: RecordSplit's idempotency lookup (SELECT ... FROM splits) and
+// parent-pass lookup (SELECT pass_id FROM shards) used to run on s.db (the
+// single write connection, MaxOpenConns=1) while already holding s.mu — so a
+// busy split (recordLinkSightingsTx is 5 statements per sighting, all inside
+// the same locked transaction) held the write lock for the full
+// lookup-then-decide sequence, not just the final insert, serializing every
+// agent's heartbeat/dispatch behind it (docs/DESIGN-agent.md §3.4
+// investigation: "long wait for write lock" fired thousands of times with
+// RecordSplit as a top offender).
+//
+// Both pre-checks now run on s.rdb before s.mu is ever taken. Proved here by
+// holding s.db's one connection busy in an open, uncommitted transaction from
+// this test (MaxOpenConns=1, so a second caller of s.db would genuinely
+// block waiting for that same connection) and confirming RecordSplit's
+// idempotent-hit path still returns promptly — it cannot be touching s.db at
+// all until account for the final insert, which this test never reaches.
+func TestRecordSplitPreChecksDoNotBlockOnWriteConnection(t *testing.T) {
+	s := openTest(t)
+	_, _, shardID := seed(t, s)
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	subs := []NewShard{{Kind: model.KindDir, RelPath: "a"}}
+	if _, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the sole write connection busy in an open transaction — anything
+	// that still needs s.db (not s.rdb) blocks here until it's released.
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE agents SET last_heartbeat = 0 WHERE id = 'nobody'`); err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	done := make(chan error, 1)
+	go func() {
+		// Retransmit of the split recorded above: hits the idempotency-check
+		// fast path and must return without ever touching s.db.
+		_, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecordSplit's idempotency pre-check blocked on the write connection; " +
+			"it must run on s.rdb before s.mu/s.db are touched")
+	}
+}
+
 // TestRecordSplitMissingParentIsIdempotent covers the case a live incident
 // surfaced: an agent's outbox can replay a SHARD_SPLIT for a parent that has
 // since been reaped (or whose job was dropped) across a reconnect. Before
@@ -1595,6 +1653,60 @@ func TestReleaseShardRequeuesWithoutPenalty(t *testing.T) {
 	}
 	if rows[0].Attempt != 2 {
 		t.Errorf("attempt after release+regrant = %d, want 2 (release must not penalise)", rows[0].Attempt)
+	}
+}
+
+// TestTouchAgentsBatchesTimestamps: TouchAgents replaced a per-heartbeat
+// TouchAgent call (store.mu on every single heartbeat frame from every
+// connected agent — a top contributor to the live "long wait for write lock"
+// contention storm, docs/DESIGN-agent.md §3.4) with one batched write. Pins
+// that a multi-agent batch actually persists every agent's own timestamp
+// correctly (not just the last one written, and not cross-contaminated
+// between agents), and that an unknown agent id in the batch (already
+// disconnected/removed between the flusher's snapshot and its write) does not
+// fail the rest of the batch.
+func TestTouchAgentsBatchesTimestamps(t *testing.T) {
+	s := openTest(t)
+	for _, id := range []string{"agent-a", "agent-b", "agent-c"} {
+		if err := s.UpsertAgent(id, id+".host", "v1", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.TouchAgents([]AgentHeartbeatStamp{
+		{AgentID: "agent-a", AtMs: 1000},
+		{AgentID: "agent-b", AtMs: 2000},
+		{AgentID: "unknown-agent", AtMs: 3000}, // no matching row: must not fail the batch
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	agents, err := s.ListAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, a := range agents {
+		got[a.ID] = a.LastHeartbeat
+	}
+	if got["agent-a"] != 1000 {
+		t.Errorf("agent-a last_heartbeat = %d, want 1000", got["agent-a"])
+	}
+	if got["agent-b"] != 2000 {
+		t.Errorf("agent-b last_heartbeat = %d, want 2000", got["agent-b"])
+	}
+	if got["agent-c"] == 1000 || got["agent-c"] == 2000 {
+		t.Errorf("agent-c last_heartbeat = %d, cross-contaminated from another agent's stamp", got["agent-c"])
+	}
+}
+
+// TestTouchAgentsEmptyBatchIsNoop: the flusher calls this every interval
+// regardless of whether any agent is connected — an empty batch must be a
+// cheap no-op, not an error or a wasted lock acquisition.
+func TestTouchAgentsEmptyBatchIsNoop(t *testing.T) {
+	s := openTest(t)
+	if err := s.TouchAgents(nil); err != nil {
+		t.Fatalf("TouchAgents(nil) = %v, want nil", err)
 	}
 }
 
