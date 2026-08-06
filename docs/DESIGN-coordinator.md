@@ -193,6 +193,23 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   already drain correctly regardless of timing. The phase itself still only
   transitions once every queued/leased shard drains (unchanged) — this only stops
   *already-finished* shards from sitting around for the rest of the phase.
+- **QueueSummary reports reaped DONE too:** `ShardStateCounts` (previous bullet) folds
+  `passes.shards_reaped` into its DONE total, but `QueueSummary` — the `/api/v1/queue`
+  view the console's job progress bars, DONE tiles and queue-state bar all read — did
+  not, since it predates the eager reap and originally had no reason to: DONE rows
+  used to sit in `shard_counts` until the whole phase drained, so a live scan was
+  always the true total in the moment that mattered. Once shards started being reaped
+  mid-phase, that stopped holding — a job walking a large tree could show a shrinking
+  or flat DONE count, or a progress bar stuck near 0%, while steadily completing work,
+  because the count was reading only whatever hadn't been reaped out from under it
+  yet. Fixed the same way as `ShardStateCounts`: `QueueSummary`'s query gained a third
+  UNIONed leg selecting `passes.shards_reaped` as a synthetic `(kind=model.KindReaped,
+  state=DONE)` row per non-terminal pass with a nonzero total, seekable on
+  `passes_state` like the first leg. Every current consumer of the DONE total (job
+  progress, the DONE tile, the queue's state bar) already sums across `kind`, so the
+  synthetic row folds in transparently; only a strict per-kind breakdown of
+  *already-reaped* DONE work is unavailable, since `shards_reaped` is one running total
+  per pass, not per kind — no current view needs that.
 - **link_groups/link_members reap:** these two tables (D11 hardlink correlation,
   `docs/DESIGN-hardlinks.md` §3) shipped with a job-purge-only lifecycle, the same as
   `chunk_groups` — no per-pass reap. Unlike `chunk_groups` (small in practice; chunk

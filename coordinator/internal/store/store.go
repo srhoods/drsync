@@ -2132,14 +2132,37 @@ type QueueRow struct {
 // model.NonTerminalPassStates so this can't drift from the enum — each leg
 // becomes independently index-seekable: the first drives off passes_state,
 // the second off shard_counts_state.
+//
+// A third leg adds passes.shards_reaped as a synthetic DONE row (kind
+// model.KindReaped) for every non-terminal pass with a nonzero total. Since
+// the eager SCANNING reap and the reap-at-phase-transition calls
+// (passctrl.advance) now delete a DONE shard's row long before its phase — or
+// often its whole pass — finishes, the live shard_counts DONE total alone
+// understates real progress: a job walking a large tree can show a shrinking
+// or flat DONE count while continuously completing work. shards_reaped is
+// exactly the running total ShardStateCounts already adds back for the same
+// reason (see its comment); this does the same for the queue view so job
+// progress bars, the DONE tile and the DONE segment of the queue's state bar
+// all read the true count instead of whatever fraction hasn't been reaped
+// yet. Per-kind DONE breakdown for already-reaped shards is not
+// reconstructable (shards_reaped is one running total per pass, not
+// per-kind) — callers that need progress or a DONE total should sum across
+// kind, which is what every current consumer does; callers that need a
+// per-kind live breakdown (e.g. "what's queued right now") are unaffected,
+// since only QUEUED/LEASED/PARKED rows are ever broken out that way.
 func (s *Store) QueueSummary() ([]QueueRow, error) {
 	nonTerminal := model.NonTerminalPassStates()
 	ph := strings.TrimSuffix(strings.Repeat("?,", len(nonTerminal)), ",")
-	args := make([]any, 0, len(nonTerminal))
+	nonTerminalArgs := make([]any, 0, len(nonTerminal))
 	for _, st := range nonTerminal {
-		args = append(args, string(st))
+		nonTerminalArgs = append(nonTerminalArgs, string(st))
 	}
+
+	args := make([]any, 0, 2*len(nonTerminal)+3)
+	args = append(args, nonTerminalArgs...)
 	args = append(args, string(model.ShardParked))
+	args = append(args, string(model.KindReaped), string(model.ShardDone))
+	args = append(args, nonTerminalArgs...)
 
 	rows, err := s.rdb.Query(`SELECT j.name, p.pass_no, sc.kind, sc.state, sc.n
 		FROM shard_counts sc
@@ -2152,6 +2175,11 @@ func (s *Store) QueueSummary() ([]QueueRow, error) {
 		JOIN passes p ON p.id = sc.pass_id
 		JOIN jobs   j ON j.id = p.job_id
 		WHERE sc.n > 0 AND sc.state = ?
+		UNION
+		SELECT j.name, p.pass_no, ?, ?, p.shards_reaped
+		FROM passes p
+		JOIN jobs j ON j.id = p.job_id
+		WHERE p.shards_reaped > 0 AND p.state IN (`+ph+`)
 		ORDER BY 1, 2`, args...)
 	if err != nil {
 		return nil, err

@@ -52,6 +52,12 @@ const (
 	// KindLinkfix: linkat tasks for hardlink-group members once their group's
 	// anchor copy has landed (docs/DESIGN-hardlinks.md).
 	KindLinkfix ShardKind = "linkfix"
+	// KindReaped is not a real shard kind — it never appears in the shards
+	// table. QueueSummary uses it to label the synthetic DONE row that carries
+	// a pass's shards_reaped total (see store.QueueSummary), so consumers that
+	// sum DONE by kind still land on the true total instead of whatever
+	// fraction the reaper hasn't yet deleted.
+	KindReaped ShardKind = "reaped"
 )
 
 // Scheduling priorities (higher = granted first). Chunk tasks outrank walk
