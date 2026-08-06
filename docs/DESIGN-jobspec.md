@@ -187,7 +187,9 @@ with `-smtp-config`); the spec only names recipients and which events fire:
 
 - `on_pass_complete` — one email as each pass finishes, carrying that pass's delta (files,
   bytes, metadata fixes, orphans, verify, errors) and duration. This is the convergence
-  trace, arriving pass by pass.
+  trace, arriving pass by pass. A scan pass's orphan figure and a later delete pass's
+  removal figure are different units, not the same count twice — see
+  `docs/DESIGN-coordinator.md` §2.2 (`DELETE`).
 - `on_job_complete` — a single summary email when the job reaches `COMPLETED`: the full
   per-pass trajectory table (state, **duration**, Δfiles, Δbytes, orphans, verify, errors —
   one row per pass, so a slow convergence shows *where* the time went, not just the totals)
