@@ -108,7 +108,16 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
 - `VERIFY` grants verify batches built from the pass journal (all-metadata + sampled
   checksum per D4).
 - `DELETE` exists only when triggered with the explicit double-gate (D5); tasks are
-  built from the orphan journal — **no additional scan**.
+  built from the orphan journal — **no additional scan**. The orphan count a scan pass
+  reports (job summary, convergence table, `drsync journal cat --summary`) and the
+  removal count the delete pass later reports are different units, not the same number
+  reappearing twice: the scan journals one `ORPHAN` record per orphan *path* and never
+  descends into an orphaned directory (no reason to — the whole subtree is getting
+  deleted), so a directory with thousands of descendants underneath still counts once.
+  At delete time, `agent/src/delete.c`'s `rm_tree` recursively removes and counts every
+  filesystem object under each orphan path — so it is expected and correct for the
+  delete pass's live removal count to run well past the prior pass's reported orphan
+  count while still in progress, not a sign of double-counting or runaway deletion.
 
 ### 2.3 Shard
 
