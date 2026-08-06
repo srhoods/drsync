@@ -1853,26 +1853,37 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 	}
 }
 
-// WALCheckpoint runs a PASSIVE wal_checkpoint: copies as many WAL frames back
-// into the main db file as it can without blocking any other connection
-// (readers on s.rdb keep running; it simply checkpoints less than a FULL/
-// RESTART/TRUNCATE mode would if a reader is holding an old snapshot open).
-// Still takes s.mu — the copy itself briefly holds SQLite's own internal WAL
-// lock against this connection's next write either way, so there is no
-// benefit to letting a write race in during it, only a busy-timeout retry to
-// pay for. Called on a fixed interval (RunWALCheckpoint) now that
-// wal_autocheckpoint is disabled at Open (see its comment there) — this is
-// what actually keeps the WAL from growing unbounded, just on a schedule this
-// process controls instead of one SQLite's internal page-count trigger
-// picked. Logs at info when a checkpoint does real work (checkpointed > 0) so
-// the interval and WAL growth rate can be sanity-checked from operator logs
-// without extra tooling; silent when there is nothing to do, which is the
-// common case between busy stretches.
+// WALCheckpoint runs a TRUNCATE wal_checkpoint: like PASSIVE, it copies WAL
+// frames back into the main db file without blocking any other connection —
+// readers on s.rdb keep running, and it still checkpoints less than the full
+// WAL if a reader is holding an old snapshot open, exactly like PASSIVE would
+// (`busy` comes back nonzero in that case; nothing here treats that as an
+// error). The difference, and the reason this isn't PASSIVE: once every frame
+// is copied back, PASSIVE leaves the WAL file on disk at whatever size it
+// grew to — it reclaims WAL *content*, not the *file*. Only TRUNCATE (or
+// RESTART, which reclaims the file down to empty-but-still-allocated rather
+// than deleting it) shrinks bytes on disk. Without this, the WAL file grows
+// to its peak size under load and stays there indefinitely even though every
+// checkpoint since has fully "succeeded" (checkpointed == wal_pages,
+// busy == false) — this is what a live report of the WAL file matching the
+// main db file's own size turned out to be: checkpointing was working
+// exactly as designed, PASSIVE mode just never promised to shrink the file.
+// Still takes s.mu — the checkpoint itself briefly holds SQLite's own
+// internal WAL lock against this connection's next write either way, so
+// there is no benefit to letting a write race in during it, only a
+// busy-timeout retry to pay for. Called on a fixed interval (RunWALCheckpoint)
+// now that wal_autocheckpoint is disabled at Open (see its comment there) —
+// this is what actually keeps the WAL from growing unbounded, just on a
+// schedule this process controls instead of one SQLite's internal page-count
+// trigger picked. Logs at info when a checkpoint does real work
+// (checkpointed > 0) so the interval and WAL growth rate can be
+// sanity-checked from operator logs without extra tooling; silent when there
+// is nothing to do, which is the common case between busy stretches.
 func (s *Store) WALCheckpoint() error {
 	s.lockTimed("WALCheckpoint")
 	defer s.mu.Unlock()
 	var busy, log, checkpointed int
-	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(PASSIVE)`).
+	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).
 		Scan(&busy, &log, &checkpointed); err != nil {
 		return err
 	}

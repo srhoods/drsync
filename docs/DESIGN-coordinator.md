@@ -242,9 +242,18 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   write volume, not random contention, and a restart resets it because SQLite
   performs a full checkpoint on clean shutdown. `store.RunWALCheckpoint`, started
   from `main.go` on a 5-minute interval, replaces the disabled trigger with an
-  explicit `PRAGMA wal_checkpoint(PASSIVE)` this process schedules itself, so the WAL
+  explicit `PRAGMA wal_checkpoint(TRUNCATE)` this process schedules itself, so the WAL
   still gets bounded — just predictably, instead of at whatever moment a write
-  happens to cross SQLite's own page-count threshold.
+  happens to cross SQLite's own page-count threshold. TRUNCATE, not PASSIVE: both
+  fully copy WAL content back to the main db file without blocking readers or writers
+  (a reader holding an old snapshot just makes either mode checkpoint less than the
+  full WAL that cycle — `busy` comes back nonzero, nothing more), but PASSIVE never
+  shrinks the WAL *file* on disk, only its content — once the file grows to its peak
+  size under load it stays there indefinitely even though every checkpoint since has
+  fully succeeded. TRUNCATE additionally reclaims the file itself down to empty. Found
+  live: the WAL file matching the main db file's own size despite `RunWALCheckpoint`
+  running every 5 minutes without error — checkpointing was working exactly as
+  designed, PASSIVE just never promised to shrink the file.
 - **Indexing discipline for high-write tables:** every predicate a hot-path query
   filters or joins on needs an index that actually serves it — not just "an index
   exists on the table." A single-writer store makes this load-bearing in a way a
