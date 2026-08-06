@@ -1458,6 +1458,38 @@ func TestSplitIdempotency(t *testing.T) {
 	}
 }
 
+// TestRecordSplitMissingParentIsIdempotent covers the case a live incident
+// surfaced: an agent's outbox can replay a SHARD_SPLIT for a parent that has
+// since been reaped (or whose job was dropped) across a reconnect. Before
+// this fix RecordSplit's "SELECT pass_id FROM shards" returned sql.ErrNoRows
+// and the error propagated all the way to dispatch(), which tore the session
+// down — and since the outbox replays the same frame on every subsequent
+// reconnect, the agent never made it past this split, spamming "dispatch
+// failed" and "coordinator sent protocol error" forever. The fix: treat a
+// missing parent as "already processed" (nil, nil) rather than fatal.
+func TestRecordSplitMissingParentIsIdempotent(t *testing.T) {
+	s := openTest(t)
+	_, _, shardID := seed(t, s)
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the parent shard having been reaped: delete its row directly
+	// (mirrors what the DONE-shard reaper does) without a matching splits row.
+	if _, err := s.db.Exec(`DELETE FROM shards WHERE id = ?`, shardID); err != nil {
+		t.Fatal(err)
+	}
+
+	subs := []NewShard{{Kind: model.KindDir, RelPath: "a"}}
+	ids, err := s.RecordSplit(shardID, 9, subs, nil, nil, 0)
+	if err != nil {
+		t.Fatalf("RecordSplit on reaped parent returned an error, want nil: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("RecordSplit on reaped parent returned %d ids, want none inserted", len(ids))
+	}
+}
+
 // TestRunningSinceStampedOnEntryToRunning locks down SetJobState's
 // running_since_ms behavior: stamped on the initial READY->RUNNING
 // transition, left untouched across a pause (so a paused job still reports

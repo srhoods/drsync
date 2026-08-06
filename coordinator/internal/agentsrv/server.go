@@ -5,6 +5,7 @@ package agentsrv
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -191,11 +192,23 @@ func (ac *agentConn) send(ft drsyncpb.FrameType, msg proto.Message) error {
 	}
 }
 
+// writeDeadline bounds a single frame write. wire.WriteFrame has no visibility
+// into net.Conn deadlines on its own (it takes a plain io.Writer), so this
+// loop sets one before every write: without it, a peer that has stopped
+// reading but left the TCP connection open (as opposed to closed/reset) lets
+// the write block here indefinitely. That stalls this goroutine, then fills
+// ac.out (outBuffer frames), then blocks ac.send() in the read loop for this
+// same agent — one wedged peer otherwise hangs its own session forever
+// instead of being torn down and allowed to reconnect.
+// var, not const, so a test can shorten it rather than wait out the real value.
+var writeDeadline = 30 * time.Second
+
 func (ac *agentConn) writeLoop() {
 	defer close(ac.done)
 	for {
 		select {
 		case f := <-ac.out:
+			ac.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 			if err := wire.WriteFrame(ac.conn, f.ft, f.msg); err != nil {
 				ac.conn.Close() // unblock the read loop's ReadFrame
 				return
@@ -517,6 +530,15 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 	if len(sp.BigFiles) > 0 {
 		chunkShards, g, err := s.planBigFiles(int64(sp.ParentShardId), sp.BigFiles)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				// Parent shard is gone (reaped, or its job was dropped) — this
+				// split is an outbox replay racing a reconnect, not new work.
+				// RecordSplit below independently reaches the same conclusion
+				// for the plain-subdir/entrylist portion of the split; skip the
+				// big-file fan-out too rather than erroring the whole frame.
+				return ac.send(drsyncpb.FrameType_FRAME_SHARD_SPLIT_ACK,
+					&drsyncpb.ShardSplitAck{ParentShardId: sp.ParentShardId, Seq: sp.Seq})
+			}
 			return err
 		}
 		shards = append(shards, chunkShards...)
@@ -525,6 +547,10 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 
 	sightings, maxGroupScan, err := s.planLinkSightings(int64(sp.ParentShardId), sp.LinkSightings)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ac.send(drsyncpb.FrameType_FRAME_SHARD_SPLIT_ACK,
+				&drsyncpb.ShardSplitAck{ParentShardId: sp.ParentShardId, Seq: sp.Seq})
+		}
 		return err
 	}
 

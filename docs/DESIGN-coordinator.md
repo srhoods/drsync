@@ -202,6 +202,36 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   already drain correctly regardless of timing. The phase itself still only
   transitions once every queued/leased shard drains (unchanged) — this only stops
   *already-finished* shards from sitting around for the rest of the phase.
+- **A reaped parent can still be split-referenced, across a reconnect.** The
+  ordering invariant above (split-before-result) holds *within* one agent
+  session, but not across one: the agent's outbox (agent/src/state.c) is a
+  single durable FIFO for the whole process, spanning reconnects — a
+  `ShardSplit` queued but not yet acked when the control connection drops sits
+  there and gets replayed verbatim once the agent reconnects, frame type and
+  all, with no awareness of what happened to its parent shard in the meantime.
+  If that parent finished and was eagerly reaped during the outage, the
+  replayed split now names a `shards` row that no longer exists.
+  `RecordSplit`'s own idempotency check (`splits` keyed on
+  `(parent_shard_id, seq)`) doesn't save this case either, since the parent's
+  reap is what proves the split was already fully processed — there was never
+  a reason to also keep the `splits` row once the parent shard itself, and
+  everything downstream of it, was gone. Before the fix this surfaced live as
+  a permanent disconnect loop across the fleet: `RecordSplit`'s
+  `SELECT pass_id FROM shards` returned `sql.ErrNoRows`, `dispatch()` treated
+  that as fatal and closed the session, and since the outbox replays the same
+  unacked frame on every subsequent reconnect the agent could never get past
+  it — logged as repeated "dispatch failed: sql: no rows in result set" on the
+  coordinator and "coordinator sent protocol error" on the agent, with
+  queue-to-wire latency climbing as the outbox backed up behind the poison
+  frame. Fixed by treating a missing parent as *already processed* rather than
+  an error: `RecordSplit` returns `(nil, nil)` instead of propagating
+  `sql.ErrNoRows`, and `onShardSplit`'s `planBigFiles`/`planLinkSightings`
+  calls (which resolve the parent's (job, pass) before `RecordSplit` even
+  runs its own check) ACK the split the same way on the identical error rather
+  than failing the frame. There is genuinely nothing left to do for a replay
+  like this: whatever the split would have produced either already ran as
+  part of the parent shard's own completion, or belonged to a job that no
+  longer exists.
 - **QueueSummary reports reaped DONE too:** `ShardStateCounts` (previous bullet) folds
   `passes.shards_reaped` into its DONE total, but `QueueSummary` — the `/api/v1/queue`
   view the console's job progress bars, DONE tiles and queue-state bar all read — did
