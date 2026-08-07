@@ -518,7 +518,7 @@ short-term, but noisy over a long window — safe to remove once this concludes)
   one `dispatch` call exceeds 500ms — direct evidence for or against store-lock
   contention as the cause, independent of Send-Q (which only reflects the
   agent's *send* side, not what the coordinator was doing).
-- Coordinator, `store.Store.lockTimed` (every one of the 30 `s.mu.Lock()` call
+- Coordinator, `store.Store.lockTimed` (every one of the 30+ `s.mu.Lock()` call
   sites in store.go, mechanically replaced with this labeled wrapper):
   `"store: long wait for write lock" caller=... waited_ms=...` whenever
   acquiring the write mutex takes over 200ms — the direct test of the
@@ -527,6 +527,17 @@ short-term, but noisy over a long window — safe to remove once this concludes)
   a `dispatch took unusually long` warning for the active agent, that is
   confirmation: a background job, not another agent, is starving this agent's
   dispatch by holding the process-wide lock.
+  `lockTimed` also returns a release func that logs the hold side:
+  `"store: long write lock hold" caller=... held_ms=...` whenever a single
+  critical section itself runs over 1s. This closes a blind spot the
+  wait-side log alone has: a caller that acquires `mu` instantly never
+  triggers the wait-side warning for *itself*, even if it then sits on the
+  lock for a long time — every other call site pays for that as an
+  unexplained wait with no caller attached. Found live at 10 agents: a batch
+  of unrelated callers all reporting `waited_ms` in the tens of seconds
+  simultaneously, with no wait-side log line accounting for what they were
+  actually waiting on — the hold-side warning is what points directly at the
+  culprit instead of only ever showing its victims.
 
 Reading the logs together for one agent around a requeue event should show which
 mechanism is real: a gap between "heartbeat queued" and "heartbeat sent" points

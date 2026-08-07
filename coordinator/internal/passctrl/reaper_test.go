@@ -37,13 +37,38 @@ func seedDoneShards(t *testing.T, c *Controller, passID int64, kind model.ShardK
 			t.Fatalf("seedDoneShards: stuck with %d of %d %s shards still ungranted", remaining, n, kind)
 		}
 		for _, r := range rows {
-			if err := c.st.CompleteShard(r.ID, r.LeaseID, nil); err != nil {
+			if err := c.st.CompleteShard(r.ID, r.LeaseID, 0, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			remaining--
 		}
 	}
 	return ids
+}
+
+// drainReaps synchronously processes every reap advance() enqueued instead of
+// running inline (runReapWorker, started only by Run/Controller.Run — these
+// tests call advance() directly and never start that goroutine). Tests that
+// assert on reap outcomes must call this right after advance(); it is a
+// no-op once the channel is empty, so calling it when advance() enqueued
+// nothing is harmless.
+func drainReaps(t *testing.T, c *Controller) {
+	t.Helper()
+	for {
+		select {
+		case req := <-c.reapCh:
+			if req.registry {
+				c.doReapLinkRegistry(req.job, req.pass)
+			} else {
+				c.doReapPhase(req.job, req.pass, req.kinds)
+			}
+			c.reapInflightMu.Lock()
+			delete(c.reapInflight, reapKey{req.pass.ID, req.registry})
+			c.reapInflightMu.Unlock()
+		default:
+			return
+		}
+	}
 }
 
 // shardGone reports whether a shard's row has been deleted (ShardMeta reads
@@ -124,6 +149,7 @@ spec:
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -151,6 +177,7 @@ func TestAdvanceReapsDirfixOnLinkfixTransition(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +203,7 @@ func TestAdvanceReapsLinkfixOnVerifyTransition(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -202,6 +230,7 @@ func TestAdvanceReapsVerifyOnPassComplete(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +255,7 @@ func TestAdvanceReapsDeleteOnJobComplete(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	if st := jobState(t, c, job.ID); st != model.JobCompleted {
 		t.Fatalf("job state = %s, want COMPLETED", st)
 	}
@@ -264,6 +294,7 @@ func TestAdvanceEagerlyReapsScanningWhilePhaseStillDraining(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +329,7 @@ func TestAdvanceDoesNotEagerlyReapOutsideScanning(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	pass, err = c.st.PassByNo(job.ID, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -326,7 +358,75 @@ func TestReapPhaseIncrementsMetric(t *testing.T) {
 	if err := c.advance(job); err != nil {
 		t.Fatal(err)
 	}
+	drainReaps(t, c)
 	if got := testutil.ToFloat64(met.ShardsReaped); got != 12 {
 		t.Fatalf("ShardsReaped = %v, want 12", got)
+	}
+}
+
+// TestAdvanceDoesNotBlockOnReap is the live-incident regression: reaping used
+// to run inline inside advance() (doReapPhase's loop, up to reapPhaseBudget =
+// 30s, re-acquiring store.mu on every batch with no yield between them) —
+// which meant one job's reap could hold up every other running job's
+// advance() call for the rest of that tick, and contend with every
+// connected agent's heartbeat/dispatch call the whole time (docs/
+// DESIGN-agent.md §3.4 investigation: "long wait for write lock" storms,
+// agents missing lease TTL in unison). Proves advance() now only enqueues:
+// its own DONE shards are still present (undrained) immediately after
+// advance() returns, and only disappear once the request is actually worked.
+func TestAdvanceDoesNotBlockOnReap(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassDirfix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneDirfix := seedDoneShards(t, c, pass.ID, model.KindDirfix, 30)
+
+	if err := c.advance(job); err != nil {
+		t.Fatal(err)
+	}
+	// No drainReaps here: advance() must have returned without doing the
+	// reap itself, so every DONE shard is still exactly where it was.
+	assertNoneGone(t, c, "DIRFIX's DONE shards immediately after advance() returns (reap deferred)", doneDirfix)
+
+	select {
+	case req := <-c.reapCh:
+		if req.pass.ID != pass.ID {
+			t.Fatalf("queued reap request pass id = %d, want %d", req.pass.ID, pass.ID)
+		}
+	default:
+		t.Fatal("advance() did not enqueue a reap request for the drained DIRFIX phase")
+	}
+}
+
+// TestAdvanceDedupsReapRequests: the SCANNING eager reap re-enqueues every
+// tick while counts[ShardDone] > 0 (advance's own gate). Without dedup, a
+// worker slower than the tick interval would accumulate one queued request
+// per tick for the same pass; reapInflight must instead collapse repeat
+// advance() calls for a pass with a reap already queued/in-flight into a
+// single entry.
+func TestAdvanceDedupsReapRequests(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedDoneShards(t, c, pass.ID, model.KindDir, 5)
+	// One shard still queued: SCANNING keeps re-entering the eager-reap gate
+	// (counts[ShardDone] > 0) on every advance() call without transitioning.
+	if _, err := c.st.InsertShards(pass.ID, 0,
+		[]store.NewShard{{Kind: model.KindDir}}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 5; i++ {
+		if err := c.advance(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(c.reapCh); got != 1 {
+		t.Fatalf("reapCh has %d queued requests after 5 advance() calls, want 1 (deduped)", got)
 	}
 }

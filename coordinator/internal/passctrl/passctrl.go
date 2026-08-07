@@ -75,7 +75,43 @@ type Controller struct {
 	// notifier's configured rollup window are batched here instead of each
 	// firing their own email, then flushed together once the window elapses.
 	parkedRollup map[string]*parkedRollupState
+
+	// reapCh feeds runReapWorker — see its doc comment for why reaping runs on
+	// its own goroutine instead of inline in advance().
+	reapCh chan reapRequest
+	// reapInflight dedups reapCh: a pass already queued or being worked is not
+	// queued again, so a busy eager-SCANNING-reap pass firing every tick while
+	// counts[ShardDone] > 0 (advance's own gate, unchanged) cannot pile up
+	// redundant requests behind a worker that has not caught up yet.
+	reapInflightMu sync.Mutex
+	reapInflight   map[reapKey]bool
 }
+
+// reapKey identifies one (pass, reap-kind-set) unit of dedup for reapInflight.
+// registry is true for a reapLinkRegistry request, false for reapPhase — the
+// two touch disjoint tables, so a pass can have one of each in flight without
+// colliding on this key.
+type reapKey struct {
+	passID   int64
+	registry bool
+}
+
+// reapRequest is one deferred reap, enqueued by advance() and drained by
+// runReapWorker.
+type reapRequest struct {
+	job      *store.Job
+	pass     *store.Pass
+	kinds    []model.ShardKind
+	registry bool // true: reapLinkRegistry(job, pass); false: reapPhase(job, pass, kinds...)
+}
+
+// reapChanBuffer bounds reapCh. Generous: with reapInflight deduping repeat
+// requests for the same pass, the only way this fills is many distinct passes
+// all reaching a reap point faster than the worker drains them, which is far
+// beyond any fleet this coordinator targets — sized so a send never blocks
+// advance() in practice, with enqueueReap's non-blocking select as the actual
+// guarantee.
+const reapChanBuffer = 256
 
 type parkedRollupState struct {
 	lastSentAt time.Time
@@ -92,7 +128,8 @@ func (c *Controller) jobTerminal(jobID int64) {
 
 func New(st *store.Store, journalRoot string) *Controller {
 	return &Controller{st: st, journalRoot: journalRoot,
-		parkedAlerted: map[int64]bool{}, parkedRollup: map[string]*parkedRollupState{}}
+		parkedAlerted: map[int64]bool{}, parkedRollup: map[string]*parkedRollupState{},
+		reapCh: make(chan reapRequest, reapChanBuffer), reapInflight: map[reapKey]bool{}}
 }
 
 // SetNotifier wires an email sender for pass/job completion notifications. A
@@ -205,8 +242,10 @@ func (c *Controller) seedPass(jobID int64, passNo int) error {
 	return nil
 }
 
-// Run ticks the lifecycle until ctx is done.
+// Run ticks the lifecycle until ctx is done, alongside the dedicated reap
+// worker (see runReapWorker) that drains reapCh.
 func (c *Controller) Run(ctx context.Context, every time.Duration) {
+	go c.runReapWorker(ctx)
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -396,7 +435,7 @@ func (c *Controller) advance(job *store.Job) error {
 	// reap. reapPhase's own batching/budget/shards_reaped accounting applies
 	// unchanged; this is the same call, just gated differently.
 	if pass.State == model.PassScanning && counts[model.ShardDone] > 0 {
-		c.reapPhase(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
+		c.enqueueReap(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
 	}
 	inFlight := counts[model.ShardQueued] + counts[model.ShardLeased]
 	if inFlight > 0 {
@@ -454,7 +493,7 @@ func (c *Controller) advance(job *store.Job) error {
 		// remainder the eager pass hasn't caught up to yet (e.g. this tick is
 		// the one where inFlight first hits zero) still gets cleared before the
 		// phase transition completes, rather than carrying over into DIRFIX.
-		c.reapPhase(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
+		c.enqueueReap(job, pass, model.KindProbe, model.KindDir, model.KindEntryList, model.KindChunk)
 		return nil
 	case model.PassDirfix:
 		// Seed LINKFIX before flipping the phase (same reason as every other
@@ -470,14 +509,14 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassLinkfix); err != nil {
 			return err
 		}
-		c.reapPhase(job, pass, model.KindDirfix)
+		c.enqueueReap(job, pass, model.KindDirfix)
 		// seedLinkfix (above) is the only reader of link_groups/link_members
 		// anywhere in the coordinator, and it has now run for this pass — the
 		// registry rows it consumed are permanently settled (see
 		// store.ReapLinkRegistry's comment for why no later split/sighting
 		// traffic for this pass can still arrive). Safe to reap now, not
 		// deferred to job purge.
-		c.reapLinkRegistry(job, pass)
+		c.enqueueReapLinkRegistry(job, pass)
 		return nil
 	case model.PassLinkfix:
 		n, err := c.seedVerify(job, pass)
@@ -489,7 +528,7 @@ func (c *Controller) advance(job *store.Job) error {
 		if err := c.st.SetPassState(pass.ID, model.PassVerify); err != nil {
 			return err
 		}
-		c.reapPhase(job, pass, model.KindLinkfix)
+		c.enqueueReap(job, pass, model.KindLinkfix)
 		return nil
 	case model.PassVerify:
 		// DELETE phase only on explicit operator trigger (D5); default skips.
@@ -499,7 +538,7 @@ func (c *Controller) advance(job *store.Job) error {
 			return err
 		}
 		c.recordJournalTypeCounts(job, pass)
-		c.reapPhase(job, pass, model.KindVerify)
+		c.enqueueReap(job, pass, model.KindVerify)
 		jobDone, converged, err := c.decideNextPass(job, pass)
 		if err != nil {
 			return err
@@ -516,7 +555,7 @@ func (c *Controller) advance(job *store.Job) error {
 			return err
 		}
 		c.recordJournalTypeCounts(job, pass)
-		c.reapPhase(job, pass, model.KindDelete)
+		c.enqueueReap(job, pass, model.KindDelete)
 		// A delete pass never auto-seeds another pass: back to COMPLETED,
 		// further passes are explicit operator triggers.
 		if err := c.st.SetJobState(job.ID, model.JobCompleted); err != nil {
@@ -544,12 +583,88 @@ func (c *Controller) advance(job *store.Job) error {
 // 30s at ReapBatchSize keeps that a rare, not routine, outcome.
 const reapPhaseBudget = 30 * time.Second
 
-// reapPhase deletes the now-fully-drained phase's DONE shards, looping
+// runReapWorker drains reapCh on its own goroutine, one request at a time,
+// until ctx is done. Reaping used to run inline inside advance() — but a
+// single busy pass's reap loop (ReapDoneShards/ReapLinkRegistry batches,
+// back-to-back with no yield between them) can legitimately run for the
+// whole reapPhaseBudget, and every batch independently takes store.mu. Inline
+// on the tick goroutine, that meant one job's reap could hold up advance()
+// for every *other* running job for up to 30 seconds solid (tick() loops jobs
+// serially), while simultaneously re-acquiring store.mu in a tight loop the
+// entire time — directly competing with every connected agent's
+// heartbeat/dispatch call on every single acquisition. A live fleet showed
+// this as "long wait for write lock" storms and agents missing their lease
+// TTL in unison. Moving the actual work here means advance() only ever
+// enqueues (non-blocking, deduped by reapInflight) and returns immediately;
+// tick() keeps moving through the job list, and the reap itself still takes
+// store.mu the same way — one goroutine at a time now, instead of contending
+// with itself across jobs — but never blocks unrelated coordinator work
+// upstream of it.
+func (c *Controller) runReapWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req := <-c.reapCh:
+			if req.registry {
+				c.doReapLinkRegistry(req.job, req.pass)
+			} else {
+				c.doReapPhase(req.job, req.pass, req.kinds)
+			}
+			c.reapInflightMu.Lock()
+			delete(c.reapInflight, reapKey{req.pass.ID, req.registry})
+			c.reapInflightMu.Unlock()
+		}
+	}
+}
+
+// enqueueReap defers a reapPhase call to runReapWorker. Best-effort and
+// non-blocking by design: advance() must never stall on this, and a reap
+// that doesn't get enqueued this tick (channel full, or one already
+// in-flight/queued for this pass) is picked up the next time advance() calls
+// this for the same still-eligible pass — the eager-SCANNING-reap call site
+// does exactly that every 2s tick already; the others are one-shot per phase
+// transition but leave any remainder for the next pass's reap at worst.
+func (c *Controller) enqueueReap(job *store.Job, pass *store.Pass, kinds ...model.ShardKind) {
+	c.enqueue(reapRequest{job: job, pass: pass, kinds: kinds})
+}
+
+// enqueueReapLinkRegistry defers a reapLinkRegistry call to runReapWorker.
+// See enqueueReap.
+func (c *Controller) enqueueReapLinkRegistry(job *store.Job, pass *store.Pass) {
+	c.enqueue(reapRequest{job: job, pass: pass, registry: true})
+}
+
+func (c *Controller) enqueue(req reapRequest) {
+	key := reapKey{req.pass.ID, req.registry}
+	c.reapInflightMu.Lock()
+	if c.reapInflight[key] {
+		c.reapInflightMu.Unlock()
+		return
+	}
+	c.reapInflight[key] = true
+	c.reapInflightMu.Unlock()
+
+	select {
+	case c.reapCh <- req:
+	default:
+		// Channel full: extremely unlikely at reapChanBuffer (see its comment),
+		// but this must never block advance(). Clear the inflight mark so a
+		// later tick's request for this same pass is not dropped forever.
+		c.reapInflightMu.Lock()
+		delete(c.reapInflight, key)
+		c.reapInflightMu.Unlock()
+		slog.Warn("reap request dropped: worker queue full", "job", req.job.Name,
+			"pass", req.pass.PassNo, "registry", req.registry)
+	}
+}
+
+// doReapPhase deletes the now-fully-drained phase's DONE shards, looping
 // store.ReapDoneShards batches until the phase's backlog is exhausted or
 // reapPhaseBudget elapses. Best-effort: a reap failure must not stop the
-// phase transition that already committed above it — logging and moving on
-// costs disk, not correctness.
-func (c *Controller) reapPhase(job *store.Job, pass *store.Pass, kinds ...model.ShardKind) {
+// phase transition that already committed before this was enqueued. Runs
+// only on runReapWorker's goroutine — see enqueueReap.
+func (c *Controller) doReapPhase(job *store.Job, pass *store.Pass, kinds []model.ShardKind) {
 	deadline := time.Now().Add(reapPhaseBudget)
 	var total int64
 	for time.Now().Before(deadline) {
@@ -573,16 +688,18 @@ func (c *Controller) reapPhase(job *store.Job, pass *store.Pass, kinds ...model.
 	}
 }
 
-// reapLinkRegistry deletes a pass's now-fully-consumed link_groups/
+// doReapLinkRegistry deletes a pass's now-fully-consumed link_groups/
 // link_members rows, looping store.ReapLinkRegistry batches until the
 // backlog is exhausted or reapPhaseBudget elapses (same budget, same
-// reasoning as reapPhase — this call site is likewise only ever reached once
-// per pass, at the DIRFIX->LINKFIX transition, so a remainder left behind by
-// hitting the budget on a truly enormous registry is picked up in full next
-// time, which for this call site means "not until the job is purged"; rare
-// at LinkRegistryReapBatchSize). Best-effort: a reap failure must not stop
-// the phase transition that already committed above it.
-func (c *Controller) reapLinkRegistry(job *store.Job, pass *store.Pass) {
+// reasoning as doReapPhase — this call site is likewise only ever enqueued
+// once per pass, at the DIRFIX->LINKFIX transition, so a remainder left
+// behind by hitting the budget on a truly enormous registry is picked up in
+// full next time, which for this call site means "not until the job is
+// purged"; rare at LinkRegistryReapBatchSize). Best-effort: a reap failure
+// must not stop the phase transition that already committed before this was
+// enqueued. Runs only on runReapWorker's goroutine — see
+// enqueueReapLinkRegistry.
+func (c *Controller) doReapLinkRegistry(job *store.Job, pass *store.Pass) {
 	deadline := time.Now().Add(reapPhaseBudget)
 	var total int64
 	for time.Now().Before(deadline) {

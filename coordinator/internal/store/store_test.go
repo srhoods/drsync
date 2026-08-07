@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"drsync/coordinator/internal/model"
+	drsyncpb "drsync/proto/gen/drsyncpb"
 )
 
 // TestConcurrentReadsDuringWrites exercises the read pool: monitoring reads run
@@ -139,7 +142,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lease child: %v %v", rows, err)
 	}
-	if err := s.CompleteShard(rows[0].ID, rows[0].LeaseID, nil); err != nil {
+	if err := s.CompleteShard(rows[0].ID, rows[0].LeaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	assertCountsConsistent(t, s, "after complete child (1 DONE)")
@@ -811,7 +814,7 @@ func TestRenewLeasesByIDMatchedCount(t *testing.T) {
 	// Once the shard completes (state != LEASED), the same lease id no longer
 	// matches — this is the "not a bug, the shard just finished" case the
 	// agentsrv warning comment documents, not a data-loss signal on its own.
-	if err := s.CompleteShard(shardID, leaseID, nil); err != nil {
+	if err := s.CompleteShard(shardID, leaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	matched, err = s.RenewLeasesByID("agent-a", []int64{leaseID}, time.Hour)
@@ -903,10 +906,10 @@ func TestLeaseLifecycle(t *testing.T) {
 	}
 
 	// Wrong lease id must be rejected.
-	if err := s.CompleteShard(shardID, lease+1, nil); err != ErrLeaseMismatch {
+	if err := s.CompleteShard(shardID, lease+1, 0, nil, nil); err != ErrLeaseMismatch {
 		t.Fatalf("stale lease accepted: %v", err)
 	}
-	if err := s.CompleteShard(shardID, lease, nil); err != nil {
+	if err := s.CompleteShard(shardID, lease, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, _ := s.ShardStateCounts(passID)
@@ -1458,6 +1461,120 @@ func TestSplitIdempotency(t *testing.T) {
 	}
 }
 
+// TestRecordSplitPreChecksDoNotBlockOnWriteConnection is the live-incident
+// regression: RecordSplit's idempotency lookup (SELECT ... FROM splits) and
+// parent-pass lookup (SELECT pass_id FROM shards) used to run on s.db (the
+// single write connection, MaxOpenConns=1) while already holding s.mu — so a
+// busy split (recordLinkSightingsTx is 5 statements per sighting, all inside
+// the same locked transaction) held the write lock for the full
+// lookup-then-decide sequence, not just the final insert, serializing every
+// agent's heartbeat/dispatch behind it (docs/DESIGN-agent.md §3.4
+// investigation: "long wait for write lock" fired thousands of times with
+// RecordSplit as a top offender).
+//
+// Both pre-checks now run on s.rdb before s.mu is ever taken. Proved here by
+// holding s.db's one connection busy in an open, uncommitted transaction from
+// this test (MaxOpenConns=1, so a second caller of s.db would genuinely
+// block waiting for that same connection) and confirming RecordSplit's
+// idempotent-hit path still returns promptly — it cannot be touching s.db at
+// all until account for the final insert, which this test never reaches.
+func TestRecordSplitPreChecksDoNotBlockOnWriteConnection(t *testing.T) {
+	s := openTest(t)
+	_, _, shardID := seed(t, s)
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	subs := []NewShard{{Kind: model.KindDir, RelPath: "a"}}
+	if _, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the sole write connection busy in an open transaction — anything
+	// that still needs s.db (not s.rdb) blocks here until it's released.
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`UPDATE agents SET last_heartbeat = 0 WHERE id = 'nobody'`); err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	done := make(chan error, 1)
+	go func() {
+		// Retransmit of the split recorded above: hits the idempotency-check
+		// fast path and must return without ever touching s.db.
+		_, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecordSplit's idempotency pre-check blocked on the write connection; " +
+			"it must run on s.rdb before s.mu/s.db are touched")
+	}
+}
+
+// TestCompleteShardMergesCounterUpdateAtomically: CompleteShard used to be two
+// separate calls from the caller — CompleteShard(shard state), then
+// AccumulatePassCounters — which meant two s.mu acquisitions for the single
+// highest-volume event in the coordinator (one per successful ShardResult
+// frame from every agent; live logs showed shardTransition:DONE and
+// AccumulatePassCounters firing in an almost 1:1, back-to-back pattern).
+// Merged into one transaction under one lock. Proves the merge is genuinely
+// atomic, not just "called from the same function": a rejected transition
+// (stale lease) must leave the pass counters completely untouched, and an
+// accepted one must apply both in the same call.
+func TestCompleteShardMergesCounterUpdateAtomically(t *testing.T) {
+	s := openTest(t)
+	jobID, passID, shardID := seed(t, s)
+	rows, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("lease: rows=%v err=%v", rows, err)
+	}
+	lease := rows[0].LeaseID
+	counters := &drsyncpb.ShardCounters{FilesCopied: 7, BytesCopied: 4096}
+
+	// Stale lease: the transition is rejected, so the counters it carried must
+	// not be applied either — if they were, that would mean the counters
+	// update ran as a separate, unguarded step rather than inside the same
+	// transaction as the (failed) state check.
+	if err := s.CompleteShard(shardID, lease+1, passID, nil, counters); err != ErrLeaseMismatch {
+		t.Fatalf("stale lease = %v, want ErrLeaseMismatch", err)
+	}
+	pass, err := s.LatestPass(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass.FilesCopied != 0 || pass.BytesCopied != 0 {
+		t.Fatalf("counters applied despite ErrLeaseMismatch: files=%d bytes=%d, want 0/0",
+			pass.FilesCopied, pass.BytesCopied)
+	}
+
+	// Genuine completion: both the shard state and the counters land together.
+	if err := s.CompleteShard(shardID, lease, passID, nil, counters); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[model.ShardDone] != 1 {
+		t.Fatalf("shard counts = %+v, want 1 DONE", counts)
+	}
+	pass, err = s.LatestPass(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass.FilesCopied != 7 || pass.BytesCopied != 4096 {
+		t.Fatalf("pass counters = files=%d bytes=%d, want 7/4096", pass.FilesCopied, pass.BytesCopied)
+	}
+}
+
 // TestRecordSplitMissingParentIsIdempotent covers the case a live incident
 // surfaced: an agent's outbox can replay a SHARD_SPLIT for a parent that has
 // since been reaped (or whose job was dropped) across a reconnect. Before
@@ -1595,6 +1712,60 @@ func TestReleaseShardRequeuesWithoutPenalty(t *testing.T) {
 	}
 	if rows[0].Attempt != 2 {
 		t.Errorf("attempt after release+regrant = %d, want 2 (release must not penalise)", rows[0].Attempt)
+	}
+}
+
+// TestTouchAgentsBatchesTimestamps: TouchAgents replaced a per-heartbeat
+// TouchAgent call (store.mu on every single heartbeat frame from every
+// connected agent — a top contributor to the live "long wait for write lock"
+// contention storm, docs/DESIGN-agent.md §3.4) with one batched write. Pins
+// that a multi-agent batch actually persists every agent's own timestamp
+// correctly (not just the last one written, and not cross-contaminated
+// between agents), and that an unknown agent id in the batch (already
+// disconnected/removed between the flusher's snapshot and its write) does not
+// fail the rest of the batch.
+func TestTouchAgentsBatchesTimestamps(t *testing.T) {
+	s := openTest(t)
+	for _, id := range []string{"agent-a", "agent-b", "agent-c"} {
+		if err := s.UpsertAgent(id, id+".host", "v1", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := s.TouchAgents([]AgentHeartbeatStamp{
+		{AgentID: "agent-a", AtMs: 1000},
+		{AgentID: "agent-b", AtMs: 2000},
+		{AgentID: "unknown-agent", AtMs: 3000}, // no matching row: must not fail the batch
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	agents, err := s.ListAgents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, a := range agents {
+		got[a.ID] = a.LastHeartbeat
+	}
+	if got["agent-a"] != 1000 {
+		t.Errorf("agent-a last_heartbeat = %d, want 1000", got["agent-a"])
+	}
+	if got["agent-b"] != 2000 {
+		t.Errorf("agent-b last_heartbeat = %d, want 2000", got["agent-b"])
+	}
+	if got["agent-c"] == 1000 || got["agent-c"] == 2000 {
+		t.Errorf("agent-c last_heartbeat = %d, cross-contaminated from another agent's stamp", got["agent-c"])
+	}
+}
+
+// TestTouchAgentsEmptyBatchIsNoop: the flusher calls this every interval
+// regardless of whether any agent is connected — an empty batch must be a
+// cheap no-op, not an error or a wasted lock acquisition.
+func TestTouchAgentsEmptyBatchIsNoop(t *testing.T) {
+	s := openTest(t)
+	if err := s.TouchAgents(nil); err != nil {
+		t.Fatalf("TouchAgents(nil) = %v, want nil", err)
 	}
 }
 
@@ -2107,7 +2278,7 @@ func TestShardKindsPresent(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("lease: rows=%v err=%v", rows, err)
 	}
-	if err := s.CompleteShard(shardID, rows[0].LeaseID, nil); err != nil {
+	if err := s.CompleteShard(shardID, rows[0].LeaseID, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	kinds, err = s.ShardKindsPresent(passID)
@@ -2270,5 +2441,38 @@ func TestRunWALCheckpointStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("RunWALCheckpoint did not stop after context cancellation")
+	}
+}
+
+// TestLockTimedLogsHoldTime is the counterpart to the wait-side warning: a
+// caller that acquires mu instantly (so the wait-side log never fires for it)
+// can still sit on it doing real work for a long time, and every other call
+// site pays for that as an unexplained wait with no caller attached. Found
+// live: a batch of unrelated callers all reporting >50s waited_ms
+// simultaneously, with nothing in the log accounting for what they were
+// actually waiting on. This pins that lockTimed's release func logs the hold
+// side too, tagged with the same caller label, so the next occurrence points
+// straight at the culprit instead of just its victims.
+func TestLockTimedLogsHoldTime(t *testing.T) {
+	origThreshold := lockHoldWarnThreshold
+	lockHoldWarnThreshold = 20 * time.Millisecond
+	t.Cleanup(func() { lockHoldWarnThreshold = origThreshold })
+
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	s := openTest(t)
+	release := s.lockTimed("TestCaller")
+	time.Sleep(50 * time.Millisecond) // exceed the shortened threshold
+	release()
+
+	out := buf.String()
+	if !strings.Contains(out, "long write lock hold") {
+		t.Fatalf("no hold-time warning logged; output:\n%s", out)
+	}
+	if !strings.Contains(out, "caller=TestCaller") {
+		t.Fatalf("hold-time warning missing caller label; output:\n%s", out)
 	}
 }
