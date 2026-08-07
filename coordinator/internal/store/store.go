@@ -78,19 +78,41 @@ type Store struct {
 // concludes either way.
 const lockWaitWarnThreshold = 200 * time.Millisecond
 
+// lockHoldWarnThreshold: the wait-side counterpart above only ever showed who
+// was left waiting, never who they were waiting FOR — a caller that acquires
+// mu instantly (so lockTimed never logs anything for it) can still sit on it
+// doing real work for a long time, and every other call site pays for that as
+// an unexplained wait with no caller attached. Found live: a batch of
+// unrelated callers all reporting >50s waited_ms simultaneously, with no
+// contention-side log line accounting for what they were actually waiting on
+// — i.e. exactly the hold-side blind spot this closes.
+// var, not const, so a test can shorten it rather than wait out the real value.
+var lockHoldWarnThreshold = 1 * time.Second
+
 // lockTimed acquires mu, logging a warning if the wait was long enough to be
 // a candidate for stalling an agent's dispatch (and therefore its next read,
-// heartbeat included) behind unrelated coordinator-internal work. label
-// identifies the calling method so the log is actionable, not just "some
-// caller waited". Every s.mu.Lock() call site in this package goes through
-// this instead, so contention is visible fleet-wide from one log line rather
-// than needing per-call-site instrumentation at all 30 lock sites.
-func (s *Store) lockTimed(label string) {
+// heartbeat included) behind unrelated coordinator-internal work, and returns
+// a release func that separately logs if THIS call then held the lock long
+// enough to be the cause of somebody else's wait. label identifies the
+// calling method so either log is actionable, not just "some caller waited"
+// or "somebody held the lock a while". Every s.mu.Lock() call site in this
+// package goes through this instead of a bare defer s.mu.Unlock(), so both
+// sides of contention are visible fleet-wide from two log lines rather than
+// needing per-call-site instrumentation at all 30+ lock sites.
+func (s *Store) lockTimed(label string) func() {
 	start := time.Now()
 	s.mu.Lock()
-	if waited := time.Since(start); waited > lockWaitWarnThreshold {
+	acquired := time.Now()
+	if waited := acquired.Sub(start); waited > lockWaitWarnThreshold {
 		slog.Warn("store: long wait for write lock",
 			"caller", label, "waited_ms", waited.Milliseconds())
+	}
+	return func() {
+		s.mu.Unlock()
+		if held := time.Since(acquired); held > lockHoldWarnThreshold {
+			slog.Warn("store: long write lock hold",
+				"caller", label, "held_ms", held.Milliseconds())
+		}
 	}
 }
 
@@ -502,8 +524,7 @@ type Job struct {
 // multi-host assembly of a big file — reads as stray residue to the other's walk
 // of that directory and is unlinked underneath it.
 func (s *Store) DestinationConflict(excludeName, dst string, states ...model.JobState) error {
-	s.lockTimed("DestinationConflict")
-	defer s.mu.Unlock()
+	defer s.lockTimed("DestinationConflict")()
 	return s.destinationConflictLocked(excludeName, dst, states)
 }
 
@@ -546,8 +567,7 @@ func (s *Store) destinationConflictLocked(excludeName, dst string, states []mode
 // same lock as the insert: checking in the caller would let two concurrent
 // submits of overlapping destinations both pass before either row lands.
 func (s *Store) CreateJob(name string, specYAML []byte, dryRun bool, username string) (*Job, error) {
-	s.lockTimed("CreateJob")
-	defer s.mu.Unlock()
+	defer s.lockTimed("CreateJob")()
 	spec, err := model.ParseSpec(specYAML)
 	if err != nil {
 		return nil, err
@@ -696,8 +716,7 @@ func (s *Store) JobSummaries() ([]*JobSummary, error) {
 // timestamp for as long as the job stays RUNNING, so a pause doesn't need its
 // own accounting — only the moment RUNNING was most recently (re)entered.
 func (s *Store) SetJobState(id int64, st model.JobState) error {
-	s.lockTimed("SetJobState")
-	defer s.mu.Unlock()
+	defer s.lockTimed("SetJobState")()
 	var runningSince any
 	if st == model.JobRunning {
 		runningSince = nowMS()
@@ -724,8 +743,7 @@ func TerminalJobState(st string) bool {
 // deleted job's id so the caller can drop its on-disk journal segments.
 // ErrJobActive if not terminal, sql.ErrNoRows if the name is unknown.
 func (s *Store) DeleteJob(name string) (int64, error) {
-	s.lockTimed("DeleteJob")
-	defer s.mu.Unlock()
+	defer s.lockTimed("DeleteJob")()
 
 	var id int64
 	var state string
@@ -805,8 +823,7 @@ func scanPass(row interface{ Scan(...any) error }) (*Pass, error) {
 }
 
 func (s *Store) CreatePass(jobID int64, passNo int, st model.PassState) (*Pass, error) {
-	s.lockTimed("CreatePass")
-	defer s.mu.Unlock()
+	defer s.lockTimed("CreatePass")()
 	res, err := s.db.Exec(
 		`INSERT INTO passes (job_id, pass_no, state, started_at) VALUES (?,?,?,?)`,
 		jobID, passNo, string(st), nowMS())
@@ -861,8 +878,7 @@ func (s *Store) ListPasses(jobID int64) ([]*Pass, error) {
 }
 
 func (s *Store) SetPassState(passID int64, st model.PassState) error {
-	s.lockTimed("SetPassState")
-	defer s.mu.Unlock()
+	defer s.lockTimed("SetPassState")()
 	var fin any
 	if st == model.PassComplete {
 		fin = nowMS()
@@ -883,8 +899,7 @@ func (s *Store) AccumulatePassCounters(passID int64, c *drsyncpb.ShardCounters) 
 	if c == nil {
 		return nil
 	}
-	s.lockTimed("AccumulatePassCounters")
-	defer s.mu.Unlock()
+	defer s.lockTimed("AccumulatePassCounters")()
 	return accumulatePassCountersTx(s.db, passID, c)
 }
 
@@ -929,8 +944,7 @@ func accumulatePassCountersTx(x dbOrTx, passID int64, c *drsyncpb.ShardCounters)
 // completes exactly once) replaces rather than adds, since the source is a
 // full recount, not a delta.
 func (s *Store) SetJournalTypeCounts(passID int64, counts map[string]int64) error {
-	s.lockTimed("SetJournalTypeCounts")
-	defer s.mu.Unlock()
+	defer s.lockTimed("SetJournalTypeCounts")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -1012,8 +1026,7 @@ type ShardRow struct {
 
 // InsertShards queues new shards for a pass (initial seed, phase task batches).
 func (s *Store) InsertShards(passID, parentID int64, shards []NewShard) ([]int64, error) {
-	s.lockTimed("InsertShards")
-	defer s.mu.Unlock()
+	defer s.lockTimed("InsertShards")()
 	return s.insertShardsLocked(passID, parentID, shards)
 }
 
@@ -1228,8 +1241,7 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	// assigned, see ReapDoneShards), and the pass row it names outlives any
 	// one shard for the whole job, so a lock-free read of it above stays valid
 	// here even if the parent shard itself is reaped in between.
-	s.lockTimed("RecordSplit")
-	defer s.mu.Unlock()
+	defer s.lockTimed("RecordSplit")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -1384,8 +1396,7 @@ func (s *Store) MarkLinkMembersQueued(passID int64, members []LinkMemberKey) err
 	if len(members) == 0 {
 		return nil
 	}
-	s.lockTimed("MarkLinkMembersQueued")
-	defer s.mu.Unlock()
+	defer s.lockTimed("MarkLinkMembersQueued")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -1425,8 +1436,7 @@ func (s *Store) ShardMeta(shardID int64) (passID int64, kind model.ShardKind, pa
 // see CompleteShard's doc comment for why (onShardResult's chunk path is the
 // other half of the same highest-volume call site).
 func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string, finalizeShard NewShard, counters *drsyncpb.ShardCounters) (seeded bool, err error) {
-	s.lockTimed("CompleteDataChunk")
-	defer s.mu.Unlock()
+	defer s.lockTimed("CompleteDataChunk")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -1466,8 +1476,7 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 // counters folds the pass-counter accumulation into this same transaction —
 // see CompleteShard's doc comment for why.
 func (s *Store) CompleteFinalizeChunk(shardID, leaseID, passID int64, relPath string, counters *drsyncpb.ShardCounters) error {
-	s.lockTimed("CompleteFinalizeChunk")
-	defer s.mu.Unlock()
+	defer s.lockTimed("CompleteFinalizeChunk")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -1498,8 +1507,7 @@ func (s *Store) CompleteFinalizeChunk(shardID, leaseID, passID int64, relPath st
 // re-diffed next pass. The triggering chunk shard is marked DONE (not retried:
 // re-copying this pass would race the same moving source).
 func (s *Store) AbortChunkGroup(shardID, leaseID, passID int64, relPath string) error {
-	s.lockTimed("AbortChunkGroup")
-	defer s.mu.Unlock()
+	defer s.lockTimed("AbortChunkGroup")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -1547,8 +1555,7 @@ func (s *Store) LeaseShards(agentID string, max int, ttl time.Duration) ([]*Shar
 	if max <= 0 {
 		return nil, nil
 	}
-	s.lockTimed("LeaseShards")
-	defer s.mu.Unlock()
+	defer s.lockTimed("LeaseShards")()
 
 	// Administratively-disabled agents stay connected and finish in-flight
 	// leases (renewed by heartbeat), but are granted no new shards.
@@ -1708,8 +1715,7 @@ func (s *Store) RenewLeasesByID(agentID string, leaseIDs []int64, ttl time.Durat
 	if len(leaseIDs) == 0 {
 		return 0, nil
 	}
-	s.lockTimed("RenewLeasesByID")
-	defer s.mu.Unlock()
+	defer s.lockTimed("RenewLeasesByID")()
 	args := make([]any, 0, len(leaseIDs)+3)
 	args = append(args, time.Now().Add(ttl).UnixMilli(), string(model.ShardLeased), agentID)
 	ph := make([]byte, 0, len(leaseIDs)*2)
@@ -1769,8 +1775,7 @@ func (s *Store) ReapDoneShards(passID int64, kinds []model.ShardKind) (int64, er
 	if len(kinds) == 0 {
 		return 0, nil
 	}
-	s.lockTimed("ReapDoneShards")
-	defer s.mu.Unlock()
+	defer s.lockTimed("ReapDoneShards")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -1863,8 +1868,7 @@ const LinkRegistryReapBatchSize = 20000
 // drain check (there is no live shard state to check: the registry's
 // consumer is a one-shot seed, not an ongoing queue).
 func (s *Store) ReapLinkRegistry(passID int64) (int64, error) {
-	s.lockTimed("ReapLinkRegistry")
-	defer s.mu.Unlock()
+	defer s.lockTimed("ReapLinkRegistry")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
@@ -1898,8 +1902,7 @@ const incrementalVacuumPages = 500
 // Reaper's deletes, this is what turns "reaped rows" into actual disk space
 // given back, rather than freelist bloat the file quietly carries forever.
 func (s *Store) IncrementalVacuum(n int) error {
-	s.lockTimed("IncrementalVacuum")
-	defer s.mu.Unlock()
+	defer s.lockTimed("IncrementalVacuum")()
 	_, err := s.db.Exec(fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, n))
 	return err
 }
@@ -1950,8 +1953,7 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 // sanity-checked from operator logs without extra tooling; silent when there
 // is nothing to do, which is the common case between busy stretches.
 func (s *Store) WALCheckpoint() error {
-	s.lockTimed("WALCheckpoint")
-	defer s.mu.Unlock()
+	defer s.lockTimed("WALCheckpoint")()
 	var busy, log, checkpointed int
 	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).
 		Scan(&busy, &log, &checkpointed); err != nil {
@@ -2010,8 +2012,7 @@ type ExpiredLease struct {
 // see ExpiredLease — captured before the requeue/park UPDATE, since lease_agent
 // does not survive a re-grant.
 func (s *Store) ExpireLeases(now time.Time) ([]ExpiredLease, error) {
-	s.lockTimed("ExpireLeases")
-	defer s.mu.Unlock()
+	defer s.lockTimed("ExpireLeases")()
 	ms := now.UnixMilli()
 
 	tx, err := s.db.Begin()
@@ -2084,8 +2085,7 @@ func execCountTx(tx *sql.Tx, q string, args ...any) (int64, error) {
 // passes counters (RequeueShard/ReleaseShard/ParkShard never accumulate); see
 // its doc comment for why this merge exists.
 func (s *Store) shardTransition(shardID, leaseID int64, to model.ShardState, result []byte, errMsg string, requeue bool, passID int64, counters *drsyncpb.ShardCounters) error {
-	s.lockTimed("shardTransition:" + string(to))
-	defer s.mu.Unlock()
+	defer s.lockTimed("shardTransition:" + string(to))()
 	if counters == nil {
 		q := `UPDATE shards SET state = ?, result = COALESCE(?, result),
 			error = COALESCE(NULLIF(?, ''), error), lease_id = NULL, updated_at = ?
@@ -2356,8 +2356,7 @@ var ErrNotParked = errors.New("shard not found or not parked")
 // the recorded error is cleared. The shard's pass/job must still exist; a
 // completed job's pass will not schedule it until the job runs again.
 func (s *Store) RetryParkedShard(shardID int64) error {
-	s.lockTimed("RetryParkedShard")
-	defer s.mu.Unlock()
+	defer s.lockTimed("RetryParkedShard")()
 	n, err := s.execCount(`UPDATE shards
 		SET state = ?, attempt = 0, lease_id = NULL, lease_agent = NULL,
 		    lease_expiry = NULL, error = NULL, updated_at = ?
@@ -2375,8 +2374,7 @@ func (s *Store) RetryParkedShard(shardID int64) error {
 // RetryParkedByJob requeues every PARKED shard belonging to a job. Returns the
 // number requeued.
 func (s *Store) RetryParkedByJob(jobName string) (int64, error) {
-	s.lockTimed("RetryParkedByJob")
-	defer s.mu.Unlock()
+	defer s.lockTimed("RetryParkedByJob")()
 	return s.execCount(`UPDATE shards
 		SET state = ?, attempt = 0, lease_id = NULL, lease_agent = NULL,
 		    lease_expiry = NULL, error = NULL, updated_at = ?
@@ -2389,8 +2387,7 @@ func (s *Store) RetryParkedByJob(jobName string) (int64, error) {
 // gap it represents. This unblocks a pass that advance() is holding open on
 // parked work.
 func (s *Store) DropParkedShard(shardID int64) error {
-	s.lockTimed("DropParkedShard")
-	defer s.mu.Unlock()
+	defer s.lockTimed("DropParkedShard")()
 	n, err := s.execCount(`DELETE FROM shards WHERE id = ? AND state = ?`,
 		shardID, string(model.ShardParked))
 	if err != nil {
@@ -2405,8 +2402,7 @@ func (s *Store) DropParkedShard(shardID int64) error {
 // DropParkedByJob permanently discards every PARKED shard of a job. Returns the
 // number dropped.
 func (s *Store) DropParkedByJob(jobName string) (int64, error) {
-	s.lockTimed("DropParkedByJob")
-	defer s.mu.Unlock()
+	defer s.lockTimed("DropParkedByJob")()
 	return s.execCount(`DELETE FROM shards
 		WHERE state = ? AND pass_id IN (
 			SELECT p.id FROM passes p JOIN jobs j ON j.id = p.job_id WHERE j.name = ?)`,
@@ -2428,8 +2424,7 @@ type Agent struct {
 }
 
 func (s *Store) UpsertAgent(id, hostname, version string, protoMinor uint32) error {
-	s.lockTimed("UpsertAgent")
-	defer s.mu.Unlock()
+	defer s.lockTimed("UpsertAgent")()
 	now := nowMS()
 	_, err := s.db.Exec(`INSERT INTO agents (id, hostname, version, proto_minor, state, last_heartbeat, registered_at)
 		VALUES (?,?,?,?,?,?,?)
@@ -2441,8 +2436,7 @@ func (s *Store) UpsertAgent(id, hostname, version string, protoMinor uint32) err
 }
 
 func (s *Store) SetAgentState(id, state string) error {
-	s.lockTimed("SetAgentState")
-	defer s.mu.Unlock()
+	defer s.lockTimed("SetAgentState")()
 	_, err := s.db.Exec(`UPDATE agents SET state = ? WHERE id = ?`, state, id)
 	return err
 }
@@ -2451,8 +2445,7 @@ func (s *Store) SetAgentState(id, state string) error {
 // agent stays connected but receives no new shard grants. Returns sql.ErrNoRows
 // if the agent id is unknown.
 func (s *Store) SetAgentEnabled(id string, enabled bool) error {
-	s.lockTimed("SetAgentEnabled")
-	defer s.mu.Unlock()
+	defer s.lockTimed("SetAgentEnabled")()
 	v := 0
 	if enabled {
 		v = 1
@@ -2487,8 +2480,7 @@ func (s *Store) TouchAgents(stamps []AgentHeartbeatStamp) error {
 	if len(stamps) == 0 {
 		return nil
 	}
-	s.lockTimed("TouchAgents")
-	defer s.mu.Unlock()
+	defer s.lockTimed("TouchAgents")()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -2570,8 +2562,7 @@ func (s *Store) SchedulableAgents() ([]string, error) {
 // probing phase; dropping it lets the pass proceed on the agents that did
 // probe. Returns the number pruned.
 func (s *Store) PruneStaleProbes(passID int64) (int64, error) {
-	s.lockTimed("PruneStaleProbes")
-	defer s.mu.Unlock()
+	defer s.lockTimed("PruneStaleProbes")()
 	res, err := s.db.Exec(`DELETE FROM shards
 		WHERE pass_id = ? AND kind = ? AND state IN (?, ?)
 		  AND target_agent IS NOT NULL
@@ -2622,8 +2613,7 @@ func (s *Store) SchedulerCounts() (SchedulerCounts, error) {
 // ---------------------------------------------------------------------------
 
 func (s *Store) JournalCursor(passID int64, agentID string) (uint64, error) {
-	s.lockTimed("JournalCursor")
-	defer s.mu.Unlock()
+	defer s.lockTimed("JournalCursor")()
 	// Scan into int64, not uint64: database/sql's Scan rejects a stored value
 	// with the high bit set the same way Exec rejects a uint64 argument (see
 	// recordLinkSightingsTx). uint64(seq) below is the matching bit-preserving
@@ -2638,8 +2628,7 @@ func (s *Store) JournalCursor(passID int64, agentID string) (uint64, error) {
 }
 
 func (s *Store) SetJournalCursor(passID int64, agentID string, seq uint64) error {
-	s.lockTimed("SetJournalCursor")
-	defer s.mu.Unlock()
+	defer s.lockTimed("SetJournalCursor")()
 	_, err := s.db.Exec(`INSERT INTO journal_cursors (pass_id, agent_id, acked_seq) VALUES (?,?,?)
 		ON CONFLICT(pass_id, agent_id) DO UPDATE SET acked_seq = MAX(acked_seq, excluded.acked_seq)`,
 		passID, agentID, int64(seq))

@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2439,5 +2441,38 @@ func TestRunWALCheckpointStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("RunWALCheckpoint did not stop after context cancellation")
+	}
+}
+
+// TestLockTimedLogsHoldTime is the counterpart to the wait-side warning: a
+// caller that acquires mu instantly (so the wait-side log never fires for it)
+// can still sit on it doing real work for a long time, and every other call
+// site pays for that as an unexplained wait with no caller attached. Found
+// live: a batch of unrelated callers all reporting >50s waited_ms
+// simultaneously, with nothing in the log accounting for what they were
+// actually waiting on. This pins that lockTimed's release func logs the hold
+// side too, tagged with the same caller label, so the next occurrence points
+// straight at the culprit instead of just its victims.
+func TestLockTimedLogsHoldTime(t *testing.T) {
+	origThreshold := lockHoldWarnThreshold
+	lockHoldWarnThreshold = 20 * time.Millisecond
+	t.Cleanup(func() { lockHoldWarnThreshold = origThreshold })
+
+	var buf bytes.Buffer
+	origLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	s := openTest(t)
+	release := s.lockTimed("TestCaller")
+	time.Sleep(50 * time.Millisecond) // exceed the shortened threshold
+	release()
+
+	out := buf.String()
+	if !strings.Contains(out, "long write lock hold") {
+		t.Fatalf("no hold-time warning logged; output:\n%s", out)
+	}
+	if !strings.Contains(out, "caller=TestCaller") {
+		t.Fatalf("hold-time warning missing caller label; output:\n%s", out)
 	}
 }
