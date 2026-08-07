@@ -280,12 +280,12 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   (`SchedulerCounts`'s full scan of `shard_counts`) — accumulation correlated with
   write volume, not random contention, and a restart resets it because SQLite
   performs a full checkpoint on clean shutdown. `store.RunWALCheckpoint`, started
-  from `main.go` on a 5-minute interval, replaces the disabled trigger with an
+  from `main.go` on a 20-second interval, replaces the disabled trigger with an
   explicit `PRAGMA wal_checkpoint(TRUNCATE)` this process schedules itself, so the WAL
   still gets bounded — just predictably, instead of at whatever moment a write
   happens to cross SQLite's own page-count threshold. TRUNCATE, not PASSIVE: both
-  fully copy WAL content back to the main db file without blocking readers or writers
-  (a reader holding an old snapshot just makes either mode checkpoint less than the
+  fully copy WAL content back to the main db file without blocking *readers* (a
+  reader holding an old snapshot just makes either mode checkpoint less than the
   full WAL that cycle — `busy` comes back nonzero, nothing more), but PASSIVE never
   shrinks the WAL *file* on disk, only its content — once the file grows to its peak
   size under load it stays there indefinitely even though every checkpoint since has
@@ -293,6 +293,23 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   live: the WAL file matching the main db file's own size despite `RunWALCheckpoint`
   running every 5 minutes without error — checkpointing was working exactly as
   designed, PASSIVE just never promised to shrink the file.
+  Unlike PASSIVE, though, TRUNCATE genuinely does block *writers*: shrinking the file
+  needs an exclusive lock over the whole WAL, so `WALCheckpoint`'s `s.mu` hold spans
+  that entire copy-back-and-truncate step, not just the query dispatch around it. At
+  a live 10-agent fleet, still on the original 5-minute interval, `lockTimed`'s
+  hold-side logging (§ below) measured a *median* `WALCheckpoint` hold of 33s and a
+  max of 144s — every other write in the coordinator blocked for the whole stretch,
+  the actual mechanism behind a batch of unrelated callers all reporting `waited_ms`
+  in the tens of seconds simultaneously with no single one of them individually
+  slow. Moving the checkpoint off `s.mu` would not remove this cost, only relocate
+  it: TRUNCATE's exclusive WAL lock is SQLite's own constraint and would block any
+  other connection's write attempt regardless of what Go-level mutex wraps the call,
+  trading a blocked goroutine for a `SQLITE_BUSY` retry loop of similar wall-clock
+  cost. The interval is the actual lever — TRUNCATE's cost scales with how much WAL
+  content has accumulated since the last checkpoint, so 20s (down from 5min) trades
+  more frequent, individually cheaper checkpoints for eliminating the large backlog
+  a long interval let build up. Re-measured after this change, not just assumed
+  fixed by the same reasoning that picked 5 minutes originally and turned out wrong.
 - **Indexing discipline for high-write tables:** every predicate a hot-path query
   filters or joins on needs an index that actually serves it — not just "an index
   exists on the table." A single-writer store makes this load-bearing in a way a

@@ -1941,17 +1941,28 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 // busy == false) — this is what a live report of the WAL file matching the
 // main db file's own size turned out to be: checkpointing was working
 // exactly as designed, PASSIVE mode just never promised to shrink the file.
-// Still takes s.mu — the checkpoint itself briefly holds SQLite's own
-// internal WAL lock against this connection's next write either way, so
-// there is no benefit to letting a write race in during it, only a
-// busy-timeout retry to pay for. Called on a fixed interval (RunWALCheckpoint)
-// now that wal_autocheckpoint is disabled at Open (see its comment there) —
-// this is what actually keeps the WAL from growing unbounded, just on a
-// schedule this process controls instead of one SQLite's internal page-count
-// trigger picked. Logs at info when a checkpoint does real work
-// (checkpointed > 0) so the interval and WAL growth rate can be
-// sanity-checked from operator logs without extra tooling; silent when there
-// is nothing to do, which is the common case between busy stretches.
+// Still takes s.mu, and NOT briefly: TRUNCATE needs an exclusive lock over
+// the whole WAL to shrink the file, so this connection's own copy-back work
+// runs under s.mu for as long as that takes — measured live at a 10-agent
+// fleet with the (since shortened) 5-minute interval at a median hold of
+// 33s and a max of 144s (docs/DESIGN-agent.md's lockTimed hold-side logging
+// is what caught this: every other write in the coordinator blocked for the
+// whole stretch, not a rare tail). Moving this off s.mu would not remove the
+// cost, only relocate it — TRUNCATE's exclusive WAL lock blocks any other
+// connection's write attempt regardless of what Go-level mutex wraps this
+// call, trading a blocked goroutine for a SQLITE_BUSY retry loop of similar
+// wall-clock cost. The actual lever is RunWALCheckpoint's interval: shorter
+// means less WAL content has accumulated by the time TRUNCATE runs, so less
+// to copy and a shorter hold — see its call site in main.go for the current
+// value and the reasoning behind it. Called on a fixed interval
+// (RunWALCheckpoint) now that wal_autocheckpoint is disabled at Open (see
+// its comment there) — this is what actually keeps the WAL from growing
+// unbounded, just on a schedule this process controls instead of one
+// SQLite's internal page-count trigger picked. Logs at info when a
+// checkpoint does real work (checkpointed > 0) so the interval and WAL
+// growth rate can be sanity-checked from operator logs without extra
+// tooling; silent when there is nothing to do, which is the common case
+// between busy stretches.
 func (s *Store) WALCheckpoint() error {
 	defer s.lockTimed("WALCheckpoint")()
 	var busy, log, checkpointed int

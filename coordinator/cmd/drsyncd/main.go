@@ -248,10 +248,26 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 	// a schedule this process controls, instead of firing inline on whichever
 	// write happens to cross SQLite's own WAL-page threshold and blocking
 	// s.mu (and therefore every agent's grant/renew/complete call) for
-	// however long that copy takes. 5 minutes: frequent enough that the WAL
-	// never approaches the size where a single checkpoint's own cost becomes
-	// the problem it exists to avoid.
-	go st.RunWALCheckpoint(ctx, 5*time.Minute)
+	// however long that copy takes.
+	//
+	// 20s, not the original 5min: TRUNCATE needs an exclusive lock over the
+	// whole WAL to shrink the file, held under s.mu for the full duration of
+	// copying back whatever has accumulated since the last checkpoint — a
+	// live 10-agent test at the 5-minute interval measured a *median*
+	// WALCheckpoint hold of 33s and a max of 144s, verified via the hold-side
+	// half of store.lockTimed (docs/DESIGN-agent.md's diagnostic log
+	// catalog): every other write in the coordinator blocked for the whole
+	// stretch, not a rare tail. The interval, not TRUNCATE mode itself, was
+	// the actual lever — TRUNCATE's cost scales with how much WAL content has
+	// accumulated since the last checkpoint, so a shorter interval means less
+	// backlog per call and a shorter hold, not a structural fix (moving the
+	// checkpoint off s.mu would trade a blocked goroutine for a SQLITE_BUSY
+	// retry loop of similar wall-clock cost — TRUNCATE's exclusive WAL lock
+	// is a SQLite-level constraint, not an app-level overcaution). Re-measure
+	// after changing this: too aggressive an interval could turn one rare
+	// long stall into many small frequent ones if TRUNCATE has meaningful
+	// fixed overhead independent of backlog size.
+	go st.RunWALCheckpoint(ctx, 20*time.Second)
 	go pc.Run(ctx, 2*time.Second)
 	go poller.Run(ctx, time.Second)
 	// Journal durability: fsync persisted batches, then ack each agent up to its
