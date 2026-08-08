@@ -419,6 +419,99 @@ func TestShardSplitForReapedParentIsAcked(t *testing.T) {
 	a.recv(drsyncpb.FrameType_FRAME_HEARTBEAT_ACK, hbAck)
 }
 
+// TestDeleteRemainderPathsJoinDirRel is the path-joining regression: a
+// ShardSplit.DeleteRemainder's Names are bare basenames (agent readdir
+// entries, agent/src/delete.c flush_delete_split) — onShardSplit must join
+// each one under DirRel before placing it in the split-produced KindDelete
+// shard's DeleteBatch.RelPaths, the same full-relative-path shape
+// seedDeletePass's own DeleteBatch shards use (passctrl.go). Feeding a bare
+// basename straight into DeleteBatch.RelPaths makes the agent try to unlink
+// it at the destination root instead of under the orphan directory — a
+// silent ENOENT, not an error, so the shard reports success while removing
+// nothing. This was caught by local e2e verification (delete_fanout_e2e.sh),
+// not by the delete_groups completion-tracking unit tests, since those drive
+// store.RecordSplit directly with pre-built NewShards and never exercise
+// onShardSplit's own payload construction.
+func TestDeleteRemainderPathsJoinDirRel(t *testing.T) {
+	srv := newTestServer(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go srv.Serve(ln)
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	a := &fakeAgent{t: t, conn: conn}
+
+	a.send(drsyncpb.FrameType_FRAME_HELLO, &drsyncpb.Hello{
+		AgentId: "agent-test", Hostname: "testhost", ProtoMajor: 1, AgentVersion: "0.0.1"})
+	a.recv(drsyncpb.FrameType_FRAME_HELLO_ACK, &drsyncpb.HelloAck{})
+
+	a.send(drsyncpb.FrameType_FRAME_WORK_REQUEST, &drsyncpb.WorkRequest{ShardCredits: 4})
+	grant := &drsyncpb.WorkGrant{}
+	a.recv(drsyncpb.FrameType_FRAME_WORK_GRANT, grant)
+	root := grant.Items[0].GetShard()
+	lease := grant.Items[0].LeaseId
+
+	// A pathological orphan directory streamed out as two DeleteRemainder
+	// batches — the second (final) one carrying TotalChildren, same shape
+	// agent/src/delete.c's stream_delete_split produces.
+	a.send(drsyncpb.FrameType_FRAME_SHARD_SPLIT, &drsyncpb.ShardSplit{
+		ParentShardId: root.ShardId, Seq: 1,
+		DeleteRemainders: []*drsyncpb.ShardSplit_DeleteRemainder{
+			{DirRel: []byte("big-orphan-dir"), Names: [][]byte{[]byte("f1.txt"), []byte("f2.txt")}},
+		},
+	})
+	a.recv(drsyncpb.FrameType_FRAME_SHARD_SPLIT_ACK, &drsyncpb.ShardSplitAck{})
+	a.send(drsyncpb.FrameType_FRAME_SHARD_SPLIT, &drsyncpb.ShardSplit{
+		ParentShardId: root.ShardId, Seq: 2,
+		DeleteRemainders: []*drsyncpb.ShardSplit_DeleteRemainder{
+			{DirRel: []byte("big-orphan-dir"), Names: [][]byte{[]byte("f3.txt")}, TotalChildren: 2},
+		},
+	})
+	a.recv(drsyncpb.FrameType_FRAME_SHARD_SPLIT_ACK, &drsyncpb.ShardSplitAck{})
+
+	// Finish the root shard so its own credits free up, then pull the
+	// split-produced delete shards and inspect their payloads directly.
+	a.send(drsyncpb.FrameType_FRAME_SHARD_RESULT, &drsyncpb.ShardResult{
+		ShardId: root.ShardId, LeaseId: lease, Status: drsyncpb.ResultStatus_RESULT_OK,
+		Counters: &drsyncpb.ShardCounters{},
+	})
+	a.send(drsyncpb.FrameType_FRAME_WORK_REQUEST, &drsyncpb.WorkRequest{ShardCredits: 4})
+	grant2 := &drsyncpb.WorkGrant{}
+	a.recv(drsyncpb.FrameType_FRAME_WORK_GRANT, grant2)
+	if len(grant2.Items) != 2 {
+		t.Fatalf("granted %d delete shards, want 2", len(grant2.Items))
+	}
+
+	var gotPaths []string
+	for _, item := range grant2.Items {
+		batch := item.GetDelete()
+		if batch == nil {
+			t.Fatalf("granted item = %+v, want a delete work item", item)
+		}
+		for _, p := range batch.RelPaths {
+			gotPaths = append(gotPaths, string(p))
+		}
+	}
+	want := map[string]bool{
+		"big-orphan-dir/f1.txt": true, "big-orphan-dir/f2.txt": true, "big-orphan-dir/f3.txt": true,
+	}
+	if len(gotPaths) != len(want) {
+		t.Fatalf("relPaths = %v, want exactly %v", gotPaths, want)
+	}
+	for _, p := range gotPaths {
+		if !want[p] {
+			t.Fatalf("relPaths contains %q (bare basename, not joined under dir_rel) — full set: %v", p, gotPaths)
+		}
+	}
+}
+
 // TestChunkTempNamePassTagged is the "open temp for finalize" regression. A
 // chunk temp lives in the destination directory, with no source counterpart,
 // for the whole multi-host copy — indistinguishable from crash residue to an

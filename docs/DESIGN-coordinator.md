@@ -148,18 +148,51 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   entry-list never does: something has to remove the now-empty directory itself
   once every split-produced child has finished emptying it, and the coordinator
   has no way to know that in advance — the agent streams via `readdir` and only
-  learns the true child-shard count once it hits EOF (the last `DeleteRemainder`
-  batch for a directory carries `total_children`; every earlier batch is 0). A new
-  `delete_groups` table (§3), the delete-pass analogue of `chunk_groups`, tracks
-  `n_total`/`n_done`/`closed` per directory. Because a split-produced child shard's
+  learns EOF once it hits it (the last `DeleteRemainder` batch for a directory
+  carries `total_children`, its own entry count; every earlier batch carries 0,
+  meaning "not yet the last one"). A new `delete_groups` table (§3), the
+  delete-pass analogue of `chunk_groups`, tracks `n_total`/`n_done`/
+  `done_streaming`/`closed` per directory. Because a split-produced child shard's
   own completion is an independent frame from the streaming parent's batches — only
   the parent's *own* `ShardResult` is ordered after every split it shipped
   (protocol §4.2), not the split's own processing relative to its children's — a
   child can complete before the coordinator has even recorded the group's true
   total. `store.CompleteDeleteRemainder` (child completion) and `store.RecordSplit`
-  (the final batch) each independently check "is this group now closeable" —
-  whichever one lands last seeds the one-entry cleanup shard that removes the
-  directory, and `closed` stops the other from ever seeding a second one.
+  (each batch, not just the final one) each independently check "is this group now
+  closeable" — whichever one lands last seeds the one-entry cleanup shard that
+  removes the directory, and `closed` stops the other from ever seeding a second
+  one.
+
+  **Found in local verification, before this ever reached CI:** two bugs, caught
+  by `delete_fanout_e2e.sh` (a unit-test-only check would have missed both — see
+  below).
+  1. `n_total` was first wired directly to `total_children` — the directory's
+     *entry* count (e.g. 300) — while `n_done` counts completed *shards*
+     (batches, e.g. 8 at batch size 40). Comparing the two never converges
+     except by coincidence, so the group sat open forever and the DELETE phase
+     silently "completed" (shard counts drained to zero, nothing was left
+     `QUEUED`/`LEASED`, so `passctrl.advance()` saw no reason to block) with the
+     orphan directory's cleanup shard never seeded. Fixed by making `n_total`
+     count shards (one `RecordSplit` bump per `DeleteRemainder` received,
+     final batch included) and moving the "streaming finished" signal to its
+     own `done_streaming` column, set only when `total_children > 0` lands —
+     closeable is now `done_streaming=1 AND n_done>=n_total`, both sides in the
+     same unit.
+  2. Once that closed correctly, the directory's contents were *still* not
+     removed: `stream_delete_split` (`agent/src/delete.c`) ships bare
+     `readdir` basenames (`f0001.txt`), but `onShardSplit`
+     (`coordinator/internal/agentsrv/server.go`) was passing them straight into
+     `DeleteBatch.RelPaths` — the same field `seedDeletePass` fills with full
+     paths relative to the destination root. A split-produced delete shard
+     then tried to unlink e.g. `f0001.txt` at the destination root, missed
+     (ENOENT, silently treated as "already gone"), and reported success having
+     removed nothing. Fixed by joining each name under `dir_rel` in
+     `onShardSplit` before building the batch. Neither `deletefanout_test.go`
+     (drives `store.RecordSplit`/`CompleteDeleteRemainder` directly with
+     pre-built shards, never touching `onShardSplit`'s own payload
+     construction) nor a code read caught this — it only showed up once a real
+     directory failed to disappear from disk. `TestDeleteRemainderPathsJoinDirRel`
+     (`agentsrv/server_test.go`) now pins the join at the `onShardSplit` level.
 
 ### 2.3 Shard
 
@@ -195,11 +228,15 @@ agents  (id, hostname, state, version, caps BLOB, last_heartbeat,
 chunk_groups (pass_id, rel_path, temp_name, size, mtime_ns,
               n_chunks, n_done, state)               -- large-file cross-fleet assembly;
               -- finalize task seeded (same tx as the last data chunk) at n_done==n_chunks
-delete_groups (pass_id, rel_path, n_total, n_done, closed) -- §2.2 DELETE fan-out; the
-              -- delete-pass analogue of chunk_groups. n_total is 0 until the streaming
-              -- parent's final DeleteRemainder batch sets it (unlike n_chunks, not known
-              -- upfront); cleanup shard seeded once n_done>=n_total, whichever of
-              -- CompleteDeleteRemainder/RecordSplit observes that first (closed dedups)
+delete_groups (pass_id, rel_path, n_total, n_done,          -- §2.2 DELETE fan-out; the
+              done_streaming, closed)                        -- delete-pass analogue of
+              -- chunk_groups. n_total counts split-produced DELETE *shards* (bumped by
+              -- one per DeleteRemainder batch received, NOT total_children's entry
+              -- count — see §2.2's "found in local verification" note for why those
+              -- two must never be compared); done_streaming is set once the final
+              -- (EOF) batch lands. Cleanup shard seeded once done_streaming=1 AND
+              -- n_done>=n_total, whichever of CompleteDeleteRemainder/RecordSplit
+              -- observes that first (closed dedups)
 link_groups  (pass_id, dev, ino, nlink_expected, members_seen,
               anchor_rel_path, anchor_size, anchor_mtime_ns,
               anchor_state, updated_at)              -- D11 hardlink correlation, pass-scoped;

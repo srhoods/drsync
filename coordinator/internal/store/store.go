@@ -285,27 +285,28 @@ CREATE TABLE IF NOT EXISTS chunk_groups (
 
 -- One row per pathological orphan directory being fanned out across DELETE
 -- shards (docs/DESIGN-coordinator.md §2.2 DELETE fan-out) — the delete-pass
--- analogue of chunk_groups above. Unlike a chunk group, n_total is not known
--- when the row is first created: the agent streams the directory via
--- readdir and only learns the true child-shard count once it hits EOF (the
--- last ShardSplit.DeleteRemainder batch for this dir_rel carries
--- total_children; every earlier batch is 0, meaning "not yet known"). A
--- child shard's completion can race ahead of that final batch — the two are
--- independent shards/frames, only the *streaming parent's own* ShardResult
--- is ordered after every split it shipped (protocol §4.2) — so n_done is
--- incremented unconditionally on every child completion, and the "seed a
--- cleanup shard for dir_rel" decision is checked at BOTH the write that sets
--- n_total and the write that increments n_done, whichever lands last.
--- n_total = 0 doubles as "still streaming" and "impossible legitimate total"
--- (a split with zero children is never shipped), so a single comparison
--- (n_total > 0 AND n_done >= n_total) covers "closeable" without a separate
--- state column.
+-- analogue of chunk_groups above. n_total counts split-produced DELETE
+-- *shards* (batches) for dir_rel, one per ShardSplit.DeleteRemainder
+-- received — NOT total_children, which is the directory's *entry* count and
+-- is unrelated in scale (a 300-entry directory at batch size 40 is 8
+-- shards); comparing n_done (also counted in shards) against an entry count
+-- would just never converge except by coincidence. total_children only
+-- serves as the "readdir hit EOF, this was the last batch" signal, recorded
+-- in done_streaming. A child shard's completion can race ahead of that final
+-- batch — the two are independent shards/frames, only the *streaming
+-- parent's own* ShardResult is ordered after every split it shipped
+-- (protocol §4.2) — so n_done is incremented unconditionally on every child
+-- completion, and the "seed a cleanup shard for dir_rel" decision is checked
+-- at BOTH the write that sets done_streaming and the write that increments
+-- n_done, whichever lands last: closeable is (done_streaming=1 AND
+-- n_done >= n_total).
 CREATE TABLE IF NOT EXISTS delete_groups (
-  pass_id  INTEGER NOT NULL,
-  rel_path TEXT NOT NULL,  -- the directory being emptied (dir_rel)
-  n_total  INTEGER NOT NULL DEFAULT 0,
-  n_done   INTEGER NOT NULL DEFAULT 0,
-  closed   INTEGER NOT NULL DEFAULT 0,  -- 1 once the cleanup shard has been seeded (idempotency)
+  pass_id        INTEGER NOT NULL,
+  rel_path       TEXT NOT NULL,  -- the directory being emptied (dir_rel)
+  n_total        INTEGER NOT NULL DEFAULT 0,  -- split-produced DELETE shards seen so far
+  n_done         INTEGER NOT NULL DEFAULT 0,  -- of those, how many have completed
+  done_streaming INTEGER NOT NULL DEFAULT 0,  -- 1 once the final batch (EOF) has landed
+  closed         INTEGER NOT NULL DEFAULT 0,  -- 1 once the cleanup shard has been seeded (idempotency)
   PRIMARY KEY (pass_id, rel_path)
 ) WITHOUT ROWID;
 
@@ -1199,19 +1200,22 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 	return nil
 }
 
-// DeleteGroupTotal is one delete-remainder batch's "this was the last batch
-// for dirRel" signal (ShardSplit.DeleteRemainder.total_children — see its
-// doc comment for why the total is only known on the final streamed batch,
-// not upfront like a chunk group's byte-size-derived n_chunks). cleanupShard
-// is pre-built by the caller (store stays payload-agnostic, same division of
-// labor as CompleteDataChunk's finalizeShard) and only actually inserted if
-// every sibling delete-remainder shard has already reported done by the time
-// this total lands — the same race CompleteDeleteRemainder resolves from the
-// other direction.
+// DeleteGroupTotal records one delete-remainder batch shipped for DirRel —
+// RecordSplit bumps that group's n_total by one per entry, regardless of
+// LastBatch (see delete_groups' doc comment for why n_total counts shards,
+// not ShardSplit.DeleteRemainder.total_children's entry count). LastBatch is
+// set from total_children > 0 — the "readdir hit EOF for dirRel" signal, only
+// known on the final streamed batch, not upfront like a chunk group's
+// byte-size-derived n_chunks. CleanupShard is pre-built by the caller (store
+// stays payload-agnostic, same division of labor as CompleteDataChunk's
+// finalizeShard) and only actually inserted if every sibling delete-remainder
+// shard has already reported done by the time LastBatch lands — the same
+// race CompleteDeleteRemainder resolves from the other direction; it is only
+// read when LastBatch is true.
 type DeleteGroupTotal struct {
-	DirRel        string
-	TotalChildren int
-	CleanupShard  NewShard
+	DirRel       string
+	LastBatch    bool
+	CleanupShard NewShard
 }
 
 // RecordSplit persists a ShardSplit idempotently: retransmits of the same
@@ -1321,14 +1325,25 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 			passID, dt.DirRel); err != nil {
 			return nil, err
 		}
-		var nTotal, nDone, closed int
-		if err := tx.QueryRow(`UPDATE delete_groups SET n_total = ?
-			WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, closed`,
-			dt.TotalChildren, passID, dt.DirRel).Scan(&nTotal, &nDone, &closed); err != nil {
+		// n_total counts shards (one per batch, this one included), never
+		// total_children — see delete_groups' doc comment.
+		var nTotal, nDone, doneStreaming, closed int
+		if dt.LastBatch {
+			err = tx.QueryRow(`UPDATE delete_groups SET n_total = n_total + 1, done_streaming = 1
+				WHERE pass_id = ? AND rel_path = ?
+				RETURNING n_total, n_done, done_streaming, closed`,
+				passID, dt.DirRel).Scan(&nTotal, &nDone, &doneStreaming, &closed)
+		} else {
+			err = tx.QueryRow(`UPDATE delete_groups SET n_total = n_total + 1
+				WHERE pass_id = ? AND rel_path = ?
+				RETURNING n_total, n_done, done_streaming, closed`,
+				passID, dt.DirRel).Scan(&nTotal, &nDone, &doneStreaming, &closed)
+		}
+		if err != nil {
 			return nil, err
 		}
-		if closed != 0 || nDone < nTotal {
-			continue // not every sibling has reported done yet, or already closed
+		if closed != 0 || doneStreaming == 0 || nDone < nTotal {
+			continue // streaming not finished, not every sibling has reported done yet, or already closed
 		}
 		if _, err := insertShardsTx(tx, passID, 0, []NewShard{dt.CleanupShard}); err != nil {
 			return nil, err
@@ -1548,8 +1563,8 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 // CompleteDataChunk. relPath is the directory being emptied (dir_rel), not
 // this shard's own identity; see agentsrv.onShardResult for how a
 // split-produced KindDelete shard is told apart from an ordinary top-level
-// one. When n_done reaches n_total (known only once the streaming parent's
-// final DeleteRemainder batch has landed and set it — see RecordSplit) this
+// one. When n_done reaches n_total AND done_streaming is set (the streaming
+// parent's final DeleteRemainder batch has landed — see RecordSplit) this
 // inserts cleanupShard (built by the caller: a single-entry DeleteBatch for
 // relPath itself, run through the ordinary unmodified delete path — store
 // stays payload-agnostic, same division of labor as CompleteDataChunk's
@@ -1586,14 +1601,14 @@ func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath 
 		passID, relPath); err != nil {
 		return err
 	}
-	var nTotal, nDone, closed int
+	var nTotal, nDone, doneStreaming, closed int
 	if err := tx.QueryRow(`UPDATE delete_groups SET n_done = n_done + 1
-		WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, closed`,
-		passID, relPath).Scan(&nTotal, &nDone, &closed); err != nil {
+		WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, done_streaming, closed`,
+		passID, relPath).Scan(&nTotal, &nDone, &doneStreaming, &closed); err != nil {
 		return err
 	}
-	if closed != 0 || nTotal == 0 || nDone < nTotal {
-		return tx.Commit() // already closed, total not known yet, or siblings outstanding
+	if closed != 0 || doneStreaming == 0 || nDone < nTotal {
+		return tx.Commit() // already closed, streaming not finished yet, or siblings outstanding
 	}
 	if _, err := insertShardsTx(tx, passID, 0, []NewShard{cleanupShard}); err != nil {
 		return err

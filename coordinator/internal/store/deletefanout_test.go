@@ -22,9 +22,8 @@ func cleanupShard(dirRel string) NewShard {
 
 // TestDeleteGroupSeedsCleanupOnceAllChildrenDone is the ordinary case: a
 // directory splits into 3 delete-remainder shards in one ShardSplit (the
-// final one carrying total_children=3), all 3 complete, and the cleanup
-// shard for the directory itself is seeded exactly once, only after the
-// last one.
+// final one carrying LastBatch), all 3 complete, and the cleanup shard for
+// the directory itself is seeded exactly once, only after the last one.
 func TestDeleteGroupSeedsCleanupOnceAllChildrenDone(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)
@@ -36,8 +35,12 @@ func TestDeleteGroupSeedsCleanupOnceAllChildrenDone(t *testing.T) {
 	remainders := []NewShard{
 		deleteRemainderShard(dir), deleteRemainderShard(dir), deleteRemainderShard(dir),
 	}
+	// One DeleteGroupTotal per batch shard (RecordSplit bumps n_total by one
+	// per entry, same units as n_done) — only the last carries LastBatch.
 	ids, err := s.RecordSplit(shardID, 1, remainders, nil, nil, 0, []DeleteGroupTotal{
-		{DirRel: dir, TotalChildren: 3, CleanupShard: cleanupShard(dir)},
+		{DirRel: dir, CleanupShard: cleanupShard(dir)},
+		{DirRel: dir, CleanupShard: cleanupShard(dir)},
+		{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -93,11 +96,13 @@ func TestDeleteGroupSeedsCleanupOnceAllChildrenDone(t *testing.T) {
 // completion is an independent frame from the streaming parent's own
 // ShardSplit batches — only the parent's own ShardResult is ordered after
 // every split it shipped (protocol §4.2), not the split's own processing
-// relative to its children. This drives that race directly: complete the
-// (only) child BEFORE its group's total_children is ever recorded, then
-// record it, and confirms the cleanup shard is still seeded — from the
-// RecordSplit side, since CompleteDeleteRemainder's own check found the
-// total unknown (0) at the time it ran.
+// relative to its children. This drives that race directly: two batches are
+// recorded (n_total reaches 2, only the second carrying LastBatch), the
+// FIRST batch's shard completes before the SECOND (final) batch is ever
+// recorded — CompleteDeleteRemainder's own check finds streaming not yet
+// done and doesn't close the group — then the final batch lands and
+// RecordSplit notices n_done already reached n_total and seeds the cleanup
+// shard itself.
 func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	s := openTest(t)
 	_, passID, shardID := seed(t, s)
@@ -106,9 +111,12 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	}
 
 	const dir = "racing-dir"
-	// First ShardSplit: one remainder batch, NOT the final one (no
-	// DeleteGroupTotal) — total_children is not known yet.
-	ids, err := s.RecordSplit(shardID, 1, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0, nil)
+	// First ShardSplit: one remainder batch, NOT the final one — every batch
+	// (final or not) ships a DeleteRemainder and therefore a DeleteGroupTotal
+	// entry (server.go onShardSplit), so n_total is bumped to 1 here; only
+	// LastBatch (from total_children>0 on the wire) is still unset.
+	ids, err := s.RecordSplit(shardID, 1, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0,
+		[]DeleteGroupTotal{{DirRel: dir, CleanupShard: cleanupShard(dir)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +131,9 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	if len(leased) != 1 {
 		t.Fatalf("leased %d shards, want 1", len(leased))
 	}
-	// The child completes before the coordinator has ever seen total_children.
+	// This first child completes while n_total is still 1 (streaming not
+	// finished) — reaches n_done >= n_total by coincidence, but done_streaming
+	// is still 0, so the group must NOT close yet.
 	if err := s.CompleteDeleteRemainder(leased[0].ID, leased[0].LeaseID, passID, dir, nil,
 		cleanupShard(dir), nil); err != nil {
 		t.Fatal(err)
@@ -133,17 +143,44 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if counts[model.ShardQueued] != 0 {
-		t.Fatalf("queued after the only child completes with total still unknown = %d, want 0",
+		t.Fatalf("queued after the first child completes with streaming unfinished = %d, want 0",
 			counts[model.ShardQueued])
 	}
 
 	// Now the streaming parent's final batch lands (a second ShardSplit,
-	// different seq — the parent is still mid-stream, this is its EOF batch)
-	// with total_children=1: RecordSplit must notice n_done already reached
-	// n_total and seed the cleanup shard itself.
-	if _, err := s.RecordSplit(shardID, 2, nil, nil, nil, 0, []DeleteGroupTotal{
-		{DirRel: dir, TotalChildren: 1, CleanupShard: cleanupShard(dir)},
-	}); err != nil {
+	// different seq — the parent is still mid-stream, this is its EOF batch,
+	// carrying its own remainder shard plus LastBatch): n_total becomes 2,
+	// but only 1 child has completed so far, so RecordSplit itself must not
+	// close the group on this call either.
+	ids2, err := s.RecordSplit(shardID, 2, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0,
+		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids2) != 1 {
+		t.Fatalf("RecordSplit produced %d ids, want 1", len(ids2))
+	}
+	counts, err = s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts[model.ShardQueued] != 1 {
+		t.Fatalf("queued after the final batch lands with 1/2 done = %d, want 1 (only the new remainder, no cleanup yet)",
+			counts[model.ShardQueued])
+	}
+
+	// The second (final) batch's own shard now completes — n_done reaches
+	// n_total (2) AND done_streaming is set, so THIS completion must seed the
+	// cleanup shard.
+	leased2, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leased2) != 1 || leased2[0].ID != ids2[0] {
+		t.Fatalf("lease mismatch: leased=%v ids2=%v", leased2, ids2)
+	}
+	if err := s.CompleteDeleteRemainder(leased2[0].ID, leased2[0].LeaseID, passID, dir, nil,
+		cleanupShard(dir), nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err = s.ShardStateCounts(passID)
@@ -151,7 +188,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if counts[model.ShardQueued] != 1 {
-		t.Fatalf("queued after the final batch resolves the race = %d, want 1 (the cleanup shard)",
+		t.Fatalf("queued after both children done and streaming finished = %d, want 1 (the cleanup shard)",
 			counts[model.ShardQueued])
 	}
 }
@@ -171,7 +208,7 @@ func TestDeleteGroupNeverSeedsCleanupTwice(t *testing.T) {
 
 	const dir = "dup-dir"
 	ids, err := s.RecordSplit(shardID, 1, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0,
-		[]DeleteGroupTotal{{DirRel: dir, TotalChildren: 1, CleanupShard: cleanupShard(dir)}})
+		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +235,7 @@ func TestDeleteGroupNeverSeedsCleanupTwice(t *testing.T) {
 	// replay racing a reconnect, same shape RecordSplit already handles for
 	// every other split kind) must not seed a second cleanup shard.
 	if _, err := s.RecordSplit(shardID, 2, nil, nil, nil, 0,
-		[]DeleteGroupTotal{{DirRel: dir, TotalChildren: 1, CleanupShard: cleanupShard(dir)}}); err != nil {
+		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)}}); err != nil {
 		t.Fatal(err)
 	}
 	counts, err = s.ShardStateCounts(passID)

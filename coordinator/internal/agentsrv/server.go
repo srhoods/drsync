@@ -542,23 +542,36 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 	// kind.
 	var deleteTotals []store.DeleteGroupTotal
 	for _, dr := range sp.DeleteRemainders {
-		payload, err := proto.Marshal(&drsyncpb.DeleteBatch{RelPaths: dr.Names})
+		// dr.Names are bare basenames (agent readdir entries, delete.c
+		// flush_delete_split) — DeleteBatch.RelPaths must be full paths
+		// relative to the destination root (same contract seedDeletePass's
+		// own DeleteBatch shards use), so each name is joined under dir_rel
+		// here before the split-produced shard is built. Without this a
+		// split-produced delete shard tries to unlink a bare basename at the
+		// destination root, silently misses (ENOENT, not an error), and the
+		// pathological directory's contents are never actually removed even
+		// though delete_groups correctly tracks every batch as done.
+		relPaths := make([][]byte, len(dr.Names))
+		for i, name := range dr.Names {
+			relPaths[i] = []byte(string(dr.DirRel) + "/" + string(name))
+		}
+		payload, err := proto.Marshal(&drsyncpb.DeleteBatch{RelPaths: relPaths})
 		if err != nil {
 			return err
 		}
 		shards = append(shards, store.NewShard{
 			Kind: model.KindDelete, RelPath: string(dr.DirRel), Payload: payload})
-		if dr.TotalChildren > 0 {
-			// The last batch streamed for this directory — see
-			// ShardSplit.DeleteRemainder's doc comment and store.RecordSplit's
-			// handling. Pre-build the cleanup shard regardless of whether every
-			// sibling has already reported done; RecordSplit only actually
-			// inserts it once that's true.
-			deleteTotals = append(deleteTotals, store.DeleteGroupTotal{
-				DirRel: string(dr.DirRel), TotalChildren: int(dr.TotalChildren),
-				CleanupShard: deleteCleanupShard(string(dr.DirRel)),
-			})
-		}
+		// One DeleteGroupTotal per batch (not just the final one) — RecordSplit
+		// bumps delete_groups.n_total by one per entry, so it stays in the same
+		// units as n_done (shards, not directory entries — see delete_groups'
+		// doc comment). total_children > 0 only marks LastBatch, the "readdir
+		// hit EOF" signal; the cleanup shard is pre-built regardless of whether
+		// every sibling has already reported done — RecordSplit only actually
+		// inserts it once that's true.
+		deleteTotals = append(deleteTotals, store.DeleteGroupTotal{
+			DirRel: string(dr.DirRel), LastBatch: dr.TotalChildren > 0,
+			CleanupShard: deleteCleanupShard(string(dr.DirRel)),
+		})
 	}
 
 	var groups []store.NewChunkGroup

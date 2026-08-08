@@ -22,6 +22,18 @@ cleanup() {
 }
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# has <pattern> <cmd...> — runs cmd, fails (returns 1) if it errors or its
+# output doesn't contain pattern. out is declared before the assignment on
+# purpose: `local out=$(CMD)` would mask CMD's exit status behind local's own,
+# silently dropping the status check pipefail is meant to give us. Same
+# helper as e2e.sh/hardlink_e2e.sh define locally (not in lib.sh, since not
+# every script needs it).
+has() {
+    local pat=$1 out
+    shift
+    out=$("$@") || return 1
+    grep -q -- "$pat" <<<"$out"
+}
 export DRSYNC_SERVER="$API" DRSYNC_TOKEN=delfanouttok
 
 API_TOKEN_FILE="$WORK/api-token"
@@ -77,7 +89,7 @@ for _ in $(seq 1 60); do
     sleep 0.25
 done
 curl -sf -H "$AUTH" "$API/api/v1/jobs/delfanout" | grep -q '"state":"COMPLETED"' \
-    || { tail -8 "$WORK"/agent.log "$WORK"/coord.log; fail "initial pass did not converge"; }
+    || { tail -n 8 "$WORK"/agent.log "$WORK"/coord.log; fail "initial pass did not converge"; }
 
 # orphandir must be journaled as a single ORPHAN record (never descended
 # during scan, D5) even though it will fan out at delete time.
@@ -108,16 +120,20 @@ print(c.execute("select count(*) from shards where kind='delete'").fetchone()[0]
 PY
 }
 NDEL=0
-STATE=""
+DONE=0
 for _ in $(seq 1 120); do
     n=$(delete_shard_count)
     [[ "${n:-0}" -gt "$NDEL" ]] && NDEL=$n
-    STATE=$(curl -sf -H "$AUTH" "$API/api/v1/jobs/delfanout" | grep -o '"state":"[A-Z]*"' | tail -1)
-    [[ "$STATE" == '"state":"COMPLETED"' ]] && break
+    # The job's own top-level "state" is "COMPLETED" (with the D) — a pass's
+    # own nested "state" is "COMPLETE" (without it), so this must not just
+    # grep for the LAST "state" value in the response (that would pick up
+    # the delete pass's own passView.State instead of the job's).
+    curl -sf -H "$AUTH" "$API/api/v1/jobs/delfanout" | grep -q '"state":"COMPLETED"' \
+        && { DONE=1; break; }
     sleep 0.25
 done
-[[ "$STATE" == '"state":"COMPLETED"' ]] \
-    || { tail -8 "$WORK"/agent.log "$WORK"/coord.log; fail "delete pass did not complete (state=$STATE)"; }
+[[ "$DONE" -eq 1 ]] \
+    || { tail -n 8 "$WORK"/agent.log "$WORK"/coord.log; fail "delete pass did not complete"; }
 
 # 1. fan-out actually happened: more than just the one top-level orphan shard
 #    (the original orphandir path) — split-produced remainder shards, plus the
