@@ -76,6 +76,20 @@ type Controller struct {
 	// firing their own email, then flushed together once the window elapses.
 	parkedRollup map[string]*parkedRollupState
 
+	// parkedAutoRetried tracks pass IDs whose parked backlog has already been
+	// given one automatic retry round (see advance()'s parked-shard gate) —
+	// so a persistently-failing shard that re-parks after the retry blocks
+	// the pass for operator attention as before, instead of looping forever.
+	// Guarded by parkedAlertMu (same lock as the other parked-tracking maps;
+	// a dedicated mutex would only ever be taken alongside it in practice).
+	// In-memory only, same "safe direction to be wrong in" reasoning as
+	// parkedAlerted: a coordinator restart re-attempts one retry round for a
+	// pass that was already retried before the restart — a redundant but
+	// harmless extra attempt, not a correctness issue. Forgotten once a pass
+	// leaves parked-blocked state (advances or the job ends), so a job that
+	// runs again later gets its own fresh retry round.
+	parkedAutoRetried map[int64]bool
+
 	// reapCh feeds runReapWorker — see its doc comment for why reaping runs on
 	// its own goroutine instead of inline in advance().
 	reapCh chan reapRequest
@@ -129,7 +143,8 @@ func (c *Controller) jobTerminal(jobID int64) {
 func New(st *store.Store, journalRoot string) *Controller {
 	return &Controller{st: st, journalRoot: journalRoot,
 		parkedAlerted: map[int64]bool{}, parkedRollup: map[string]*parkedRollupState{},
-		reapCh: make(chan reapRequest, reapChanBuffer), reapInflight: map[reapKey]bool{}}
+		parkedAutoRetried: map[int64]bool{},
+		reapCh:            make(chan reapRequest, reapChanBuffer), reapInflight: map[reapKey]bool{}}
 }
 
 // SetNotifier wires an email sender for pass/job completion notifications. A
@@ -442,6 +457,34 @@ func (c *Controller) advance(job *store.Job) error {
 		return nil // phase still draining
 	}
 	if parked := counts[model.ShardParked]; parked > 0 {
+		// Give the backlog one automatic retry round before blocking for an
+		// operator: a parked shard exhausted MaxShardAttempts (5) grants, but
+		// many park causes are transient at the point they're hit (a mount
+		// blip, a brief NFS hiccup) rather than deterministic — by the time
+		// the rest of the pass has drained (potentially hours later on a
+		// large tree), conditions may well have changed, and RetryParkedByJob
+		// resets the attempt counter, so a retried shard gets the same fresh
+		// 5-attempt budget as any new shard rather than one bonus try. Only
+		// one round: parkedAutoRetried (keyed by pass, not shard — shard IDs
+		// change across the retry) stops this from firing every tick forever
+		// on a genuinely stuck shard, which would just be an infinite retry
+		// loop wearing a different name. If it re-parks after the one round,
+		// fall through to the existing block-and-alert behavior below.
+		c.parkedAlertMu.Lock()
+		alreadyRetried := c.parkedAutoRetried[pass.ID]
+		if !alreadyRetried {
+			c.parkedAutoRetried[pass.ID] = true
+		}
+		c.parkedAlertMu.Unlock()
+		if !alreadyRetried {
+			n, err := c.st.RetryParkedByJob(job.Name)
+			if err != nil {
+				return fmt.Errorf("auto-retry parked shards: %w", err)
+			}
+			slog.Info("auto-retried parked shards at end of pass", "job", job.Name,
+				"pass", pass.PassNo, "retried", n)
+			return nil // re-queued work needs a later tick to grant/drain
+		}
 		// Do not advance past parked work silently; operator resolves via API.
 		slog.Warn("pass blocked on parked shards", "job", job.Name,
 			"pass", pass.PassNo, "parked", parked)

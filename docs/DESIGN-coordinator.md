@@ -91,9 +91,10 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   synced into the underlying rootfs. A missing/misordered mount or a stub on any host is
   thus caught before bulk work runs — not just on whichever agent grabbed the root shard.
   A failed probe parks (like any shard),
-  and the parked-shard guard holds the pass until the operator fixes the mount and
-  retries. Probes pinned to an agent that departs after seeding are pruned so the phase
-  is not stalled. An empty fleet skips probing (nobody to probe or grant work to).
+  and the parked-shard guard holds the pass — after one automatic retry round, see
+  §2.3 — until the operator fixes the mount and retries. Probes pinned to an agent
+  that departs after seeding are pruned so the phase is not stalled. An empty fleet
+  skips probing (nobody to probe or grant work to).
 - `SCANNING` is the long phase: walk, diff, and copy are interleaved *per shard*, so
   data starts moving seconds after pass start; there is no global "scan first" barrier.
 - `DIRFIX` applies directory metadata deepest-first from the journal's dir records
@@ -124,8 +125,8 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
 ```
 QUEUED ──grant──▶ LEASED ──ShardResult ok──▶ DONE
                     │  │
-        lease expiry┘  └─ShardResult(err)──▶ PARKED ──(operator retry / auto after
-                    ▼                                   transient-window)──▶ QUEUED
+        lease expiry┘  └─ShardResult(err)──▶ PARKED ──(operator retry, or one
+                    ▼                          automatic round at pass end)──▶ QUEUED
                  QUEUED (attempt++)
 ```
 
@@ -134,6 +135,26 @@ QUEUED ──grant──▶ LEASED ──ShardResult ok──▶ DONE
   diagnosis breadcrumbs instead of poisoning the fleet forever.
 - Shards created by `ShardSplit` enter `QUEUED` in the same transaction that records
   the split against the parent (ordering invariant, protocol doc §4.2).
+- **One automatic retry round at the end of a phase, then block for the operator.**
+  `advance()`'s parked-shard guard (§2.2) used to hold every phase transition open
+  indefinitely the instant any shard parked — correct, but on a long-running pass a
+  job could sit for hours waiting on a park caused by something transient at the
+  moment it happened (a mount blip, a brief NFS hiccup), not a shard that will fail
+  the same way forever. `advance()` now calls `store.RetryParkedByJob` once per pass
+  (`Controller.parkedAutoRetried`, keyed by pass id, in-memory — a coordinator restart
+  re-attempts one round for a pass already retried before the restart, a redundant
+  but harmless extra attempt, same "safe direction to be wrong in" reasoning as
+  `parkedAlerted` below) before falling back to the original block-and-alert
+  behavior. `RetryParkedByJob` resets `attempt` to 0, so a retried shard gets the
+  same fresh 5-attempt budget as any new shard, not one bonus try. Deliberately
+  bounded to exactly one round: an unbounded auto-retry on a genuinely stuck shard
+  (a real permissions problem, a permanently unreachable mount) would just be an
+  infinite retry loop wearing a different name, and would silently mask a job that
+  actually needs operator attention. `checkParkedShards`' alerting (`passctrl.go`,
+  the tick-driven parked-shard email digest) composes with this unchanged — a shard
+  that leaves and re-enters PARKED state naturally clears and re-sets its
+  `parkedAlerted` entry, so the operator is still alerted, just once the automatic
+  round has already been given a chance to make the alert unnecessary.
 
 ## 3. Schema (SQLite)
 

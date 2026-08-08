@@ -184,6 +184,33 @@ test("a closely-spaced poll does not blank the fleet's rates", async () => {
   assert.ok(/Mbps|Gbps|Kbps|MiB|GiB|KiB/.test(fleet), "fleet throughput column blanked");
 });
 
+test("aggregate timeline toggles between throughput and scan rate", async () => {
+  // Default view is throughput: the scan-rate tab is present but inactive.
+  const bwTab = c.$('#tl-mode button[data-tl="bw"]');
+  const scanTab = c.$('#tl-mode button[data-tl="scan"]');
+  assert.ok(bwTab.classList.contains("on"), "throughput tab not selected by default");
+  assert.ok(!scanTab.classList.contains("on"), "scan-rate tab selected before being clicked");
+  assert.match(c.text("#tl-title"), /throughput/i);
+
+  const bwNow = c.text("#tl-now");
+  assert.notEqual(bwNow, "–", "timeline never populated in throughput mode");
+
+  scanTab.click();
+  await c.tick(50);
+
+  assert.ok(scanTab.classList.contains("on"), "scan-rate tab did not activate on click");
+  assert.ok(!bwTab.classList.contains("on"), "throughput tab still marked active after switching");
+  assert.match(c.text("#tl-title"), /scan rate/i);
+  const scanNow = c.text("#tl-now");
+  assert.notEqual(scanNow, "–", "timeline blanked after switching to scan rate");
+
+  // Switching back restores the throughput reading, proving the two
+  // histories are genuinely independent series, not one relabeled.
+  bwTab.click();
+  await c.tick(50);
+  assert.equal(c.text("#tl-now"), bwNow, "throughput reading changed after switching back");
+});
+
 // --------------------------------------------------------------------------
 // Per-agent in-flight work
 // --------------------------------------------------------------------------
