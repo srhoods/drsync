@@ -1957,18 +1957,19 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 // hold 33s -> 4.6s) but scaled sublinearly — a 15x shorter interval only
 // bought a 7x shorter hold, which means TRUNCATE has real fixed overhead
 // (the file-truncate step plus its fsync) that does not shrink just because
-// less WAL content has accumulated. checkpointRunPassive (called every tick)
-// is the fix for that floor: PASSIVE copies WAL content back to the main db
-// file the same as TRUNCATE does, without needing TRUNCATE's exclusive
-// file-shrinking lock, so it holds s.mu only as long as the copy itself
-// takes — cheap and frequent. TRUNCATE (this method, still what
-// WALCheckpoint calls directly) then runs far less often
-// (walCheckpointTruncateEvery ticks), and by the time it does, the
-// intervening PASSIVE calls have already drained most of the WAL content, so
-// there is less left for TRUNCATE to redo and its own hold should be
-// shorter still — not just called less often, but each call doing less work.
-// See its call site in main.go for the current interval/ratio and the
-// reasoning behind them. Called on a fixed schedule (RunWALCheckpoint) now
+// less WAL content has accumulated. checkpointRunPassive (called on its own,
+// independent cadence, see RunWALCheckpoint) is the fix for that floor:
+// PASSIVE copies WAL content back to the main db file the same as TRUNCATE
+// does, without needing TRUNCATE's exclusive file-shrinking lock, so it
+// holds s.mu only as long as the copy itself takes — cheap and frequent.
+// TRUNCATE (this method, still what WALCheckpoint calls directly) then runs
+// far less often, and by the time it does, the intervening PASSIVE calls
+// have already drained most of the WAL content, so there is less left for
+// TRUNCATE to redo and its own hold should be shorter still — not just
+// called less often, but each call doing less work. See RunWALCheckpoint's
+// doc comment and its call site in main.go for the current cadences and the
+// reasoning behind them (including why the two run on independent tickers
+// rather than one coupled ratio). Called on a fixed schedule now
 // that wal_autocheckpoint is disabled at Open (see its comment there) — this
 // is what actually keeps the WAL from growing unbounded, just on a schedule
 // this process controls instead of one SQLite's internal page-count trigger
@@ -2001,37 +2002,45 @@ func (s *Store) walCheckpoint(mode, label string) error {
 	return nil
 }
 
-// walCheckpointTruncateEvery: RunWALCheckpoint runs PASSIVE on every tick and
-// promotes to TRUNCATE (which actually shrinks the WAL file on disk, see
-// WALCheckpoint's doc comment) once every this-many ticks.
-const walCheckpointTruncateEvery = 10
-
 // RunWALCheckpoint periodically checkpoints the WAL until ctx is done: a
-// cheap PASSIVE checkpoint every tick to keep WAL content continuously
-// drained, escalating to the more expensive TRUNCATE only every
-// walCheckpointTruncateEvery ticks to reclaim the file's size on disk. See
-// WALCheckpoint's doc comment for the full reasoning (this split is what
-// brought the s.mu hold time down further than shortening the interval alone
-// could) and the wal_autocheckpoint(0) comment in Open for why this exists:
-// with SQLite's own auto-checkpoint trigger disabled, nothing else keeps the
-// WAL bounded.
-func (s *Store) RunWALCheckpoint(ctx context.Context, every time.Duration) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-	tick := 0
+// cheap PASSIVE checkpoint every passiveEvery to keep WAL content
+// continuously drained, escalating to the more expensive TRUNCATE every
+// truncateEvery to reclaim the file's size on disk. See WALCheckpoint's doc
+// comment for the full reasoning (this split is what brought the s.mu hold
+// time down further than shortening one shared interval alone could) and the
+// wal_autocheckpoint(0) comment in Open for why this exists: with SQLite's
+// own auto-checkpoint trigger disabled, nothing else keeps the WAL bounded.
+//
+// The two cadences are independent, not one ticker with TRUNCATE riding
+// every Nth PASSIVE tick (an earlier version did that): coupling them meant
+// widening either cadence to fix one moved the other too. That mattered live
+// — a 6-hour, 10-agent test at passiveEvery=20s/truncateEvery=200s (the
+// coupled 1-tick/10-tick version) found PASSIVE's own median hold (3.4s)
+// running *higher* than TRUNCATE's (2.95s), the opposite of what the split
+// was for. At a 20s interval PASSIVE has very little WAL content to copy
+// each call, so its hold time is dominated by fixed per-call overhead (lock
+// dispatch, the PRAGMA itself) rather than actual copy work — running it 9x
+// more often than truncateEvery was paying that fixed cost 9x without
+// letting it amortize over more real work per call, the same floor
+// TRUNCATE's own interval hit before this split existed. Decoupling lets
+// passiveEvery widen (accumulate more real backlog per call, so the fixed
+// cost matters less) independently of whatever truncateEvery is already
+// tuned to.
+func (s *Store) RunWALCheckpoint(ctx context.Context, passiveEvery, truncateEvery time.Duration) {
+	passiveT := time.NewTicker(passiveEvery)
+	defer passiveT.Stop()
+	truncateT := time.NewTicker(truncateEvery)
+	defer truncateT.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			tick++
-			var err error
-			if tick%walCheckpointTruncateEvery == 0 {
-				err = s.WALCheckpoint()
-			} else {
-				err = s.checkpointRunPassive()
+		case <-passiveT.C:
+			if err := s.checkpointRunPassive(); err != nil {
+				slog.Error("wal checkpoint failed", "err", err)
 			}
-			if err != nil {
+		case <-truncateT.C:
+			if err := s.WALCheckpoint(); err != nil {
 				slog.Error("wal checkpoint failed", "err", err)
 			}
 		}

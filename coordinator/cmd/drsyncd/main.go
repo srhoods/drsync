@@ -250,9 +250,10 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 	// s.mu (and therefore every agent's grant/renew/complete call) for
 	// however long that copy takes.
 	//
-	// 20s ticks, TRUNCATE only every walCheckpointTruncateEvery of them (see
-	// RunWALCheckpoint/WALCheckpoint in store.go for the full history): the
-	// original 5-minute, TRUNCATE-only interval measured a live 10-agent
+	// PASSIVE every 60s, TRUNCATE every 200s — independent cadences (see
+	// RunWALCheckpoint in store.go for why they're no longer one ticker with
+	// TRUNCATE riding every Nth PASSIVE tick, and the full history below).
+	// The original 5-minute, TRUNCATE-only interval measured a live 10-agent
 	// median WALCheckpoint hold of 33s (max 144s) — TRUNCATE needs an
 	// exclusive lock over the whole WAL to shrink the file, held under s.mu
 	// for the full copy-back duration, so every other coordinator write
@@ -266,12 +267,22 @@ func run(agentAddr, httpAddr, dataDir, apiTokenFile, tlsCert, tlsKey, tlsCA, smt
 	// content, no exclusive lock needed) with TRUNCATE only periodically
 	// (reclaims file size, but by then PASSIVE has already drained most of
 	// what it would otherwise have to copy) addresses that floor instead of
-	// just calling TRUNCATE more often. Moving checkpointing off s.mu
-	// entirely was considered and rejected: TRUNCATE's exclusive WAL lock is
-	// a SQLite-level constraint, not an app-level overcaution, so that would
-	// only trade a blocked goroutine for a SQLITE_BUSY retry loop of similar
-	// wall-clock cost. Re-measure after changing either number here.
-	go st.RunWALCheckpoint(ctx, 20*time.Second)
+	// just calling TRUNCATE more often — this got TRUNCATE's own median down
+	// to 2.95s (max 8.7s). But a 6-hour, 10-agent test at PASSIVE=20s (one
+	// ticker, TRUNCATE riding every 10th tick) found PASSIVE's own median
+	// hold (3.4s) running *higher* than TRUNCATE's — at 20s there is so
+	// little real WAL content per call that PASSIVE's hold is dominated by
+	// the same fixed per-call overhead that limited TRUNCATE before the
+	// split, just paid 9x as often. Decoupling the two cadences (this call)
+	// lets PASSIVE widen to accumulate more real backlog per call — 60s,
+	// still far more frequent than the original 5-minute baseline — without
+	// having to also widen TRUNCATE's already-working interval to do it.
+	// Moving checkpointing off s.mu entirely was considered and rejected:
+	// TRUNCATE's exclusive WAL lock is a SQLite-level constraint, not an
+	// app-level overcaution, so that would only trade a blocked goroutine for
+	// a SQLITE_BUSY retry loop of similar wall-clock cost. Re-measure after
+	// changing either number here.
+	go st.RunWALCheckpoint(ctx, 60*time.Second, 200*time.Second)
 	go pc.Run(ctx, 2*time.Second)
 	go poller.Run(ctx, time.Second)
 	// Journal durability: fsync persisted batches, then ack each agent up to its
