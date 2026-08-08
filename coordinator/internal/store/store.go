@@ -1990,7 +1990,7 @@ func (s *Store) checkpointRunPassive() error {
 func (s *Store) walCheckpoint(mode, label string) error {
 	defer s.lockTimed(label)()
 	var busy, log, checkpointed int
-	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(` + mode + `)`).
+	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(`+mode+`)`).
 		Scan(&busy, &log, &checkpointed); err != nil {
 		return err
 	}
