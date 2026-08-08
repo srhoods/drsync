@@ -619,13 +619,17 @@
     </section>
 
     <section class="panel">
-      <div class="head"><h2>Aggregate throughput</h2><span class="eyebrow">bytes copied · fleet-wide · 90s</span></div>
+      <div class="head"><h2 id="tl-title">Aggregate throughput</h2><span class="eyebrow" id="tl-eyebrow">bytes copied · fleet-wide · 90s</span>
+        <span class="chips" id="tl-mode" style="margin-left:auto" role="tablist" aria-label="Timeline metric">
+          <button class="chip on" data-tl="bw" role="tab" aria-selected="true">throughput</button>
+          <button class="chip" data-tl="scan" role="tab" aria-selected="false">scan rate</button>
+        </span></div>
       <div class="tl-wrap">
         <div class="tl-top">
           <div class="tl-big"><span id="tl-now">–</span> <span class="u"></span></div>
           <div class="tl-leg"><span><i></i> <span id="tl-leg-u">throughput</span></span><span id="tl-peak">peak –</span></div>
         </div>
-        <canvas id="tl" height="150" aria-label="Aggregate throughput timeline"></canvas>
+        <canvas id="tl" height="150" aria-label="Aggregate timeline"></canvas>
       </div>
     </section>
 
@@ -856,6 +860,15 @@
     let v = bps * 8; const u = ["bps","Kbps","Mbps","Gbps","Tbps"]; let i = 0;
     while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
     return [i === 0 ? String(Math.round(v)) : v.toFixed(v < 10 ? 2 : 1), u[i]];
+  }
+  // scanRate: entries/s → [value, unit] — the same [value, unit] shape as
+  // rate() so drawTL can treat both metrics identically, just with SI counts
+  // (1000-based, matching countFmt) instead of a byte/bit rate.
+  function scanRate(eps) {
+    eps = +eps || 0;
+    const u = ["/s","K/s","M/s","B/s"]; let i = 0;
+    while (eps >= 1000 && i < u.length - 1) { eps /= 1000; i++; }
+    return [i === 0 ? String(Math.round(eps)) : eps.toFixed(eps < 10 ? 2 : 1), u[i]];
   }
   function countFmt(n) {
     n = +n || 0;
@@ -1718,8 +1731,25 @@
       : `<div class="jmeta" style="padding:6px 4px">no parked shards</div>`;
   }
 
-  // ---------- throughput timeline (auto-scaling canvas) ----------
+  // ---------- aggregate timeline (auto-scaling canvas) ----------
+  // "bw" (default) plots bwHist through rate() (throughput, unit-mode aware);
+  // "scan" plots scanHist through scanRate() (entries/s). Same canvas, same
+  // draw routine — just a different history array and formatter, persisted
+  // like unitsMode so a reload keeps the operator's last choice.
+  let tlMode = localStorage.getItem("drsync.tlmode") === "scan" ? "scan" : "bw";
+  function applyTLMode(m) {
+    tlMode = m;
+    document.querySelectorAll("#tl-mode button").forEach(b => { const on = b.dataset.tl === m; b.classList.toggle("on", on); b.setAttribute("aria-selected", on); });
+    $("#tl-title").textContent = m === "scan" ? "Aggregate scan rate" : "Aggregate throughput";
+    $("#tl-eyebrow").textContent = m === "scan" ? "entries scanned · fleet-wide · 90s" : "bytes copied · fleet-wide · 90s";
+    cv.setAttribute("aria-label", m === "scan" ? "Aggregate scan rate timeline" : "Aggregate throughput timeline");
+  }
+  $("#tl-mode").addEventListener("click", e => {
+    const b = e.target.closest("button[data-tl]"); if (!b) return;
+    applyTLMode(b.dataset.tl); localStorage.setItem("drsync.tlmode", tlMode); drawTL();
+  });
   const cv = $("#tl"), ctx = cv.getContext("2d");
+  applyTLMode(tlMode);
   function sizeCanvas() {
     const dpr = Math.min(devicePixelRatio || 1, 2), w = cv.clientWidth, h = 150;
     cv.width = w * dpr; cv.height = h * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1728,14 +1758,16 @@
   const niceTop = v => { if (v <= 0) return 1; const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p;
     return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p * 1.05; };
   function drawTL() {
+    const fmt = tlMode === "scan" ? scanRate : rate;
+    const src = tlMode === "scan" ? scanHist : bwHist;
     const { w, h } = sizeCanvas(); ctx.clearRect(0, 0, w, h);
     const pad = { t:12, r:6, b:16, l:6 }, gw = w - pad.l - pad.r, gh = h - pad.t - pad.b;
-    const data = bwHist.length ? bwHist : [0], n = data.length, hi = niceTop(Math.max(...data, 1));
+    const data = src.length ? src : [0], n = data.length, hi = niceTop(Math.max(...data, 1));
     const x = i => n < 2 ? pad.l + gw : pad.l + i / (n - 1) * gw;
     const y = v => pad.t + (1 - v / hi) * gh;
     ctx.strokeStyle = css("--grid"); ctx.lineWidth = 1; ctx.font = "10px ui-monospace, monospace"; ctx.fillStyle = css("--muted");
     [0, hi / 2, hi].forEach(g => { ctx.beginPath(); ctx.moveTo(pad.l, y(g)); ctx.lineTo(w - pad.r, y(g)); ctx.stroke();
-      const [rv, ru] = rate(g); ctx.fillText(rv + " " + ru, pad.l + 2, y(g) - 3); });
+      const [rv, ru] = fmt(g); ctx.fillText(rv + " " + ru, pad.l + 2, y(g) - 3); });
     const acc = css("--accent"), acc2 = css("--accent-2");
     const grad = ctx.createLinearGradient(0, pad.t, 0, h - pad.b);
     grad.addColorStop(0, hexA(acc, .34)); grad.addColorStop(1, hexA(acc, .02));
@@ -1746,10 +1778,10 @@
     const ex = x(n - 1), ey = y(data[n - 1]);
     ctx.beginPath(); ctx.arc(ex, ey, 6, 0, 7); ctx.fillStyle = hexA(acc2, .22); ctx.fill();
     ctx.beginPath(); ctx.arc(ex, ey, 3.2, 0, 7); ctx.fillStyle = acc2; ctx.fill();
-    const [cvv, cu] = rate(data[n - 1]); $("#tl-now").textContent = cvv;
+    const [cvv, cu] = fmt(data[n - 1]); $("#tl-now").textContent = cvv;
     const uEl = document.querySelector(".tl-big .u"); if (uEl) uEl.textContent = cu;
     $("#tl-leg-u").textContent = cu;
-    const [pv, pu] = rate(Math.max(...data)); $("#tl-peak").textContent = "peak " + pv + " " + pu;
+    const [pv, pu] = fmt(Math.max(...data)); $("#tl-peak").textContent = "peak " + pv + " " + pu;
   }
   function hexA(hex, a) { hex = hex.replace("#", ""); if (hex.length === 3) hex = hex.split("").map(c => c + c).join("");
     const n = parseInt(hex, 16); return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`; }
