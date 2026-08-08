@@ -1941,44 +1941,97 @@ func (s *Store) RunIncrementalVacuum(ctx context.Context, every time.Duration) {
 // busy == false) — this is what a live report of the WAL file matching the
 // main db file's own size turned out to be: checkpointing was working
 // exactly as designed, PASSIVE mode just never promised to shrink the file.
-// Still takes s.mu — the checkpoint itself briefly holds SQLite's own
-// internal WAL lock against this connection's next write either way, so
-// there is no benefit to letting a write race in during it, only a
-// busy-timeout retry to pay for. Called on a fixed interval (RunWALCheckpoint)
-// now that wal_autocheckpoint is disabled at Open (see its comment there) —
-// this is what actually keeps the WAL from growing unbounded, just on a
-// schedule this process controls instead of one SQLite's internal page-count
-// trigger picked. Logs at info when a checkpoint does real work
-// (checkpointed > 0) so the interval and WAL growth rate can be
-// sanity-checked from operator logs without extra tooling; silent when there
-// is nothing to do, which is the common case between busy stretches.
+// Still takes s.mu, and NOT briefly: TRUNCATE needs an exclusive lock over
+// the whole WAL to shrink the file, so this connection's own copy-back work
+// runs under s.mu for as long as that takes — measured live at a 10-agent
+// fleet with the original 5-minute interval at a median hold of 33s and a
+// max of 144s (docs/DESIGN-agent.md's lockTimed hold-side logging is what
+// caught this: every other write in the coordinator blocked for the whole
+// stretch, not a rare tail). Moving this off s.mu would not remove the cost,
+// only relocate it — TRUNCATE's exclusive WAL lock blocks any other
+// connection's write attempt regardless of what Go-level mutex wraps this
+// call, trading a blocked goroutine for a SQLITE_BUSY retry loop of similar
+// wall-clock cost.
+//
+// Shrinking RunWALCheckpoint's interval (5min -> 20s) helped a lot (median
+// hold 33s -> 4.6s) but scaled sublinearly — a 15x shorter interval only
+// bought a 7x shorter hold, which means TRUNCATE has real fixed overhead
+// (the file-truncate step plus its fsync) that does not shrink just because
+// less WAL content has accumulated. checkpointRunPassive (called every tick)
+// is the fix for that floor: PASSIVE copies WAL content back to the main db
+// file the same as TRUNCATE does, without needing TRUNCATE's exclusive
+// file-shrinking lock, so it holds s.mu only as long as the copy itself
+// takes — cheap and frequent. TRUNCATE (this method, still what
+// WALCheckpoint calls directly) then runs far less often
+// (walCheckpointTruncateEvery ticks), and by the time it does, the
+// intervening PASSIVE calls have already drained most of the WAL content, so
+// there is less left for TRUNCATE to redo and its own hold should be
+// shorter still — not just called less often, but each call doing less work.
+// See its call site in main.go for the current interval/ratio and the
+// reasoning behind them. Called on a fixed schedule (RunWALCheckpoint) now
+// that wal_autocheckpoint is disabled at Open (see its comment there) — this
+// is what actually keeps the WAL from growing unbounded, just on a schedule
+// this process controls instead of one SQLite's internal page-count trigger
+// picked. Logs at info when a checkpoint does real work (checkpointed > 0)
+// so the interval and WAL growth rate can be sanity-checked from operator
+// logs without extra tooling; silent when there is nothing to do, which is
+// the common case between busy stretches.
 func (s *Store) WALCheckpoint() error {
-	defer s.lockTimed("WALCheckpoint")()
+	return s.walCheckpoint("TRUNCATE", "WALCheckpoint")
+}
+
+// checkpointRunPassive runs the cheap, non-exclusive checkpoint mode — see
+// WALCheckpoint's doc comment for why RunWALCheckpoint calls this on most
+// ticks and only escalates to TRUNCATE periodically.
+func (s *Store) checkpointRunPassive() error {
+	return s.walCheckpoint("PASSIVE", "WALCheckpointPassive")
+}
+
+func (s *Store) walCheckpoint(mode, label string) error {
+	defer s.lockTimed(label)()
 	var busy, log, checkpointed int
-	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).
+	if err := s.db.QueryRow(`PRAGMA wal_checkpoint(`+mode+`)`).
 		Scan(&busy, &log, &checkpointed); err != nil {
 		return err
 	}
 	if checkpointed > 0 {
-		slog.Info("wal checkpoint", "busy", busy != 0, "wal_pages", log,
+		slog.Info("wal checkpoint", "mode", mode, "busy", busy != 0, "wal_pages", log,
 			"checkpointed_pages", checkpointed)
 	}
 	return nil
 }
 
-// RunWALCheckpoint periodically checkpoints the WAL until ctx is done. See
-// WALCheckpoint and the wal_autocheckpoint(0) comment in Open for why this
-// exists: with SQLite's own auto-checkpoint trigger disabled, nothing else
-// keeps the WAL bounded.
+// walCheckpointTruncateEvery: RunWALCheckpoint runs PASSIVE on every tick and
+// promotes to TRUNCATE (which actually shrinks the WAL file on disk, see
+// WALCheckpoint's doc comment) once every this-many ticks.
+const walCheckpointTruncateEvery = 10
+
+// RunWALCheckpoint periodically checkpoints the WAL until ctx is done: a
+// cheap PASSIVE checkpoint every tick to keep WAL content continuously
+// drained, escalating to the more expensive TRUNCATE only every
+// walCheckpointTruncateEvery ticks to reclaim the file's size on disk. See
+// WALCheckpoint's doc comment for the full reasoning (this split is what
+// brought the s.mu hold time down further than shortening the interval alone
+// could) and the wal_autocheckpoint(0) comment in Open for why this exists:
+// with SQLite's own auto-checkpoint trigger disabled, nothing else keeps the
+// WAL bounded.
 func (s *Store) RunWALCheckpoint(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
+	tick := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := s.WALCheckpoint(); err != nil {
+			tick++
+			var err error
+			if tick%walCheckpointTruncateEvery == 0 {
+				err = s.WALCheckpoint()
+			} else {
+				err = s.checkpointRunPassive()
+			}
+			if err != nil {
 				slog.Error("wal checkpoint failed", "err", err)
 			}
 		}
