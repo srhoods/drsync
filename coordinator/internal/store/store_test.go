@@ -2479,14 +2479,15 @@ func TestCheckpointRunPassiveDoesNotShrinkWALFile(t *testing.T) {
 	}
 }
 
-// TestRunWALCheckpointTruncatesOnlyPeriodically: RunWALCheckpoint must not
-// shrink the WAL file on every tick — only every walCheckpointTruncateEvery
-// of them (see its doc comment for why: TRUNCATE's fixed per-call overhead
-// means calling it as often as the cheap PASSIVE checkpoints would give back
-// most of what shortening the interval bought). Drives exactly
-// walCheckpointTruncateEvery-1 ticks (file must not have shrunk yet) then one
-// more (file must have shrunk by then).
-func TestRunWALCheckpointTruncatesOnlyPeriodically(t *testing.T) {
+// TestRunWALCheckpointTruncatesOnItsOwnCadence: RunWALCheckpoint's
+// PASSIVE and TRUNCATE cadences are independent tickers (not one ticker with
+// TRUNCATE riding every Nth PASSIVE tick — see its doc comment for why that
+// coupling was dropped: widening PASSIVE's interval to fix its fixed-cost
+// problem would have forced widening TRUNCATE's too). This drives
+// RunWALCheckpoint with a short PASSIVE interval and a longer TRUNCATE
+// interval, and asserts the WAL file has NOT shrunk while only PASSIVE ticks
+// have fired, then HAS shrunk once TRUNCATE's own interval has also elapsed.
+func TestRunWALCheckpointTruncatesOnItsOwnCadence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	s, err := Open(path)
 	if err != nil {
@@ -2513,39 +2514,39 @@ func TestRunWALCheckpointTruncatesOnlyPeriodically(t *testing.T) {
 		t.Fatalf("WAL only %d bytes before checkpoint, too small to exercise this", before.Size())
 	}
 
-	// Drive one continuous RunWALCheckpoint (its own tick counter must not be
-	// restarted mid-test, or the Nth-tick assertion below is meaningless).
-	// The interval is generous relative to how long one checkpoint call
-	// actually takes (a few ms for 586 pages, more so for TRUNCATE) so ticks
-	// don't run behind schedule under load — this test previously flaked
-	// under -count=5 and under the full package's -race load at a tighter
-	// interval/margin.
-	const tickInterval = 150 * time.Millisecond
+	// PASSIVE fast enough to fire several times before TRUNCATE's own
+	// interval elapses; both generous relative to how long one checkpoint
+	// call actually takes (a few ms for 586 pages) so ticks don't run behind
+	// schedule under load — an earlier, tighter-margin version of this test
+	// flaked under -count=N and under the full package's -race load.
+	const passiveEvery = 50 * time.Millisecond
+	const truncateEvery = 400 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go s.RunWALCheckpoint(ctx, tickInterval)
+	go s.RunWALCheckpoint(ctx, passiveEvery, truncateEvery)
 
-	// Sample just before the Nth tick would fire: must still be PASSIVE-only.
-	time.Sleep(time.Duration(walCheckpointTruncateEvery-1) * tickInterval)
+	// Sample partway to truncateEvery: several PASSIVE ticks have fired, but
+	// TRUNCATE's own interval has not elapsed yet.
+	time.Sleep(truncateEvery - passiveEvery)
 	mid, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if mid.Size() < before.Size() {
-		t.Fatalf("WAL file already shrunk before tick %d (%d -> %d bytes): "+
-			"TRUNCATE fired too early", walCheckpointTruncateEvery, before.Size(), mid.Size())
+		t.Fatalf("WAL file already shrunk before TRUNCATE's own interval elapsed "+
+			"(%d -> %d bytes)", before.Size(), mid.Size())
 	}
 
-	// Generous margin past the Nth tick, not a tight window right after it.
-	time.Sleep(3 * tickInterval)
+	// Generous margin past truncateEvery, not a tight window right after it.
+	time.Sleep(3 * truncateEvery)
 	cancel()
 	after, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if after.Size() >= mid.Size() {
-		t.Fatalf("WAL file did not shrink by tick %d (%d bytes): "+
-			"TRUNCATE should have fired by now", walCheckpointTruncateEvery, after.Size())
+		t.Fatalf("WAL file did not shrink once TRUNCATE's interval elapsed (%d bytes): "+
+			"TRUNCATE should have fired by now", after.Size())
 	}
 }
 
@@ -2559,7 +2560,7 @@ func TestRunWALCheckpointStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		s.RunWALCheckpoint(ctx, time.Millisecond)
+		s.RunWALCheckpoint(ctx, time.Millisecond, time.Millisecond)
 		close(done)
 	}()
 	cancel()

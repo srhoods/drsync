@@ -319,13 +319,32 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   WAL content back to the main db file, same as TRUNCATE, but needs no exclusive
   file-shrinking lock, so its `s.mu` hold is only as long as the copy itself) and a
   `TRUNCATE` checkpoint (still what `Store.WALCheckpoint` calls directly — existing
-  callers and tests are unaffected) only every `walCheckpointTruncateEvery` (10)
-  ticks, to reclaim the file's size on disk. By the time TRUNCATE runs, the
-  intervening PASSIVE calls have already drained most of what it would otherwise
-  have to copy, so its own hold should be shorter too, not just less frequent —
-  this is the fix for the fixed-cost floor the interval alone couldn't reach.
+  callers and tests are unaffected), to reclaim the file's size on disk. By the time
+  TRUNCATE runs, the intervening PASSIVE calls have already drained most of what it
+  would otherwise have to copy, so its own hold should be shorter too, not just less
+  frequent — this is the fix for the fixed-cost floor the interval alone couldn't
+  reach. And it worked on that axis: TRUNCATE's own median hold dropped further, to
+  2.95s (max 8.7s), in a 6-hour, 10-agent re-test.
+  That same re-test surfaced a second-order effect the first version of the split
+  (one ticker, TRUNCATE riding every 10th PASSIVE tick) hadn't accounted for:
+  PASSIVE's own median hold (3.4s, 377 calls) came back *higher* than TRUNCATE's
+  (2.95s, 41 calls) — backwards from what the split was for, since PASSIVE needs no
+  exclusive lock at all. At a 20s PASSIVE interval there is very little real WAL
+  content to copy each call, so PASSIVE's hold is dominated by the same *fixed*
+  per-call overhead (lock dispatch, the `PRAGMA` itself) that limited TRUNCATE
+  before this split existed — just paid 9x as often as necessary, since the coupled
+  ticker forced PASSIVE's cadence to be exactly `truncateEvery`'s cadence divided by
+  the ratio. `RunWALCheckpoint` now runs PASSIVE and TRUNCATE on two independent
+  tickers (`passiveEvery`, `truncateEvery`) instead of one ticker with a tick-count
+  ratio, specifically so each cadence can be tuned without moving the other: PASSIVE
+  widened to 60s (accumulates more real backlog per call, amortizing its fixed cost
+  better) while TRUNCATE's already-working ~200s cadence is left alone.
   `TestCheckpointRunPassiveDoesNotShrinkWALFile` and
-  `TestRunWALCheckpointTruncatesOnlyPeriodically` pin the split.
+  `TestRunWALCheckpointTruncatesOnItsOwnCadence` pin the split and its independence.
+  The general lesson, consistent with every other `s.mu` finding in this file: two
+  competing costs (call frequency vs. per-call fixed overhead) rarely share one
+  optimal knob, and coupling them to save a line of code cost a real regression that
+  only a live re-measurement caught — re-measure again if either number here moves.
 - **Indexing discipline for high-write tables:** every predicate a hot-path query
   filters or joins on needs an index that actually serves it — not just "an index
   exists on the table." A single-writer store makes this load-bearing in a way a
