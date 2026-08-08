@@ -20,7 +20,7 @@ func TestRecordLinkSightingsFirstIsAnchor(t *testing.T) {
 	sightings := []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/one", Nlink: 2, Size: 4096, MtimeNs: 111},
 	}
-	if _, err := s.RecordSplit(shardID, 1, nil, nil, sightings, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, sightings, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -49,20 +49,20 @@ func TestRecordLinkSightingsHighBitInode(t *testing.T) {
 	first := []NewLinkSighting{
 		{Dev: 1, Ino: hugeIno, RelPath: "a/one", Nlink: 2, Size: 4096, MtimeNs: 111},
 	}
-	if _, err := s.RecordSplit(shardID, 1, nil, nil, first, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, first, 0, nil); err != nil {
 		t.Fatalf("RecordSplit with a high-bit inode: %v", err)
 	}
 	second := []NewLinkSighting{
 		{Dev: 1, Ino: hugeIno, RelPath: "b/two", Nlink: 2, Size: 4096, MtimeNs: 111},
 	}
-	if _, err := s.RecordSplit(shardID, 2, nil, nil, second, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 2, nil, nil, second, 0, nil); err != nil {
 		t.Fatalf("RecordSplit (second sighting) with a high-bit inode: %v", err)
 	}
 	// A second, independent group at the absolute max value.
 	maxGroup := []NewLinkSighting{
 		{Dev: maxIno, Ino: maxIno, RelPath: "c/max", Nlink: 2, Size: 8192, MtimeNs: 222},
 	}
-	if _, err := s.RecordSplit(shardID, 3, nil, nil, maxGroup, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 3, nil, nil, maxGroup, 0, nil); err != nil {
 		t.Fatalf("RecordSplit with dev=ino=MaxUint64: %v", err)
 	}
 
@@ -115,13 +115,13 @@ func TestRecordLinkSightingsSecondIsPendingMember(t *testing.T) {
 	first := []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/one", Nlink: 2, Size: 4096, MtimeNs: 111},
 	}
-	if _, err := s.RecordSplit(shardID, 1, nil, nil, first, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, first, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	second := []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "b/two", Nlink: 2, Size: 4096, MtimeNs: 111},
 	}
-	if _, err := s.RecordSplit(shardID, 2, nil, nil, second, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 2, nil, nil, second, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -151,12 +151,12 @@ func TestRecordLinkSightingsIdempotent(t *testing.T) {
 	sightings := []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/one", Nlink: 2, Size: 4096, MtimeNs: 111},
 	}
-	if _, err := s.RecordSplit(shardID, 1, nil, nil, sightings, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, sightings, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Same (parent, seq): RecordSplit returns the cached result without
 	// re-running recordLinkSightingsTx.
-	if _, err := s.RecordSplit(shardID, 1, nil, nil, sightings, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 1, nil, nil, sightings, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -180,25 +180,25 @@ func TestRecordLinkSightingsMaxGroupScanFallback(t *testing.T) {
 
 	if _, err := s.RecordSplit(shardID, 1, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/one", Nlink: 3, Size: 10, MtimeNs: 1},
-	}, 2); err != nil { // maxGroupScan=2
+	}, 2, nil); err != nil { // maxGroupScan=2
 		t.Fatal(err)
 	}
 	if _, err := s.RecordSplit(shardID, 2, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "b/two", Nlink: 3, Size: 10, MtimeNs: 1},
-	}, 2); err != nil {
+	}, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Third sighting pushes members_seen to 3, over the cap of 2.
 	if _, err := s.RecordSplit(shardID, 3, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "c/three", Nlink: 3, Size: 10, MtimeNs: 1},
-	}, 2); err != nil {
+	}, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Fourth sighting of the SAME already-fallen-back group: must not
 	// increment link_fallback again (it counts groups, not sightings).
 	if _, err := s.RecordSplit(shardID, 4, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "d/four", Nlink: 3, Size: 10, MtimeNs: 1},
-	}, 2); err != nil {
+	}, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,12 +238,12 @@ func TestMarkLinkMembersQueuedIsScopedToPending(t *testing.T) {
 
 	if _, err := s.RecordSplit(shardID, 1, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/one", Nlink: 2, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RecordSplit(shardID, 2, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "b/two", Nlink: 2, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -401,13 +401,13 @@ func TestReapLinkRegistryDeletesBothTables(t *testing.T) {
 	// One group of 3 (anchor + 2 pending members).
 	if _, err := s.RecordSplit(shardID, 1, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/anchor", Nlink: 3, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RecordSplit(shardID, 2, nil, nil, []NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/member1", Nlink: 3, Size: 10, MtimeNs: 1},
 		{Dev: 1, Ino: 100, RelPath: "a/member2", Nlink: 3, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -425,7 +425,7 @@ func TestReapLinkRegistryDeletesBothTables(t *testing.T) {
 	}
 	if _, err := s.RecordSplit(otherShardIDs[0], 1, nil, nil, []NewLinkSighting{
 		{Dev: 2, Ino: 200, RelPath: "b/anchor", Nlink: 1, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 

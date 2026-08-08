@@ -1944,8 +1944,17 @@ type TuningOptions struct {
 	// fanned out. Sets the granularity of that fan-out: a 1.4M-entry directory
 	// becomes ceil(1.4M / entrylist_batch) shards.
 	EntrylistBatch uint32 `protobuf:"varint,6,opt,name=entrylist_batch,json=entrylistBatch,proto3" json:"entrylist_batch,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Delete-pass analogue of dir_split_threshold/entrylist_batch: a directory
+	// being orphan-deleted (agent/src/delete.c) whose own entry count exceeds
+	// delete_split_threshold is streamed out as new DELETE shards instead of
+	// being unlinked depth-first by one agent (docs/DESIGN-coordinator.md §2.2
+	// DELETE fan-out). Kept independently tunable from the entry-list values:
+	// delete work per name is a plain unlink, not a full stat/diff/copy
+	// pipeline, so the shapes that make sense for each can differ.
+	DeleteSplitThreshold uint64 `protobuf:"varint,7,opt,name=delete_split_threshold,json=deleteSplitThreshold,proto3" json:"delete_split_threshold,omitempty"`
+	DeleteSplitBatch     uint32 `protobuf:"varint,8,opt,name=delete_split_batch,json=deleteSplitBatch,proto3" json:"delete_split_batch,omitempty"` // names per split-produced DELETE shard (0 = built-in default)
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *TuningOptions) Reset() {
@@ -2016,6 +2025,20 @@ func (x *TuningOptions) GetOpDeadlineS() uint32 {
 func (x *TuningOptions) GetEntrylistBatch() uint32 {
 	if x != nil {
 		return x.EntrylistBatch
+	}
+	return 0
+}
+
+func (x *TuningOptions) GetDeleteSplitThreshold() uint64 {
+	if x != nil {
+		return x.DeleteSplitThreshold
+	}
+	return 0
+}
+
+func (x *TuningOptions) GetDeleteSplitBatch() uint32 {
+	if x != nil {
+		return x.DeleteSplitBatch
 	}
 	return 0
 }
@@ -3515,15 +3538,16 @@ func (x *WorkGrant) GetOptions() []*JobOptions {
 }
 
 type ShardSplit struct {
-	state         protoimpl.MessageState     `protogen:"open.v1"`
-	ParentShardId uint64                     `protobuf:"varint,1,opt,name=parent_shard_id,json=parentShardId,proto3" json:"parent_shard_id,omitempty"`
-	Seq           uint64                     `protobuf:"varint,2,opt,name=seq,proto3" json:"seq,omitempty"` // per-parent sequence for retransmit dedup
-	Subdirs       []*ShardSplit_NewShard     `protobuf:"bytes,3,rep,name=subdirs,proto3" json:"subdirs,omitempty"`
-	EntryLists    []*ShardSplit_NewEntryList `protobuf:"bytes,4,rep,name=entry_lists,json=entryLists,proto3" json:"entry_lists,omitempty"`
-	BigFiles      []*ShardSplit_BigFile      `protobuf:"bytes,5,rep,name=big_files,json=bigFiles,proto3" json:"big_files,omitempty"`
-	LinkSightings []*ShardSplit_LinkSighting `protobuf:"bytes,6,rep,name=link_sightings,json=linkSightings,proto3" json:"link_sightings,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState        `protogen:"open.v1"`
+	ParentShardId    uint64                        `protobuf:"varint,1,opt,name=parent_shard_id,json=parentShardId,proto3" json:"parent_shard_id,omitempty"`
+	Seq              uint64                        `protobuf:"varint,2,opt,name=seq,proto3" json:"seq,omitempty"` // per-parent sequence for retransmit dedup
+	Subdirs          []*ShardSplit_NewShard        `protobuf:"bytes,3,rep,name=subdirs,proto3" json:"subdirs,omitempty"`
+	EntryLists       []*ShardSplit_NewEntryList    `protobuf:"bytes,4,rep,name=entry_lists,json=entryLists,proto3" json:"entry_lists,omitempty"`
+	BigFiles         []*ShardSplit_BigFile         `protobuf:"bytes,5,rep,name=big_files,json=bigFiles,proto3" json:"big_files,omitempty"`
+	LinkSightings    []*ShardSplit_LinkSighting    `protobuf:"bytes,6,rep,name=link_sightings,json=linkSightings,proto3" json:"link_sightings,omitempty"`
+	DeleteRemainders []*ShardSplit_DeleteRemainder `protobuf:"bytes,7,rep,name=delete_remainders,json=deleteRemainders,proto3" json:"delete_remainders,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ShardSplit) Reset() {
@@ -3594,6 +3618,13 @@ func (x *ShardSplit) GetBigFiles() []*ShardSplit_BigFile {
 func (x *ShardSplit) GetLinkSightings() []*ShardSplit_LinkSighting {
 	if x != nil {
 		return x.LinkSightings
+	}
+	return nil
+}
+
+func (x *ShardSplit) GetDeleteRemainders() []*ShardSplit_DeleteRemainder {
+	if x != nil {
+		return x.DeleteRemainders
 	}
 	return nil
 }
@@ -4802,6 +4833,84 @@ func (x *ShardSplit_LinkSighting) GetMtimeNs() int64 {
 	return 0
 }
 
+// A pathological orphan directory being deleted (agent/src/delete.c's
+// rm_tree, WI_DELETE): once its own entry count exceeds
+// delete_split_threshold, the remaining not-yet-removed entries are
+// streamed out in batches as new DELETE shards instead of being unlinked
+// depth-first by the one agent that found the directory — the delete-pass
+// analogue of NewEntryList above. Unlike NewEntryList there is nothing to
+// diff against a destination: the whole subtree is already condemned
+// (D5), so a batch is just names to remove, deepest-first ordering
+// preserved by construction (every name here is a direct child of dir_rel,
+// never an ancestor of anything else in this same split).
+type ShardSplit_DeleteRemainder struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	DirRel []byte                 `protobuf:"bytes,1,opt,name=dir_rel,json=dirRel,proto3" json:"dir_rel,omitempty"`
+	Names  [][]byte               `protobuf:"bytes,2,rep,name=names,proto3" json:"names,omitempty"`
+	// Total DELETE shards this directory is being split into, set ONLY on
+	// the last DeleteRemainder batch shipped for dir_rel (0 on every earlier
+	// batch — the agent streams via readdir and only knows the true total
+	// once it hits EOF, unlike a chunk group's byte-size-derived n_chunks,
+	// known upfront). The coordinator uses this to size delete_groups'
+	// n_children the one time it sees it, then seeds a cleanup shard for
+	// dir_rel itself once every child DELETE shard reports done — see
+	// store.RecordSplit / CompleteShard's delete_groups handling.
+	TotalChildren uint32 `protobuf:"varint,3,opt,name=total_children,json=totalChildren,proto3" json:"total_children,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ShardSplit_DeleteRemainder) Reset() {
+	*x = ShardSplit_DeleteRemainder{}
+	mi := &file_drsync_proto_msgTypes[51]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ShardSplit_DeleteRemainder) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ShardSplit_DeleteRemainder) ProtoMessage() {}
+
+func (x *ShardSplit_DeleteRemainder) ProtoReflect() protoreflect.Message {
+	mi := &file_drsync_proto_msgTypes[51]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ShardSplit_DeleteRemainder.ProtoReflect.Descriptor instead.
+func (*ShardSplit_DeleteRemainder) Descriptor() ([]byte, []int) {
+	return file_drsync_proto_rawDescGZIP(), []int{35, 4}
+}
+
+func (x *ShardSplit_DeleteRemainder) GetDirRel() []byte {
+	if x != nil {
+		return x.DirRel
+	}
+	return nil
+}
+
+func (x *ShardSplit_DeleteRemainder) GetNames() [][]byte {
+	if x != nil {
+		return x.Names
+	}
+	return nil
+}
+
+func (x *ShardSplit_DeleteRemainder) GetTotalChildren() uint32 {
+	if x != nil {
+		return x.TotalChildren
+	}
+	return 0
+}
+
 var File_drsync_proto protoreflect.FileDescriptor
 
 const file_drsync_proto_rawDesc = "" +
@@ -4959,7 +5068,7 @@ const file_drsync_proto_rawDesc = "" +
 	"\rFSYNC_BATCHED\x10\x02\"d\n" +
 	"\fLimitOptions\x12.\n" +
 	"\x13bandwidth_per_agent\x18\x01 \x01(\x04R\x11bandwidthPerAgent\x12$\n" +
-	"\x0eiops_per_agent\x18\x02 \x01(\x04R\fiopsPerAgent\"\xf4\x01\n" +
+	"\x0eiops_per_agent\x18\x02 \x01(\x04R\fiopsPerAgent\"\xd8\x02\n" +
 	"\rTuningOptions\x12!\n" +
 	"\fshard_budget\x18\x01 \x01(\x04R\vshardBudget\x12.\n" +
 	"\x13dir_split_threshold\x18\x02 \x01(\x04R\x11dirSplitThreshold\x12\x1f\n" +
@@ -4967,7 +5076,9 @@ const file_drsync_proto_rawDesc = "" +
 	"statxBatch\x12\"\n" +
 	"\rmtime_slop_ns\x18\x04 \x01(\x03R\vmtimeSlopNs\x12\"\n" +
 	"\rop_deadline_s\x18\x05 \x01(\rR\vopDeadlineS\x12'\n" +
-	"\x0fentrylist_batch\x18\x06 \x01(\rR\x0eentrylistBatch\"\xff\x03\n" +
+	"\x0fentrylist_batch\x18\x06 \x01(\rR\x0eentrylistBatch\x124\n" +
+	"\x16delete_split_threshold\x18\a \x01(\x04R\x14deleteSplitThreshold\x12,\n" +
+	"\x12delete_split_batch\x18\b \x01(\rR\x10deleteSplitBatch\"\xff\x03\n" +
 	"\n" +
 	"JobOptions\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x19\n" +
@@ -5095,7 +5206,7 @@ const file_drsync_proto_rawDesc = "" +
 	"\x04item\"g\n" +
 	"\tWorkGrant\x12)\n" +
 	"\x05items\x18\x01 \x03(\v2\x13.drsync.v1.WorkItemR\x05items\x12/\n" +
-	"\aoptions\x18\x02 \x03(\v2\x15.drsync.v1.JobOptionsR\aoptions\"\x9c\x05\n" +
+	"\aoptions\x18\x02 \x03(\v2\x15.drsync.v1.JobOptionsR\aoptions\"\xd9\x06\n" +
 	"\n" +
 	"ShardSplit\x12&\n" +
 	"\x0fparent_shard_id\x18\x01 \x01(\x04R\rparentShardId\x12\x10\n" +
@@ -5104,7 +5215,8 @@ const file_drsync_proto_rawDesc = "" +
 	"\ventry_lists\x18\x04 \x03(\v2\".drsync.v1.ShardSplit.NewEntryListR\n" +
 	"entryLists\x12:\n" +
 	"\tbig_files\x18\x05 \x03(\v2\x1d.drsync.v1.ShardSplit.BigFileR\bbigFiles\x12I\n" +
-	"\x0elink_sightings\x18\x06 \x03(\v2\".drsync.v1.ShardSplit.LinkSightingR\rlinkSightings\x1a%\n" +
+	"\x0elink_sightings\x18\x06 \x03(\v2\".drsync.v1.ShardSplit.LinkSightingR\rlinkSightings\x12R\n" +
+	"\x11delete_remainders\x18\a \x03(\v2%.drsync.v1.ShardSplit.DeleteRemainderR\x10deleteRemainders\x1a%\n" +
 	"\bNewShard\x12\x19\n" +
 	"\brel_path\x18\x01 \x01(\fR\arelPath\x1a=\n" +
 	"\fNewEntryList\x12\x17\n" +
@@ -5120,7 +5232,11 @@ const file_drsync_proto_rawDesc = "" +
 	"\brel_path\x18\x03 \x01(\fR\arelPath\x12\x14\n" +
 	"\x05nlink\x18\x04 \x01(\rR\x05nlink\x12\x12\n" +
 	"\x04size\x18\x05 \x01(\x04R\x04size\x12\x19\n" +
-	"\bmtime_ns\x18\x06 \x01(\x03R\amtimeNs\"w\n" +
+	"\bmtime_ns\x18\x06 \x01(\x03R\amtimeNs\x1ag\n" +
+	"\x0fDeleteRemainder\x12\x17\n" +
+	"\adir_rel\x18\x01 \x01(\fR\x06dirRel\x12\x14\n" +
+	"\x05names\x18\x02 \x03(\fR\x05names\x12%\n" +
+	"\x0etotal_children\x18\x03 \x01(\rR\rtotalChildren\"w\n" +
 	"\rShardSplitAck\x12&\n" +
 	"\x0fparent_shard_id\x18\x01 \x01(\x04R\rparentShardId\x12\x10\n" +
 	"\x03seq\x18\x02 \x01(\x04R\x03seq\x12,\n" +
@@ -5276,68 +5392,69 @@ func file_drsync_proto_rawDescGZIP() []byte {
 }
 
 var file_drsync_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_drsync_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
+var file_drsync_proto_msgTypes = make([]protoimpl.MessageInfo, 52)
 var file_drsync_proto_goTypes = []any{
-	(FrameType)(0),                    // 0: drsync.v1.FrameType
-	(EntryType)(0),                    // 1: drsync.v1.EntryType
-	(ResultStatus)(0),                 // 2: drsync.v1.ResultStatus
-	(Control_Command)(0),              // 3: drsync.v1.Control.Command
-	(AclOptions_Untranslatable)(0),    // 4: drsync.v1.AclOptions.Untranslatable
-	(VerifyOptions_OnMismatch)(0),     // 5: drsync.v1.VerifyOptions.OnMismatch
-	(CopyOptions_ServerSideCopy)(0),   // 6: drsync.v1.CopyOptions.ServerSideCopy
-	(CopyOptions_FsyncMode)(0),        // 7: drsync.v1.CopyOptions.FsyncMode
-	(JournalRecord_Type)(0),           // 8: drsync.v1.JournalRecord.Type
-	(*StatInfo)(nil),                  // 9: drsync.v1.StatInfo
-	(*MountCaps)(nil),                 // 10: drsync.v1.MountCaps
-	(*Hello)(nil),                     // 11: drsync.v1.Hello
-	(*HelloAck)(nil),                  // 12: drsync.v1.HelloAck
-	(*MountHealth)(nil),               // 13: drsync.v1.MountHealth
-	(*InflightItem)(nil),              // 14: drsync.v1.InflightItem
-	(*Heartbeat)(nil),                 // 15: drsync.v1.Heartbeat
-	(*HeartbeatAck)(nil),              // 16: drsync.v1.HeartbeatAck
-	(*Control)(nil),                   // 17: drsync.v1.Control
-	(*ProtocolError)(nil),             // 18: drsync.v1.ProtocolError
-	(*FilterRule)(nil),                // 19: drsync.v1.FilterRule
-	(*AclOptions)(nil),                // 20: drsync.v1.AclOptions
-	(*MetadataOptions)(nil),           // 21: drsync.v1.MetadataOptions
-	(*VerifyOptions)(nil),             // 22: drsync.v1.VerifyOptions
-	(*CopyOptions)(nil),               // 23: drsync.v1.CopyOptions
-	(*LimitOptions)(nil),              // 24: drsync.v1.LimitOptions
-	(*TuningOptions)(nil),             // 25: drsync.v1.TuningOptions
-	(*JobOptions)(nil),                // 26: drsync.v1.JobOptions
-	(*WorkRequest)(nil),               // 27: drsync.v1.WorkRequest
-	(*FileGen)(nil),                   // 28: drsync.v1.FileGen
-	(*WalkOverrides)(nil),             // 29: drsync.v1.WalkOverrides
-	(*Shard)(nil),                     // 30: drsync.v1.Shard
-	(*EntryListShard)(nil),            // 31: drsync.v1.EntryListShard
-	(*ChunkTask)(nil),                 // 32: drsync.v1.ChunkTask
-	(*DirMeta)(nil),                   // 33: drsync.v1.DirMeta
-	(*DirFixBatch)(nil),               // 34: drsync.v1.DirFixBatch
-	(*VerifyEntry)(nil),               // 35: drsync.v1.VerifyEntry
-	(*VerifyBatch)(nil),               // 36: drsync.v1.VerifyBatch
-	(*DeleteBatch)(nil),               // 37: drsync.v1.DeleteBatch
-	(*ProbeTask)(nil),                 // 38: drsync.v1.ProbeTask
-	(*LinkTask)(nil),                  // 39: drsync.v1.LinkTask
-	(*LinkEntry)(nil),                 // 40: drsync.v1.LinkEntry
-	(*LinkTaskBatch)(nil),             // 41: drsync.v1.LinkTaskBatch
-	(*WorkItem)(nil),                  // 42: drsync.v1.WorkItem
-	(*WorkGrant)(nil),                 // 43: drsync.v1.WorkGrant
-	(*ShardSplit)(nil),                // 44: drsync.v1.ShardSplit
-	(*ShardSplitAck)(nil),             // 45: drsync.v1.ShardSplitAck
-	(*ShardCounters)(nil),             // 46: drsync.v1.ShardCounters
-	(*ShardResult)(nil),               // 47: drsync.v1.ShardResult
-	(*TaskResult)(nil),                // 48: drsync.v1.TaskResult
-	(*TaskResultBatch)(nil),           // 49: drsync.v1.TaskResultBatch
-	(*JournalRecord)(nil),             // 50: drsync.v1.JournalRecord
-	(*JournalBatch)(nil),              // 51: drsync.v1.JournalBatch
-	(*JournalAck)(nil),                // 52: drsync.v1.JournalAck
-	(*LatencyHistogram)(nil),          // 53: drsync.v1.LatencyHistogram
-	(*StatsReport)(nil),               // 54: drsync.v1.StatsReport
-	(*WorkRequest_CachedOptions)(nil), // 55: drsync.v1.WorkRequest.CachedOptions
-	(*ShardSplit_NewShard)(nil),       // 56: drsync.v1.ShardSplit.NewShard
-	(*ShardSplit_NewEntryList)(nil),   // 57: drsync.v1.ShardSplit.NewEntryList
-	(*ShardSplit_BigFile)(nil),        // 58: drsync.v1.ShardSplit.BigFile
-	(*ShardSplit_LinkSighting)(nil),   // 59: drsync.v1.ShardSplit.LinkSighting
+	(FrameType)(0),                     // 0: drsync.v1.FrameType
+	(EntryType)(0),                     // 1: drsync.v1.EntryType
+	(ResultStatus)(0),                  // 2: drsync.v1.ResultStatus
+	(Control_Command)(0),               // 3: drsync.v1.Control.Command
+	(AclOptions_Untranslatable)(0),     // 4: drsync.v1.AclOptions.Untranslatable
+	(VerifyOptions_OnMismatch)(0),      // 5: drsync.v1.VerifyOptions.OnMismatch
+	(CopyOptions_ServerSideCopy)(0),    // 6: drsync.v1.CopyOptions.ServerSideCopy
+	(CopyOptions_FsyncMode)(0),         // 7: drsync.v1.CopyOptions.FsyncMode
+	(JournalRecord_Type)(0),            // 8: drsync.v1.JournalRecord.Type
+	(*StatInfo)(nil),                   // 9: drsync.v1.StatInfo
+	(*MountCaps)(nil),                  // 10: drsync.v1.MountCaps
+	(*Hello)(nil),                      // 11: drsync.v1.Hello
+	(*HelloAck)(nil),                   // 12: drsync.v1.HelloAck
+	(*MountHealth)(nil),                // 13: drsync.v1.MountHealth
+	(*InflightItem)(nil),               // 14: drsync.v1.InflightItem
+	(*Heartbeat)(nil),                  // 15: drsync.v1.Heartbeat
+	(*HeartbeatAck)(nil),               // 16: drsync.v1.HeartbeatAck
+	(*Control)(nil),                    // 17: drsync.v1.Control
+	(*ProtocolError)(nil),              // 18: drsync.v1.ProtocolError
+	(*FilterRule)(nil),                 // 19: drsync.v1.FilterRule
+	(*AclOptions)(nil),                 // 20: drsync.v1.AclOptions
+	(*MetadataOptions)(nil),            // 21: drsync.v1.MetadataOptions
+	(*VerifyOptions)(nil),              // 22: drsync.v1.VerifyOptions
+	(*CopyOptions)(nil),                // 23: drsync.v1.CopyOptions
+	(*LimitOptions)(nil),               // 24: drsync.v1.LimitOptions
+	(*TuningOptions)(nil),              // 25: drsync.v1.TuningOptions
+	(*JobOptions)(nil),                 // 26: drsync.v1.JobOptions
+	(*WorkRequest)(nil),                // 27: drsync.v1.WorkRequest
+	(*FileGen)(nil),                    // 28: drsync.v1.FileGen
+	(*WalkOverrides)(nil),              // 29: drsync.v1.WalkOverrides
+	(*Shard)(nil),                      // 30: drsync.v1.Shard
+	(*EntryListShard)(nil),             // 31: drsync.v1.EntryListShard
+	(*ChunkTask)(nil),                  // 32: drsync.v1.ChunkTask
+	(*DirMeta)(nil),                    // 33: drsync.v1.DirMeta
+	(*DirFixBatch)(nil),                // 34: drsync.v1.DirFixBatch
+	(*VerifyEntry)(nil),                // 35: drsync.v1.VerifyEntry
+	(*VerifyBatch)(nil),                // 36: drsync.v1.VerifyBatch
+	(*DeleteBatch)(nil),                // 37: drsync.v1.DeleteBatch
+	(*ProbeTask)(nil),                  // 38: drsync.v1.ProbeTask
+	(*LinkTask)(nil),                   // 39: drsync.v1.LinkTask
+	(*LinkEntry)(nil),                  // 40: drsync.v1.LinkEntry
+	(*LinkTaskBatch)(nil),              // 41: drsync.v1.LinkTaskBatch
+	(*WorkItem)(nil),                   // 42: drsync.v1.WorkItem
+	(*WorkGrant)(nil),                  // 43: drsync.v1.WorkGrant
+	(*ShardSplit)(nil),                 // 44: drsync.v1.ShardSplit
+	(*ShardSplitAck)(nil),              // 45: drsync.v1.ShardSplitAck
+	(*ShardCounters)(nil),              // 46: drsync.v1.ShardCounters
+	(*ShardResult)(nil),                // 47: drsync.v1.ShardResult
+	(*TaskResult)(nil),                 // 48: drsync.v1.TaskResult
+	(*TaskResultBatch)(nil),            // 49: drsync.v1.TaskResultBatch
+	(*JournalRecord)(nil),              // 50: drsync.v1.JournalRecord
+	(*JournalBatch)(nil),               // 51: drsync.v1.JournalBatch
+	(*JournalAck)(nil),                 // 52: drsync.v1.JournalAck
+	(*LatencyHistogram)(nil),           // 53: drsync.v1.LatencyHistogram
+	(*StatsReport)(nil),                // 54: drsync.v1.StatsReport
+	(*WorkRequest_CachedOptions)(nil),  // 55: drsync.v1.WorkRequest.CachedOptions
+	(*ShardSplit_NewShard)(nil),        // 56: drsync.v1.ShardSplit.NewShard
+	(*ShardSplit_NewEntryList)(nil),    // 57: drsync.v1.ShardSplit.NewEntryList
+	(*ShardSplit_BigFile)(nil),         // 58: drsync.v1.ShardSplit.BigFile
+	(*ShardSplit_LinkSighting)(nil),    // 59: drsync.v1.ShardSplit.LinkSighting
+	(*ShardSplit_DeleteRemainder)(nil), // 60: drsync.v1.ShardSplit.DeleteRemainder
 }
 var file_drsync_proto_depIdxs = []int32{
 	1,  // 0: drsync.v1.StatInfo.type:type_name -> drsync.v1.EntryType
@@ -5379,21 +5496,22 @@ var file_drsync_proto_depIdxs = []int32{
 	57, // 36: drsync.v1.ShardSplit.entry_lists:type_name -> drsync.v1.ShardSplit.NewEntryList
 	58, // 37: drsync.v1.ShardSplit.big_files:type_name -> drsync.v1.ShardSplit.BigFile
 	59, // 38: drsync.v1.ShardSplit.link_sightings:type_name -> drsync.v1.ShardSplit.LinkSighting
-	2,  // 39: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
-	46, // 40: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
-	2,  // 41: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
-	10, // 42: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
-	10, // 43: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
-	48, // 44: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
-	8,  // 45: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
-	9,  // 46: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
-	9,  // 47: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
-	53, // 48: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
-	49, // [49:49] is the sub-list for method output_type
-	49, // [49:49] is the sub-list for method input_type
-	49, // [49:49] is the sub-list for extension type_name
-	49, // [49:49] is the sub-list for extension extendee
-	0,  // [0:49] is the sub-list for field type_name
+	60, // 39: drsync.v1.ShardSplit.delete_remainders:type_name -> drsync.v1.ShardSplit.DeleteRemainder
+	2,  // 40: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
+	46, // 41: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
+	2,  // 42: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
+	10, // 43: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
+	10, // 44: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
+	48, // 45: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
+	8,  // 46: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
+	9,  // 47: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
+	9,  // 48: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
+	53, // 49: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
+	50, // [50:50] is the sub-list for method output_type
+	50, // [50:50] is the sub-list for method input_type
+	50, // [50:50] is the sub-list for extension type_name
+	50, // [50:50] is the sub-list for extension extendee
+	0,  // [0:50] is the sub-list for field type_name
 }
 
 func init() { file_drsync_proto_init() }
@@ -5419,7 +5537,7 @@ func file_drsync_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_drsync_proto_rawDesc), len(file_drsync_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   51,
+			NumMessages:   52,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

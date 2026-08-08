@@ -274,6 +274,15 @@ message TuningOptions {
   // fanned out. Sets the granularity of that fan-out: a 1.4M-entry directory
   // becomes ceil(1.4M / entrylist_batch) shards.
   uint32 entrylist_batch     = 6;
+  // Delete-pass analogue of dir_split_threshold/entrylist_batch: a directory
+  // being orphan-deleted (agent/src/delete.c) whose own entry count exceeds
+  // delete_split_threshold is streamed out as new DELETE shards instead of
+  // being unlinked depth-first by one agent (docs/DESIGN-coordinator.md §2.2
+  // DELETE fan-out). Kept independently tunable from the entry-list values:
+  // delete work per name is a plain unlink, not a full stat/diff/copy
+  // pipeline, so the shapes that make sense for each can differ.
+  uint64 delete_split_threshold = 7;
+  uint32 delete_split_batch     = 8;  // names per split-produced DELETE shard (0 = built-in default)
 }
 
 message JobOptions {
@@ -510,10 +519,34 @@ message ShardSplit {
     uint64 size     = 5;
     int64  mtime_ns = 6;
   }
-  repeated NewShard     subdirs         = 3;
-  repeated NewEntryList entry_lists     = 4;
-  repeated BigFile      big_files       = 5;
-  repeated LinkSighting link_sightings  = 6;
+  // A pathological orphan directory being deleted (agent/src/delete.c's
+  // rm_tree, WI_DELETE): once its own entry count exceeds
+  // delete_split_threshold, the remaining not-yet-removed entries are
+  // streamed out in batches as new DELETE shards instead of being unlinked
+  // depth-first by the one agent that found the directory — the delete-pass
+  // analogue of NewEntryList above. Unlike NewEntryList there is nothing to
+  // diff against a destination: the whole subtree is already condemned
+  // (D5), so a batch is just names to remove, deepest-first ordering
+  // preserved by construction (every name here is a direct child of dir_rel,
+  // never an ancestor of anything else in this same split).
+  message DeleteRemainder {
+    bytes dir_rel        = 1;
+    repeated bytes names = 2;
+    // Total DELETE shards this directory is being split into, set ONLY on
+    // the last DeleteRemainder batch shipped for dir_rel (0 on every earlier
+    // batch — the agent streams via readdir and only knows the true total
+    // once it hits EOF, unlike a chunk group's byte-size-derived n_chunks,
+    // known upfront). The coordinator uses this to size delete_groups'
+    // n_children the one time it sees it, then seeds a cleanup shard for
+    // dir_rel itself once every child DELETE shard reports done — see
+    // store.RecordSplit / CompleteShard's delete_groups handling.
+    uint32 total_children = 3;
+  }
+  repeated NewShard        subdirs           = 3;
+  repeated NewEntryList    entry_lists       = 4;
+  repeated BigFile         big_files         = 5;
+  repeated LinkSighting    link_sightings    = 6;
+  repeated DeleteRemainder delete_remainders = 7;
 }
 
 message ShardSplitAck {

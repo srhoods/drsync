@@ -520,7 +520,7 @@ func (s *Server) onWorkRequest(ac *agentConn, req *drsyncpb.WorkRequest) error {
 }
 
 func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
-	shards := make([]store.NewShard, 0, len(sp.Subdirs)+len(sp.EntryLists))
+	shards := make([]store.NewShard, 0, len(sp.Subdirs)+len(sp.EntryLists)+len(sp.DeleteRemainders))
 	for _, d := range sp.Subdirs {
 		shards = append(shards, store.NewShard{Kind: model.KindDir, RelPath: string(d.RelPath)})
 	}
@@ -532,6 +532,46 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 		}
 		shards = append(shards, store.NewShard{
 			Kind: model.KindEntryList, RelPath: string(el.DirRel), Payload: payload})
+	}
+	// A pathological orphan directory the delete pass is streaming out in
+	// batches instead of unlinking depth-first on one agent (agent/src/
+	// delete.c, delete_split_threshold) — see ShardSplit.DeleteRemainder's
+	// doc comment. Same DeleteBatch shape seedDeletePass already uses for
+	// the top-level batches; job_id/pass_no/task_id are filled at grant time
+	// from the shard row (buildItem), same as every other split-produced
+	// kind.
+	var deleteTotals []store.DeleteGroupTotal
+	for _, dr := range sp.DeleteRemainders {
+		// dr.Names are bare basenames (agent readdir entries, delete.c
+		// flush_delete_split) — DeleteBatch.RelPaths must be full paths
+		// relative to the destination root (same contract seedDeletePass's
+		// own DeleteBatch shards use), so each name is joined under dir_rel
+		// here before the split-produced shard is built. Without this a
+		// split-produced delete shard tries to unlink a bare basename at the
+		// destination root, silently misses (ENOENT, not an error), and the
+		// pathological directory's contents are never actually removed even
+		// though delete_groups correctly tracks every batch as done.
+		relPaths := make([][]byte, len(dr.Names))
+		for i, name := range dr.Names {
+			relPaths[i] = []byte(string(dr.DirRel) + "/" + string(name))
+		}
+		payload, err := proto.Marshal(&drsyncpb.DeleteBatch{RelPaths: relPaths})
+		if err != nil {
+			return err
+		}
+		shards = append(shards, store.NewShard{
+			Kind: model.KindDelete, RelPath: string(dr.DirRel), Payload: payload})
+		// One DeleteGroupTotal per batch (not just the final one) — RecordSplit
+		// bumps delete_groups.n_total by one per entry, so it stays in the same
+		// units as n_done (shards, not directory entries — see delete_groups'
+		// doc comment). total_children > 0 only marks LastBatch, the "readdir
+		// hit EOF" signal; the cleanup shard is pre-built regardless of whether
+		// every sibling has already reported done — RecordSplit only actually
+		// inserts it once that's true.
+		deleteTotals = append(deleteTotals, store.DeleteGroupTotal{
+			DirRel: string(dr.DirRel), LastBatch: dr.TotalChildren > 0,
+			CleanupShard: deleteCleanupShard(string(dr.DirRel)),
+		})
 	}
 
 	var groups []store.NewChunkGroup
@@ -562,7 +602,7 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 		return err
 	}
 
-	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups, sightings, maxGroupScan)
+	ids, err := s.st.RecordSplit(int64(sp.ParentShardId), sp.Seq, shards, groups, sightings, maxGroupScan, deleteTotals)
 	if err != nil {
 		return err
 	}
@@ -681,15 +721,27 @@ func finalizeShard(rel, temp string, gen *drsyncpb.FileGen) store.NewShard {
 	return store.NewShard{Kind: model.KindChunk, RelPath: rel, Payload: payload}
 }
 
+// deleteCleanupShard builds the one-entry DeleteBatch that removes a
+// pathological orphan directory itself, once every split-produced
+// delete-remainder shard has finished emptying it (CompleteDeleteRemainder).
+// Runs through the ordinary, unmodified delete path (agent/src/delete.c) —
+// by the time this is granted, the directory is empty, so it costs one
+// fstatat + one rmdir, same as any single-entry delete batch.
+func deleteCleanupShard(dirRel string) store.NewShard {
+	payload, _ := proto.Marshal(&drsyncpb.DeleteBatch{RelPaths: [][]byte{[]byte(dirRel)}})
+	return store.NewShard{Kind: model.KindDelete, Payload: payload}
+}
+
 func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 	shardID, leaseID := int64(r.ShardId), int64(r.LeaseId)
 	var err error
 	switch r.Status {
 	case drsyncpb.ResultStatus_RESULT_OK:
-		// One read tells us pass, kind and (for chunks) the ChunkTask, so the
-		// chunk group can be maintained in the same completion without a second
-		// round trip. It replaces the passOfShard lookup the OK path already did.
-		passID, kind, payload, e := s.st.ShardMeta(shardID)
+		// One read tells us pass, kind, rel_path and (for chunks) the
+		// ChunkTask, so the chunk/delete group can be maintained in the same
+		// completion without a second round trip. It replaces the
+		// passOfShard lookup the OK path already did.
+		passID, kind, payload, relPath, e := s.st.ShardMeta(shardID)
 		if e != nil {
 			err = e
 			break
@@ -700,9 +752,20 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 		if ms := r.GetCounters().GetWallMs(); ms > 0 {
 			s.met.ShardDuration.WithLabelValues(string(kind)).Observe(float64(ms) / 1000)
 		}
-		if kind == model.KindChunk {
+		switch {
+		case kind == model.KindChunk:
 			err = s.completeChunk(passID, shardID, leaseID, payload, r)
-		} else {
+		case kind == model.KindDelete && relPath != "":
+			// A split-produced delete-remainder shard (onShardSplit sets
+			// RelPath to the directory it's emptying; a top-level batch from
+			// seedDeletePass never does) — maintain delete_groups the same
+			// way completeChunk maintains chunk_groups, seeding a cleanup
+			// shard for the now-possibly-empty directory once every sibling
+			// has reported done.
+			blob, _ := proto.Marshal(r)
+			err = s.st.CompleteDeleteRemainder(shardID, leaseID, passID, relPath, blob,
+				deleteCleanupShard(relPath), r.Counters)
+		default:
 			blob, _ := proto.Marshal(r)
 			err = s.st.CompleteShard(shardID, leaseID, passID, blob, r.Counters)
 		}
@@ -710,7 +773,7 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 		// A chunk saw the source drift under it: abort the whole file's group.
 		// The half-written temp is reclaimed as .drsync.tmp residue next walk,
 		// and the file is re-diffed next pass. Only chunks emit this status.
-		passID, kind, payload, e := s.st.ShardMeta(shardID)
+		passID, kind, payload, _, e := s.st.ShardMeta(shardID)
 		if e != nil {
 			err = e
 			break

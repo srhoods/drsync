@@ -291,6 +291,19 @@ struct walk_ctx {
     bool                     fatal;
 };
 
+/* How long ship_split's ack-wait blocks before giving up and marking the
+ * shard fatal (so it re-runs) — a coordinator that never acks within this
+ * window is treated as unreachable, not as "still working on it". */
+#define SPLIT_ACK_TIMEOUT_S 120
+
+/* Shared ShardSplit outbox machinery (split.c): ships a prepared split frame
+ * without blocking (backpressure only once SPLIT_WINDOW acks are
+ * outstanding), and drains every outstanding ack before a shard reports its
+ * result (protocol doc §4.2's ordering invariant). Used by the directory
+ * walker (walker.c) and the delete-pass executor (delete.c). */
+void ship_split(struct walk_ctx *ctx, pb_buf *b);
+void drain_splits(struct walk_ctx *ctx);
+
 void jrn_init(struct walk_ctx *ctx);
 /* thread-safe append; auto-flushes at the batch size threshold */
 void jrn_emit(struct walk_ctx *ctx, int type, const char *rel_path,
