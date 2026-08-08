@@ -2423,6 +2423,132 @@ func TestWALCheckpointShrinksWALFile(t *testing.T) {
 	}
 }
 
+// TestCheckpointRunPassiveDoesNotShrinkWALFile is the counterpart to
+// TestWALCheckpointShrinksWALFile: checkpointRunPassive (what RunWALCheckpoint
+// now calls on most ticks, see its doc comment) must copy WAL content back to
+// the main db file the same as TRUNCATE — this test doesn't re-check that,
+// TestWALCheckpointRuns/TestWALCheckpointShrinksWALFile already establish the
+// checkpoint mechanism works — but must NOT shrink the WAL file itself,
+// since reclaiming file size is deliberately left to the periodic TRUNCATE
+// call. If this ever shrinks the file, checkpointRunPassive has silently
+// started running TRUNCATE (or RESTART), defeating the whole point of the
+// PASSIVE/TRUNCATE split: PASSIVE's only advantage over TRUNCATE is not
+// needing TRUNCATE's exclusive, file-shrinking WAL lock.
+func TestCheckpointRunPassiveDoesNotShrinkWALFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	_, passID, _ := seed(t, s)
+	blob := make([]byte, 512)
+	batch := make([]NewShard, 3000)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%05d", i), Payload: blob}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	walPath := path + "-wal"
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL before checkpoint: %v", err)
+	}
+	const minWAL = 64 * 1024
+	if before.Size() < minWAL {
+		t.Fatalf("WAL only %d bytes before checkpoint, too small to exercise this — "+
+			"increase the write volume above", before.Size())
+	}
+
+	if err := s.checkpointRunPassive(); err != nil {
+		t.Fatalf("checkpointRunPassive: %v", err)
+	}
+
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("stat WAL after checkpoint: %v", err)
+	}
+	if after.Size() < before.Size() {
+		t.Fatalf("WAL file shrank after checkpointRunPassive (%d -> %d bytes): "+
+			"it must run PASSIVE, not TRUNCATE/RESTART, or the periodic-TRUNCATE "+
+			"split in RunWALCheckpoint no longer holds s.mu less often than before",
+			before.Size(), after.Size())
+	}
+}
+
+// TestRunWALCheckpointTruncatesOnlyPeriodically: RunWALCheckpoint must not
+// shrink the WAL file on every tick — only every walCheckpointTruncateEvery
+// of them (see its doc comment for why: TRUNCATE's fixed per-call overhead
+// means calling it as often as the cheap PASSIVE checkpoints would give back
+// most of what shortening the interval bought). Drives exactly
+// walCheckpointTruncateEvery-1 ticks (file must not have shrunk yet) then one
+// more (file must have shrunk by then).
+func TestRunWALCheckpointTruncatesOnlyPeriodically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	_, passID, _ := seed(t, s)
+	blob := make([]byte, 512)
+	batch := make([]NewShard, 3000)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%05d", i), Payload: blob}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+	walPath := path + "-wal"
+	before, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const minWAL = 64 * 1024
+	if before.Size() < minWAL {
+		t.Fatalf("WAL only %d bytes before checkpoint, too small to exercise this", before.Size())
+	}
+
+	// Drive one continuous RunWALCheckpoint (its own tick counter must not be
+	// restarted mid-test, or the Nth-tick assertion below is meaningless).
+	// The interval is generous relative to how long one checkpoint call
+	// actually takes (a few ms for 586 pages, more so for TRUNCATE) so ticks
+	// don't run behind schedule under load — this test previously flaked
+	// under -count=5 and under the full package's -race load at a tighter
+	// interval/margin.
+	const tickInterval = 150 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s.RunWALCheckpoint(ctx, tickInterval)
+
+	// Sample just before the Nth tick would fire: must still be PASSIVE-only.
+	time.Sleep(time.Duration(walCheckpointTruncateEvery-1) * tickInterval)
+	mid, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mid.Size() < before.Size() {
+		t.Fatalf("WAL file already shrunk before tick %d (%d -> %d bytes): "+
+			"TRUNCATE fired too early", walCheckpointTruncateEvery, before.Size(), mid.Size())
+	}
+
+	// Generous margin past the Nth tick, not a tight window right after it.
+	time.Sleep(3 * tickInterval)
+	cancel()
+	after, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() >= mid.Size() {
+		t.Fatalf("WAL file did not shrink by tick %d (%d bytes): "+
+			"TRUNCATE should have fired by now", walCheckpointTruncateEvery, after.Size())
+	}
+}
+
 // TestRunWALCheckpointStopsOnContextCancel: the background loop exits
 // promptly when its context is cancelled, same select{ctx.Done(): return}
 // shape as RunIncrementalVacuum/scheduler.RunSweeper — a goroutine that

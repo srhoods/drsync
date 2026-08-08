@@ -309,7 +309,23 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   content has accumulated since the last checkpoint, so 20s (down from 5min) trades
   more frequent, individually cheaper checkpoints for eliminating the large backlog
   a long interval let build up. Re-measured after this change, not just assumed
-  fixed by the same reasoning that picked 5 minutes originally and turned out wrong.
+  fixed by the same reasoning that picked 5 minutes originally and turned out wrong:
+  a 9-hour, 10-agent re-test at the 20s interval brought the median hold down to
+  4.6s (max 26s) — a real improvement, but the scaling was sublinear (15x shorter
+  interval only bought ~7x shorter hold), which means TRUNCATE has genuine fixed
+  overhead — the file-truncate syscall plus its fsync — that does not shrink just
+  because less WAL content has accumulated. `RunWALCheckpoint` now splits the two
+  jobs TRUNCATE was doing at once: a cheap `PASSIVE` checkpoint every tick (drains
+  WAL content back to the main db file, same as TRUNCATE, but needs no exclusive
+  file-shrinking lock, so its `s.mu` hold is only as long as the copy itself) and a
+  `TRUNCATE` checkpoint (still what `Store.WALCheckpoint` calls directly — existing
+  callers and tests are unaffected) only every `walCheckpointTruncateEvery` (10)
+  ticks, to reclaim the file's size on disk. By the time TRUNCATE runs, the
+  intervening PASSIVE calls have already drained most of what it would otherwise
+  have to copy, so its own hold should be shorter too, not just less frequent —
+  this is the fix for the fixed-cost floor the interval alone couldn't reach.
+  `TestCheckpointRunPassiveDoesNotShrinkWALFile` and
+  `TestRunWALCheckpointTruncatesOnlyPeriodically` pin the split.
 - **Indexing discipline for high-write tables:** every predicate a hot-path query
   filters or joins on needs an index that actually serves it — not just "an index
   exists on the table." A single-writer store makes this load-bearing in a way a
