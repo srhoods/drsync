@@ -36,6 +36,12 @@ func TestDefaultsAppliedToMinimalSpec(t *testing.T) {
 	if sp.Tuning.ShardBudget != 2_000 {
 		t.Errorf("tuning.shard_budget = %d, want 2000", sp.Tuning.ShardBudget)
 	}
+	if sp.Tuning.DeleteSplitThreshold != 200_000 {
+		t.Errorf("tuning.delete_split_threshold = %d, want 200000", sp.Tuning.DeleteSplitThreshold)
+	}
+	if sp.Tuning.DeleteSplitBatch != 20_000 {
+		t.Errorf("tuning.delete_split_batch = %d, want 20000", sp.Tuning.DeleteSplitBatch)
+	}
 	if sp.Metadata.Hardlinks != "preserve" {
 		t.Errorf("metadata.hardlinks = %q, want preserve", sp.Metadata.Hardlinks)
 	}
@@ -54,6 +60,10 @@ func TestDefaultsAppliedToMinimalSpec(t *testing.T) {
 	if o.Copy.ChunkThreshold != twentyFourGiB || o.Copy.ChunkSize != eightGiB {
 		t.Errorf("resolved JobOptions chunk sizes = %d/%d, want %d/%d",
 			o.Copy.ChunkThreshold, o.Copy.ChunkSize, twentyFourGiB, eightGiB)
+	}
+	if o.Tuning.DeleteSplitThreshold != 200_000 || o.Tuning.DeleteSplitBatch != 20_000 {
+		t.Errorf("resolved JobOptions delete-split tuning = %d/%d, want 200000/20000",
+			o.Tuning.DeleteSplitThreshold, o.Tuning.DeleteSplitBatch)
 	}
 }
 

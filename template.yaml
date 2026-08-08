@@ -95,6 +95,8 @@ spec:
     shard_budget: 2000               # entries a walker processes before pushing subdirs back
     dir_split_threshold: 50000       # single-directory size that triggers entry-list sharding
     entrylist_batch: 4000            # names per entry-list shard (sets a huge dir's fan-out)
+    delete_split_threshold: 200000   # single orphan-directory size that triggers delete sharding
+    delete_split_batch: 20000        # names per split-produced DELETE shard
     statx_batch: 256                 # in-flight statx per walker = io_uring ring depth (1–4096)
     mtime_slop_ns: 1000000           # 1ms slop for cross-filesystem timestamp granularity
     spread_mode: auto                # auto | off | always — coordinator-side walk fan-out

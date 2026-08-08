@@ -118,6 +118,48 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   filesystem object under each orphan path — so it is expected and correct for the
   delete pass's live removal count to run well past the prior pass's reported orphan
   count while still in progress, not a sign of double-counting or runaway deletion.
+- **DELETE fan-out.** `rm_tree`, unlike the scan walker, had no split mechanism at
+  all until this was added: a single huge orphan directory was always removed
+  depth-first by whichever one agent's shard named it — the delete-pass analogue of
+  the entry-list problem (a directory too large for one shard), but with no
+  equivalent fix. On a tree where the orphan set is dominated by a handful of large
+  stale subtrees (common right after a reorg — a source directory that no longer
+  exists at all), this made the delete pass take as long as the rest of the job
+  combined, fleet-wide parallelism notwithstanding, since only one agent thread was
+  ever doing the actual unlinking.
+
+  The fix mirrors `split_entrylist_stream` (§4.1's entry-list mechanism) more
+  closely than the plain directory-split (`queue_split`) mechanism, because delete
+  has nothing to diff against a destination — the whole subtree is already
+  condemned (D5) — so a batch is just names to remove, not a source/destination
+  merge. `remove_orphan` (`agent/src/delete.c`) probe-reads a top-level orphan
+  directory (only the path named directly in the shard's `paths[]`, not every
+  nested directory reached during recursion — same scope as the entry-list
+  trigger) up to `tuning.delete_split_threshold` entries; over that, the directory
+  is streamed via `stream_delete_split` in batches of `tuning.delete_split_batch`
+  names as `ShardSplit.DeleteRemainder` splits (wire field 7 — additive to the
+  existing `subdirs`/`entry_lists`/`big_files`/`link_sightings` repeated fields,
+  no new frame type needed) instead of being unlinked inline. `ship_split`/
+  `drain_splits` — the ack/backpressure machinery every split kind already shared
+  — moved out of `walker.c` into a new `split.c` so `delete.c` can use them too
+  without duplicating the ordering-invariant-critical code.
+
+  Unlike entry-list sharding, delete fan-out has a real completion problem
+  entry-list never does: something has to remove the now-empty directory itself
+  once every split-produced child has finished emptying it, and the coordinator
+  has no way to know that in advance — the agent streams via `readdir` and only
+  learns the true child-shard count once it hits EOF (the last `DeleteRemainder`
+  batch for a directory carries `total_children`; every earlier batch is 0). A new
+  `delete_groups` table (§3), the delete-pass analogue of `chunk_groups`, tracks
+  `n_total`/`n_done`/`closed` per directory. Because a split-produced child shard's
+  own completion is an independent frame from the streaming parent's batches — only
+  the parent's *own* `ShardResult` is ordered after every split it shipped
+  (protocol §4.2), not the split's own processing relative to its children's — a
+  child can complete before the coordinator has even recorded the group's true
+  total. `store.CompleteDeleteRemainder` (child completion) and `store.RecordSplit`
+  (the final batch) each independently check "is this group now closeable" —
+  whichever one lands last seeds the one-entry cleanup shard that removes the
+  directory, and `closed` stops the other from ever seeding a second one.
 
 ### 2.3 Shard
 
@@ -153,6 +195,11 @@ agents  (id, hostname, state, version, caps BLOB, last_heartbeat,
 chunk_groups (pass_id, rel_path, temp_name, size, mtime_ns,
               n_chunks, n_done, state)               -- large-file cross-fleet assembly;
               -- finalize task seeded (same tx as the last data chunk) at n_done==n_chunks
+delete_groups (pass_id, rel_path, n_total, n_done, closed) -- §2.2 DELETE fan-out; the
+              -- delete-pass analogue of chunk_groups. n_total is 0 until the streaming
+              -- parent's final DeleteRemainder batch sets it (unlike n_chunks, not known
+              -- upfront); cleanup shard seeded once n_done>=n_total, whichever of
+              -- CompleteDeleteRemainder/RecordSplit observes that first (closed dedups)
 link_groups  (pass_id, dev, ino, nlink_expected, members_seen,
               anchor_rel_path, anchor_size, anchor_mtime_ns,
               anchor_state, updated_at)              -- D11 hardlink correlation, pass-scoped;

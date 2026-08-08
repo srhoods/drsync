@@ -75,7 +75,7 @@ func drainReaps(t *testing.T, c *Controller) {
 // straight from the shards table, so sql.ErrNoRows is the reap signal).
 func shardGone(t *testing.T, c *Controller, id int64) bool {
 	t.Helper()
-	_, _, _, err := c.st.ShardMeta(id)
+	_, _, _, _, err := c.st.ShardMeta(id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return true
 	}

@@ -283,6 +283,32 @@ CREATE TABLE IF NOT EXISTS chunk_groups (
   PRIMARY KEY (pass_id, rel_path)
 ) WITHOUT ROWID;
 
+-- One row per pathological orphan directory being fanned out across DELETE
+-- shards (docs/DESIGN-coordinator.md §2.2 DELETE fan-out) — the delete-pass
+-- analogue of chunk_groups above. Unlike a chunk group, n_total is not known
+-- when the row is first created: the agent streams the directory via
+-- readdir and only learns the true child-shard count once it hits EOF (the
+-- last ShardSplit.DeleteRemainder batch for this dir_rel carries
+-- total_children; every earlier batch is 0, meaning "not yet known"). A
+-- child shard's completion can race ahead of that final batch — the two are
+-- independent shards/frames, only the *streaming parent's own* ShardResult
+-- is ordered after every split it shipped (protocol §4.2) — so n_done is
+-- incremented unconditionally on every child completion, and the "seed a
+-- cleanup shard for dir_rel" decision is checked at BOTH the write that sets
+-- n_total and the write that increments n_done, whichever lands last.
+-- n_total = 0 doubles as "still streaming" and "impossible legitimate total"
+-- (a split with zero children is never shipped), so a single comparison
+-- (n_total > 0 AND n_done >= n_total) covers "closeable" without a separate
+-- state column.
+CREATE TABLE IF NOT EXISTS delete_groups (
+  pass_id  INTEGER NOT NULL,
+  rel_path TEXT NOT NULL,  -- the directory being emptied (dir_rel)
+  n_total  INTEGER NOT NULL DEFAULT 0,
+  n_done   INTEGER NOT NULL DEFAULT 0,
+  closed   INTEGER NOT NULL DEFAULT 0,  -- 1 once the cleanup shard has been seeded (idempotency)
+  PRIMARY KEY (pass_id, rel_path)
+) WITHOUT ROWID;
+
 -- link_groups/link_members correlate hardlink-group members across shards
 -- (docs/DESIGN-hardlinks.md). A group is identified by (dev,ino), which is
 -- unique only within one pass's walk — this is scratch state, reaped with the
@@ -1173,14 +1199,31 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 	return nil
 }
 
+// DeleteGroupTotal is one delete-remainder batch's "this was the last batch
+// for dirRel" signal (ShardSplit.DeleteRemainder.total_children — see its
+// doc comment for why the total is only known on the final streamed batch,
+// not upfront like a chunk group's byte-size-derived n_chunks). cleanupShard
+// is pre-built by the caller (store stays payload-agnostic, same division of
+// labor as CompleteDataChunk's finalizeShard) and only actually inserted if
+// every sibling delete-remainder shard has already reported done by the time
+// this total lands — the same race CompleteDeleteRemainder resolves from the
+// other direction.
+type DeleteGroupTotal struct {
+	DirRel        string
+	TotalChildren int
+	CleanupShard  NewShard
+}
+
 // RecordSplit persists a ShardSplit idempotently: retransmits of the same
 // (parent, seq) return the originally assigned ids (protocol doc §4.3). groups
-// (for big files whose data-chunk shards are among shards) and sightings
-// (nlink>1 files reported this split) are recorded in the same transaction;
-// pass nil for either when there are none. maxGroupScan is the job's
+// (for big files whose data-chunk shards are among shards), sightings
+// (nlink>1 files reported this split), and deleteTotals (final delete-remainder
+// batches — see DeleteGroupTotal) are recorded in the same transaction; pass
+// nil for any that don't apply. maxGroupScan is the job's
 // hardlinks_max_group_scan (0 = unlimited).
 func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
-	groups []NewChunkGroup, sightings []NewLinkSighting, maxGroupScan uint64) ([]int64, error) {
+	groups []NewChunkGroup, sightings []NewLinkSighting, maxGroupScan uint64,
+	deleteTotals []DeleteGroupTotal) ([]int64, error) {
 	// int64(seq): bit-preserving reinterpret, not a truncation — see
 	// recordLinkSightingsTx's comment. seq is agent-assigned per-parent and in
 	// practice never near 2^63, but binding a uint64 with the high bit set
@@ -1266,6 +1309,34 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 	}
 	if err := recordLinkSightingsTx(tx, passID, sightings, maxGroupScan); err != nil {
 		return nil, err
+	}
+	for _, dt := range deleteTotals {
+		// INSERT OR IGNORE: a child's own completion (CompleteDeleteRemainder)
+		// may have already created this row via its own INSERT OR IGNORE if
+		// it raced ahead of this, the streaming parent's final batch — the
+		// two are independent shards/frames, only the parent's own
+		// ShardResult is ordered after every split it shipped (protocol
+		// §4.2), not the split's own processing relative to its children's.
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
+			passID, dt.DirRel); err != nil {
+			return nil, err
+		}
+		var nTotal, nDone, closed int
+		if err := tx.QueryRow(`UPDATE delete_groups SET n_total = ?
+			WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, closed`,
+			dt.TotalChildren, passID, dt.DirRel).Scan(&nTotal, &nDone, &closed); err != nil {
+			return nil, err
+		}
+		if closed != 0 || nDone < nTotal {
+			continue // not every sibling has reported done yet, or already closed
+		}
+		if _, err := insertShardsTx(tx, passID, 0, []NewShard{dt.CleanupShard}); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`UPDATE delete_groups SET closed = 1 WHERE pass_id = ? AND rel_path = ?`,
+			passID, dt.DirRel); err != nil {
+			return nil, err
+		}
 	}
 	blob, _ := json.Marshal(ids)
 	if _, err := tx.Exec(`INSERT INTO splits (parent_shard_id, seq, assigned_ids) VALUES (?,?,?)`,
@@ -1419,11 +1490,11 @@ func (s *Store) MarkLinkMembersQueued(passID int64, members []LinkMemberKey) err
 // ShardMeta returns a leased shard's pass, kind and inner payload — enough for
 // the result handler to route a completion without a second round trip. Read
 // before the shard transitions, so a chunk's ChunkTask payload is still there.
-func (s *Store) ShardMeta(shardID int64) (passID int64, kind model.ShardKind, payload []byte, err error) {
+func (s *Store) ShardMeta(shardID int64) (passID int64, kind model.ShardKind, payload []byte, relPath string, err error) {
 	var k string
-	err = s.rdb.QueryRow(`SELECT pass_id, kind, payload FROM shards WHERE id = ?`,
-		shardID).Scan(&passID, &k, &payload)
-	return passID, model.ShardKind(k), payload, err
+	err = s.rdb.QueryRow(`SELECT pass_id, kind, payload, rel_path FROM shards WHERE id = ?`,
+		shardID).Scan(&passID, &k, &payload, &relPath)
+	return passID, model.ShardKind(k), payload, relPath, err
 }
 
 // CompleteDataChunk marks a data-chunk shard DONE and bumps its group's n_done.
@@ -1470,6 +1541,68 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// CompleteDeleteRemainder marks a split-produced delete-remainder shard DONE
+// and bumps its delete_groups row's n_done — the delete-pass analogue of
+// CompleteDataChunk. relPath is the directory being emptied (dir_rel), not
+// this shard's own identity; see agentsrv.onShardResult for how a
+// split-produced KindDelete shard is told apart from an ordinary top-level
+// one. When n_done reaches n_total (known only once the streaming parent's
+// final DeleteRemainder batch has landed and set it — see RecordSplit) this
+// inserts cleanupShard (built by the caller: a single-entry DeleteBatch for
+// relPath itself, run through the ordinary unmodified delete path — store
+// stays payload-agnostic, same division of labor as CompleteDataChunk's
+// finalizeShard) and marks the group closed so a re-delivered final result
+// can never seed it twice. counters folds the pass-counter accumulation into
+// this same transaction — see CompleteShard's doc comment for why.
+func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath string, result []byte, cleanupShard NewShard, counters *drsyncpb.ShardCounters) error {
+	defer s.lockTimed("CompleteDeleteRemainder")()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	n, err := execCountTx(tx, `UPDATE shards SET state = ?, result = COALESCE(?, result), updated_at = ?
+		WHERE id = ? AND state = ? AND lease_id = ?`,
+		string(model.ShardDone), result, nowMS(), shardID, string(model.ShardLeased), leaseID)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLeaseMismatch // stale/duplicate result; drop it
+	}
+	if err := accumulatePassCountersTx(tx, passID, counters); err != nil {
+		return err
+	}
+
+	// The row may not exist yet if this child's completion raced ahead of
+	// RecordSplit's own insert for the batch that produced it — vanishingly
+	// unlikely (the grant that produced this ShardResult already required
+	// the row's shard to exist) but INSERT OR IGNORE makes the ordering
+	// irrelevant either way, same defensive shape as chunk_groups.
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
+		passID, relPath); err != nil {
+		return err
+	}
+	var nTotal, nDone, closed int
+	if err := tx.QueryRow(`UPDATE delete_groups SET n_done = n_done + 1
+		WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, closed`,
+		passID, relPath).Scan(&nTotal, &nDone, &closed); err != nil {
+		return err
+	}
+	if closed != 0 || nTotal == 0 || nDone < nTotal {
+		return tx.Commit() // already closed, total not known yet, or siblings outstanding
+	}
+	if _, err := insertShardsTx(tx, passID, 0, []NewShard{cleanupShard}); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE delete_groups SET closed = 1 WHERE pass_id = ? AND rel_path = ?`,
+		passID, relPath); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CompleteFinalizeChunk marks the finalize shard DONE and closes its group.

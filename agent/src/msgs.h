@@ -142,6 +142,13 @@ struct job_options {
     uint64_t shard_budget;
     uint64_t dir_split_threshold;
     uint32_t entrylist_batch; /* names per entry-list shard (0 = built-in default) */
+    /* Delete-pass analogue of the two above (docs/DESIGN-coordinator.md §2.2
+     * DELETE fan-out): a directory being orphan-deleted whose own entry
+     * count exceeds delete_split_threshold is streamed out as new DELETE
+     * shards, delete_split_batch names per shard, instead of being unlinked
+     * depth-first by one agent. */
+    uint64_t delete_split_threshold;
+    uint32_t delete_split_batch; /* names per split-produced DELETE shard (0 = built-in default) */
     uint32_t statx_batch; /* target statx in flight per walker ⇒ io_uring ring depth */
     int64_t  mtime_slop_ns;
     bool     dry_run;
@@ -323,6 +330,16 @@ void enc_shard_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
  * (the source-side slice of a directory over dir_split_threshold). */
 void enc_entrylist_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                          const char *dir_rel, char *const *names, size_t n_names);
+/* ShardSplit carrying one DeleteRemainder: a dir_rel plus a batch of names
+ * still to remove under it (the delete-pass analogue of EntryListShard
+ * above — a directory being orphan-deleted over delete_split_threshold).
+ * total_children is 0 for every batch except the last one streamed for
+ * dir_rel, which carries the true split-produced shard count (only known
+ * once readdir hits EOF) so the coordinator can tell when every sibling has
+ * reported done and seed a cleanup shard for dir_rel itself. */
+void enc_delete_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                      const char *dir_rel, char *const *names, size_t n_names,
+                      uint32_t total_children);
 /* ShardSplit carrying big files: rel_path + size + mtime_ns each. The
  * coordinator lays them out into ChunkTasks (proto ShardSplit.BigFile). */
 struct bigfile {

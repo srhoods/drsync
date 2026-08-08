@@ -118,6 +118,26 @@ void enc_entrylist_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
     pb_free(&el);
 }
 
+void enc_delete_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                      const char *dir_rel, char *const *names, size_t n_names,
+                      uint32_t total_children)
+{
+    pb_put_u64(b, 1, parent_shard_id);
+    pb_put_u64(b, 2, seq);
+    /* one ShardSplit.DeleteRemainder (field 7): dir_rel (1) + repeated
+     * names (2) + total_children (3, 0 unless this is the final batch for
+     * dir_rel — see the proto doc comment) */
+    pb_buf dr;
+    pb_init(&dr);
+    pb_put_bytes(&dr, 1, dir_rel, strlen(dir_rel));
+    for (size_t i = 0; i < n_names; i++)
+        pb_put_bytes(&dr, 2, names[i], strlen(names[i]));
+    if (total_children)
+        pb_put_u64(&dr, 3, total_children);
+    pb_put_msg(b, 7, &dr);
+    pb_free(&dr);
+}
+
 void enc_bigfile_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                        const struct bigfile *files, size_t n_files)
 {
@@ -481,6 +501,8 @@ static bool dec_tuning_opts(const uint8_t *p, size_t n, struct job_options *o)
         case 3: o->statx_batch = (uint32_t)pb_get_varint(&c); break;
         case 4: o->mtime_slop_ns = (int64_t)pb_get_varint(&c); break;
         case 6: o->entrylist_batch = (uint32_t)pb_get_varint(&c); break;
+        case 7: o->delete_split_threshold = pb_get_varint(&c); break;
+        case 8: o->delete_split_batch = (uint32_t)pb_get_varint(&c); break;
         default: pb_skip(&c, wt);
         }
     }
