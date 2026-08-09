@@ -484,6 +484,28 @@ journaled as a single `orphan` record but each removed entry is journaled as a
 dry-run first (`drsync journal cat myjob --type would_delete`), since dropping one
 orphaned directory can remove a large tree.
 
+**A very large orphan directory fans out across the fleet, like a huge source
+directory does during scanning.** A directory whose own entry count exceeds
+`tuning.delete_split_threshold` (default 200 000) is streamed out as batches of
+names — `tuning.delete_split_batch` (default 20 000) per batch — instead of
+being removed depth-first by whichever one agent found it. Each batch runs as
+its own DELETE shard, so the fleet unlinks the directory's contents in
+parallel; once every batch has finished, the coordinator seeds one more shard
+that removes the now-empty directory itself. Tune it the same way as
+`dir_split_threshold`/`entrylist_batch` (§4.5): the threshold decides whether
+to fan out at all, the batch size decides how many shards the directory
+becomes.
+
+```bash
+drsync job submit huge-orphans.yaml --start \
+  --set spec.tuning.delete_split_batch=50000
+```
+
+Without this, one pathologically large orphaned tree (a stale multi-million-
+file subtree that no longer exists on the source, common right after a large
+reorganization) can make the delete pass take as long as the rest of the job
+combined, with the whole fleet idle except the one agent working through it.
+
 ---
 
 ## 6. Monitoring

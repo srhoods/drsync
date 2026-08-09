@@ -2,7 +2,7 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wshadow -D_GNU_SOURCE -Ivendor
 LDFLAGS ?= -pthread -lzstd -lssl -lcrypto
 
-SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/poolsize.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/link.c src/tempname.c src/walker.c src/main.c
+SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy.c src/poolsize.c src/ucopy.c src/chunk.c src/xattr.c src/jrn.c src/split.c src/delete.c src/verify.c src/filter.c src/probe.c src/dirfix.c src/link.c src/tempname.c src/walker.c src/main.c
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
@@ -106,9 +106,9 @@ bin/estat_test: test/estat_test.c src/uring.o src/jrn.o src/msgs.o src/pb.o
 link-test: bin/link_test
 	./bin/link_test
 
-bin/link_test: test/link_test.c src/link.o src/delete.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o
+bin/link_test: test/link_test.c src/link.o src/delete.o src/split.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o
 	@mkdir -p bin
-	$(CC) $(CFLAGS) -o $@ test/link_test.c src/link.o src/delete.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o -pthread -lzstd
+	$(CC) $(CFLAGS) -o $@ test/link_test.c src/link.o src/delete.o src/split.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o -pthread -lzstd
 
 clean:
 	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test bin/estat_test bin/link_test

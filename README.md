@@ -62,6 +62,7 @@ tree, and builds the binaries it needs itself:
 | `chunk_abort_reclaim_e2e.sh` | a chunk group abandoned mid-assembly is reclaimed |
 | `chunk_resilience_e2e.sh` | agent dies mid-copy; leases expire and re-grant |
 | `deep_e2e.sh` | directory chain deeper than the walker's in-agent limit |
+| `delete_fanout_e2e.sh` | pathological orphan directory fans out across DELETE shards |
 | `dirfix_e2e.sh` | DIRFIX over a directory that fans out to entry-lists |
 | `direct_write_e2e.sh` | `copy.direct_write`: new files skip the temp+rename, updates stay atomic |
 | `fanout_e2e.sh` | a small volume must still use the whole fleet |

@@ -130,6 +130,14 @@ type JobSpec struct {
 			EntrylistBatch    uint32 `yaml:"entrylist_batch"`
 			StatxBatch        uint32 `yaml:"statx_batch"`
 			MtimeSlopNS       int64  `yaml:"mtime_slop_ns"`
+			// Delete-pass fan-out: the analogue of DirSplitThreshold/
+			// EntrylistBatch for orphan-directory deletion (docs/DESIGN-
+			// coordinator.md §2.2 DELETE fan-out). Independently tunable since
+			// delete work per name (a plain unlink) is much cheaper than a
+			// full stat/diff/copy pipeline, so the shapes that make sense
+			// differ.
+			DeleteSplitThreshold uint64 `yaml:"delete_split_threshold"`
+			DeleteSplitBatch     uint32 `yaml:"delete_split_batch"`
 			// Fan-out control. Coordinator-side only: these never reach an agent
 			// (D9 — the agent acts on the resolved per-shard overrides it is
 			// granted, not on policy). See SpreadPolicy.
@@ -250,6 +258,18 @@ func (s *JobSpec) ApplyDefaults() {
 	// whether to fan out at all, so lowering it does nothing once tripped.
 	if sp.Tuning.EntrylistBatch == 0 {
 		sp.Tuning.EntrylistBatch = 4_000
+	}
+	// Delete-pass fan-out: same shape as dir_split_threshold/entrylist_batch
+	// above (threshold decides whether to fan out at all; batch decides how
+	// many shards result), but delete work per name is a plain unlink, not a
+	// full stat/diff/copy pipeline, so a directory needs to be substantially
+	// larger before serializing its removal on one agent is worth avoiding
+	// the fan-out's own coordinator round-trip overhead.
+	if sp.Tuning.DeleteSplitThreshold == 0 {
+		sp.Tuning.DeleteSplitThreshold = 200_000
+	}
+	if sp.Tuning.DeleteSplitBatch == 0 {
+		sp.Tuning.DeleteSplitBatch = 20_000
 	}
 	if sp.Tuning.StatxBatch == 0 {
 		sp.Tuning.StatxBatch = 256
@@ -429,11 +449,13 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 			IopsPerAgent:      sp.Limits.IOPSPerAgent,
 		},
 		Tuning: &drsyncpb.TuningOptions{
-			ShardBudget:       sp.Tuning.ShardBudget,
-			DirSplitThreshold: sp.Tuning.DirSplitThreshold,
-			EntrylistBatch:    sp.Tuning.EntrylistBatch,
-			StatxBatch:        sp.Tuning.StatxBatch,
-			MtimeSlopNs:       sp.Tuning.MtimeSlopNS,
+			ShardBudget:          sp.Tuning.ShardBudget,
+			DirSplitThreshold:    sp.Tuning.DirSplitThreshold,
+			EntrylistBatch:       sp.Tuning.EntrylistBatch,
+			StatxBatch:           sp.Tuning.StatxBatch,
+			MtimeSlopNs:          sp.Tuning.MtimeSlopNS,
+			DeleteSplitThreshold: sp.Tuning.DeleteSplitThreshold,
+			DeleteSplitBatch:     sp.Tuning.DeleteSplitBatch,
 		},
 		DryRun:       dryRun,
 		RequireMount: *sp.Probe.RequireMount,

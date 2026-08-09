@@ -132,7 +132,7 @@ func TestShardCountsRollupConsistent(t *testing.T) {
 	assertCountsConsistent(t, s, "after lease (1 LEASED)")
 	if _, err := s.RecordSplit(shardID, 1, []NewShard{
 		{Kind: model.KindDir, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
-	}, nil, nil, 0); err != nil {
+	}, nil, nil, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	assertCountsConsistent(t, s, "after split")
@@ -379,7 +379,7 @@ func TestReapDoneShardsDeletesSplits(t *testing.T) {
 	}
 	childIDs, err := s.RecordSplit(shardID, 1, []NewShard{
 		{Kind: model.KindEntryList, RelPath: "a"}, {Kind: model.KindEntryList, RelPath: "b"},
-	}, nil, nil, 0)
+	}, nil, nil, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +410,7 @@ func TestReapDoneShardsDeletesSplits(t *testing.T) {
 	}
 	if _, err := s.RecordSplit(otherParent[0], 1, []NewShard{
 		{Kind: model.KindEntryList, RelPath: "c"},
-	}, nil, nil, 0); err != nil {
+	}, nil, nil, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1444,11 +1444,11 @@ func TestSplitIdempotency(t *testing.T) {
 		{Kind: model.KindDir, RelPath: "a"},
 		{Kind: model.KindDir, RelPath: "b"},
 	}
-	ids1, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0)
+	ids1, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ids2, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0) // retransmit
+	ids2, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0, nil) // retransmit
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1485,7 +1485,7 @@ func TestRecordSplitPreChecksDoNotBlockOnWriteConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	subs := []NewShard{{Kind: model.KindDir, RelPath: "a"}}
-	if _, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0); err != nil {
+	if _, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1504,7 +1504,7 @@ func TestRecordSplitPreChecksDoNotBlockOnWriteConnection(t *testing.T) {
 	go func() {
 		// Retransmit of the split recorded above: hits the idempotency-check
 		// fast path and must return without ever touching s.db.
-		_, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0)
+		_, err := s.RecordSplit(shardID, 7, subs, nil, nil, 0, nil)
 		done <- err
 	}()
 
@@ -1598,7 +1598,7 @@ func TestRecordSplitMissingParentIsIdempotent(t *testing.T) {
 	}
 
 	subs := []NewShard{{Kind: model.KindDir, RelPath: "a"}}
-	ids, err := s.RecordSplit(shardID, 9, subs, nil, nil, 0)
+	ids, err := s.RecordSplit(shardID, 9, subs, nil, nil, 0, nil)
 	if err != nil {
 		t.Fatalf("RecordSplit on reaped parent returned an error, want nil: %v", err)
 	}

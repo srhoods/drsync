@@ -32,17 +32,17 @@ func TestSeedLinkfixBuildsOneBatchTaskForPendingMembers(t *testing.T) {
 	// that's anchor-only (no member needs one).
 	if _, err := c.st.RecordSplit(shardID, 1, nil, nil, []store.NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/one", Nlink: 2, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.st.RecordSplit(shardID, 2, nil, nil, []store.NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "b/two", Nlink: 2, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.st.RecordSplit(shardID, 3, nil, nil, []store.NewLinkSighting{
 		{Dev: 1, Ino: 200, RelPath: "c/anchor-only", Nlink: 1, Size: 5, MtimeNs: 2},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,7 +114,7 @@ func TestSeedLinkfixFlushesAtBatchBoundary(t *testing.T) {
 			Nlink: 2, Size: 10, MtimeNs: 1,
 		}
 		if _, err := c.st.RecordSplit(shardID, seq, nil, nil,
-			[]store.NewLinkSighting{anchor}, 0); err != nil {
+			[]store.NewLinkSighting{anchor}, 0, nil); err != nil {
 			t.Fatal(err)
 		}
 		seq++
@@ -123,7 +123,7 @@ func TestSeedLinkfixFlushesAtBatchBoundary(t *testing.T) {
 			Nlink: 2, Size: 10, MtimeNs: 1,
 		}
 		if _, err := c.st.RecordSplit(shardID, seq, nil, nil,
-			[]store.NewLinkSighting{member}, 0); err != nil {
+			[]store.NewLinkSighting{member}, 0, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -228,12 +228,12 @@ func TestAdvanceReapsLinkRegistryOnLinkfixTransition(t *testing.T) {
 	// either way would not distinguish "reaped" from "never had anything").
 	if _, err := c.st.RecordSplit(shardID, 1, nil, nil, []store.NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/anchor", Nlink: 2, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := c.st.RecordSplit(shardID, 2, nil, nil, []store.NewLinkSighting{
 		{Dev: 1, Ino: 100, RelPath: "a/member", Nlink: 2, Size: 10, MtimeNs: 1},
-	}, 0); err != nil {
+	}, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
