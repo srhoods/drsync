@@ -20,6 +20,111 @@ func cleanupShard(dirRel string) NewShard {
 	return NewShard{Kind: model.KindDelete}
 }
 
+// TestDeleteGroupNestedChildBlocksParentClose is the nested fan-out
+// regression: a batch shard under "parent" ships a name ("parent/child")
+// that turns out to itself be pathological (agent/src/delete.c
+// remove_object checks EVERY directory a removal touches, not just the one
+// named in a shard's paths[]) and gets streamed off as its own delete_groups
+// row instead of being removed inline. The batch shard that shipped it
+// still reports itself done as soon as the hand-off completes — that is
+// correct, the batch has no more work — but "parent/child" is NOT yet gone,
+// so "parent" must not close (its cleanup rmdir would race an ENOTEMPTY
+// directory, or worse, close successfully while the real removal is still
+// in flight) until "parent/child"'s own group closes too.
+func TestDeleteGroupNestedChildBlocksParentClose(t *testing.T) {
+	s := openTest(t)
+	_, passID, shardID := seed(t, s)
+	if _, err := s.LeaseShards("agent-a", 1, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	const parent = "parent"
+	const child = "parent/child"
+
+	// parent's only (and therefore final) batch: one remainder shard whose
+	// job is to remove the single name "child" — which, in the real agent,
+	// turns out to be itself pathological, so it never actually gets
+	// removed by this shard; it gets streamed off as its own group instead
+	// (modeled below by directly recording a split for "child" whose parent
+	// shard is this same remainder shard).
+	parentIDs, err := s.RecordSplit(shardID, 1, []NewShard{deleteRemainderShard(parent)}, nil, nil, 0,
+		[]DeleteGroupTotal{{DirRel: parent, LastBatch: true, BuildCleanup: cleanupShard}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parentIDs) != 1 {
+		t.Fatalf("RecordSplit produced %d ids, want 1", len(parentIDs))
+	}
+	parentBatchID := parentIDs[0]
+	parentLeased, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parentLeased) != 1 || parentLeased[0].ID != parentBatchID {
+		t.Fatalf("lease mismatch: leased=%v parentBatchID=%d", parentLeased, parentBatchID)
+	}
+	parentBatchLeaseID := parentLeased[0].LeaseID
+
+	// The parent batch shard, while running, discovers "child" is itself
+	// pathological and ships it as a nested split — its own parent_shard_id
+	// is parentBatchID (the remainder shard that found it), not shardID (the
+	// original walk/delete shard) — same as agent/src/delete.c's
+	// remove_object calling stream_delete_split for a nested directory.
+	childIDs, err := s.RecordSplit(parentBatchID, 1, []NewShard{deleteRemainderShard(child)}, nil, nil, 0,
+		[]DeleteGroupTotal{{DirRel: child, LastBatch: true, BuildCleanup: cleanupShard}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(childIDs) != 1 {
+		t.Fatalf("RecordSplit produced %d ids, want 1", len(childIDs))
+	}
+
+	// The parent batch shard itself now completes (it was leased BEFORE the
+	// nested split above, so it's not re-leased here) — it did its job
+	// (handed "child" off), so it reports done. This must NOT close parent's
+	// group: parent/child's own group is still open (pending_children=1).
+	if err := s.CompleteDeleteRemainder(parentBatchID, parentBatchLeaseID, passID, parent, nil,
+		cleanupShard(parent), cleanupShard, nil); err != nil {
+		t.Fatal(err)
+	}
+	counts, err := s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only "child"'s own remainder shard should be queued — parent's cleanup
+	// must NOT have been seeded yet, since parent/child's group is still open.
+	if counts[model.ShardQueued] != 1 {
+		t.Fatalf("queued after parent's batch completes (child still pending) = %d, want 1 (only child's own remainder shard, no parent cleanup)",
+			counts[model.ShardQueued])
+	}
+
+	// Now child's own (only) remainder shard completes — its group closes,
+	// which must decrement parent's pending_children and, since parent's own
+	// counters were already satisfied, close parent's group too in the same
+	// transaction (closeDeleteGroupTx's upward walk).
+	childLeased, err := s.LeaseShards("agent-a", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(childLeased) != 1 || childLeased[0].ID != childIDs[0] {
+		t.Fatalf("lease mismatch: leased=%v childIDs=%v", childLeased, childIDs)
+	}
+	if err := s.CompleteDeleteRemainder(childLeased[0].ID, childLeased[0].LeaseID, passID, child, nil,
+		cleanupShard(child), cleanupShard, nil); err != nil {
+		t.Fatal(err)
+	}
+	counts, err = s.ShardStateCounts(passID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both cleanup shards must now be queued: child's own, and parent's
+	// (unblocked by child's closure propagating up).
+	if counts[model.ShardQueued] != 2 {
+		t.Fatalf("queued after child's group closes = %d, want 2 (child's cleanup AND parent's, unblocked by the chain)",
+			counts[model.ShardQueued])
+	}
+}
+
 // TestDeleteGroupSeedsCleanupOnceAllChildrenDone is the ordinary case: a
 // directory splits into 3 delete-remainder shards in one ShardSplit (the
 // final one carrying LastBatch), all 3 complete, and the cleanup shard for
@@ -38,9 +143,9 @@ func TestDeleteGroupSeedsCleanupOnceAllChildrenDone(t *testing.T) {
 	// One DeleteGroupTotal per batch shard (RecordSplit bumps n_total by one
 	// per entry, same units as n_done) — only the last carries LastBatch.
 	ids, err := s.RecordSplit(shardID, 1, remainders, nil, nil, 0, []DeleteGroupTotal{
-		{DirRel: dir, CleanupShard: cleanupShard(dir)},
-		{DirRel: dir, CleanupShard: cleanupShard(dir)},
-		{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)},
+		{DirRel: dir, BuildCleanup: cleanupShard},
+		{DirRel: dir, BuildCleanup: cleanupShard},
+		{DirRel: dir, LastBatch: true, BuildCleanup: cleanupShard},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +174,7 @@ func TestDeleteGroupSeedsCleanupOnceAllChildrenDone(t *testing.T) {
 
 	for i, r := range leased {
 		if err := s.CompleteDeleteRemainder(r.ID, r.LeaseID, passID, dir, nil,
-			cleanupShard(dir), nil); err != nil {
+			cleanupShard(dir), cleanupShard, nil); err != nil {
 			t.Fatalf("complete remainder %d: %v", i, err)
 		}
 		counts, err := s.ShardStateCounts(passID)
@@ -116,7 +221,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	// entry (server.go onShardSplit), so n_total is bumped to 1 here; only
 	// LastBatch (from total_children>0 on the wire) is still unset.
 	ids, err := s.RecordSplit(shardID, 1, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0,
-		[]DeleteGroupTotal{{DirRel: dir, CleanupShard: cleanupShard(dir)}})
+		[]DeleteGroupTotal{{DirRel: dir, BuildCleanup: cleanupShard}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +240,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	// finished) — reaches n_done >= n_total by coincidence, but done_streaming
 	// is still 0, so the group must NOT close yet.
 	if err := s.CompleteDeleteRemainder(leased[0].ID, leased[0].LeaseID, passID, dir, nil,
-		cleanupShard(dir), nil); err != nil {
+		cleanupShard(dir), cleanupShard, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err := s.ShardStateCounts(passID)
@@ -153,7 +258,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	// but only 1 child has completed so far, so RecordSplit itself must not
 	// close the group on this call either.
 	ids2, err := s.RecordSplit(shardID, 2, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0,
-		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)}})
+		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, BuildCleanup: cleanupShard}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +285,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 		t.Fatalf("lease mismatch: leased=%v ids2=%v", leased2, ids2)
 	}
 	if err := s.CompleteDeleteRemainder(leased2[0].ID, leased2[0].LeaseID, passID, dir, nil,
-		cleanupShard(dir), nil); err != nil {
+		cleanupShard(dir), cleanupShard, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err = s.ShardStateCounts(passID)
@@ -208,7 +313,7 @@ func TestDeleteGroupNeverSeedsCleanupTwice(t *testing.T) {
 
 	const dir = "dup-dir"
 	ids, err := s.RecordSplit(shardID, 1, []NewShard{deleteRemainderShard(dir)}, nil, nil, 0,
-		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)}})
+		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, BuildCleanup: cleanupShard}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +325,7 @@ func TestDeleteGroupNeverSeedsCleanupTwice(t *testing.T) {
 		t.Fatalf("lease mismatch: leased=%v ids=%v", leased, ids)
 	}
 	if err := s.CompleteDeleteRemainder(leased[0].ID, leased[0].LeaseID, passID, dir, nil,
-		cleanupShard(dir), nil); err != nil {
+		cleanupShard(dir), cleanupShard, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err := s.ShardStateCounts(passID)
@@ -235,7 +340,7 @@ func TestDeleteGroupNeverSeedsCleanupTwice(t *testing.T) {
 	// replay racing a reconnect, same shape RecordSplit already handles for
 	// every other split kind) must not seed a second cleanup shard.
 	if _, err := s.RecordSplit(shardID, 2, nil, nil, nil, 0,
-		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, CleanupShard: cleanupShard(dir)}}); err != nil {
+		[]DeleteGroupTotal{{DirRel: dir, LastBatch: true, BuildCleanup: cleanupShard}}); err != nil {
 		t.Fatal(err)
 	}
 	counts, err = s.ShardStateCounts(passID)
