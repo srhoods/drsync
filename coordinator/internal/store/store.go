@@ -299,14 +299,30 @@ CREATE TABLE IF NOT EXISTS chunk_groups (
 -- completion, and the "seed a cleanup shard for dir_rel" decision is checked
 -- at BOTH the write that sets done_streaming and the write that increments
 -- n_done, whichever lands last: closeable is (done_streaming=1 AND
--- n_done >= n_total).
+-- n_done>=n_total AND pending_children=0).
+--
+-- pending_children handles nesting: fan-out is checked at EVERY directory a
+-- removal touches, not just the one named in a shard's paths[] (agent/src/
+-- delete.c remove_object), so a name inside dir_rel's own batch can itself
+-- turn out to be pathological and get streamed off as ITS OWN delete_groups
+-- row instead of being removed inline. The batch shard that shipped that
+-- name still reports itself done as soon as it finishes handing the name
+-- off (correctly — the batch itself has no more work), which bumps dir_rel's
+-- n_done — but the name itself is NOT yet gone, so dir_rel must not close
+-- until that grandchild group also closes. registerPendingChild bumps
+-- dir_rel's pending_children when a nested rel_path whose parent is an open
+-- delete_groups row is first seen (RecordSplit); the child's own closing
+-- transition decrements it and re-checks the parent's closeability from the
+-- other direction — same both-sides-check pattern n_done/done_streaming
+-- already use for the flat case.
 CREATE TABLE IF NOT EXISTS delete_groups (
-  pass_id        INTEGER NOT NULL,
-  rel_path       TEXT NOT NULL,  -- the directory being emptied (dir_rel)
-  n_total        INTEGER NOT NULL DEFAULT 0,  -- split-produced DELETE shards seen so far
-  n_done         INTEGER NOT NULL DEFAULT 0,  -- of those, how many have completed
-  done_streaming INTEGER NOT NULL DEFAULT 0,  -- 1 once the final batch (EOF) has landed
-  closed         INTEGER NOT NULL DEFAULT 0,  -- 1 once the cleanup shard has been seeded (idempotency)
+  pass_id          INTEGER NOT NULL,
+  rel_path         TEXT NOT NULL,  -- the directory being emptied (dir_rel)
+  n_total          INTEGER NOT NULL DEFAULT 0,  -- split-produced DELETE shards seen so far
+  n_done           INTEGER NOT NULL DEFAULT 0,  -- of those, how many have completed
+  done_streaming   INTEGER NOT NULL DEFAULT 0,  -- 1 once the final batch (EOF) has landed
+  pending_children INTEGER NOT NULL DEFAULT 0,  -- open nested delete_groups rows spawned from a batch of this one
+  closed           INTEGER NOT NULL DEFAULT 0,  -- 1 once the cleanup shard has been seeded (idempotency)
   PRIMARY KEY (pass_id, rel_path)
 ) WITHOUT ROWID;
 
@@ -1200,22 +1216,107 @@ func recordLinkSightingsTx(tx *sql.Tx, passID int64, sightings []NewLinkSighting
 	return nil
 }
 
+// deleteGroupParent returns relPath's parent directory and true, or ("",
+// false) if relPath is already top-level (no "/") — a top-level orphan's
+// delete_groups row has no parent row to chain to (seedDeletePass's own
+// top-level DeleteBatch shards don't create one either).
+func deleteGroupParent(relPath string) (string, bool) {
+	i := strings.LastIndexByte(relPath, '/')
+	if i < 0 {
+		return "", false
+	}
+	return relPath[:i], true
+}
+
+// registerPendingChildTx bumps parent's pending_children by one, but ONLY if
+// parent itself has an open (existing, not-yet-closed) delete_groups row —
+// an ordinary directory that merely happens to contain childRel is not
+// itself being tracked, so there is nothing to chain to. Called once per
+// child, guarded by the caller checking childIsNew (the child's own
+// delete_groups row was just newly INSERTed, not already present) so a
+// retried/redelivered split for the same child never double-counts.
+func registerPendingChildTx(tx *sql.Tx, passID int64, childRel string) error {
+	parent, ok := deleteGroupParent(childRel)
+	if !ok {
+		return nil
+	}
+	n, err := execCountTx(tx, `UPDATE delete_groups SET pending_children = pending_children + 1
+		WHERE pass_id = ? AND rel_path = ? AND closed = 0`, passID, parent)
+	if err != nil {
+		return err
+	}
+	// n == 0: parent has no open delete_groups row (not itself a fan-out
+	// group — e.g. childRel's immediate parent happens to be a plain
+	// directory name that never itself split) — nothing to chain to.
+	// Deliberately not recursive beyond one level: registerPendingChildTx
+	// only links a child to its DIRECT parent's row; if that parent is
+	// itself someone else's pending child, ITS OWN closing (checked by
+	// closeDeleteGroupTx below, which walks back up via deleteGroupParent)
+	// is what propagates the chain further up, one link at a time.
+	_ = n
+	return nil
+}
+
+// closeDeleteGroupTx marks relPath's delete_groups row closed and inserts
+// cleanupShard — called once the row's own counters prove it closeable
+// (done_streaming=1, n_done>=n_total, pending_children=0). If relPath has a
+// parent row, decrements ITS pending_children and recursively re-checks
+// whether that unblocks the parent's own closure too — the chain can be
+// arbitrarily deep (a pathological directory inside a pathological
+// directory inside...), so this walks all the way up rather than handling
+// just one level. buildCleanup builds a cleanup NewShard for any dirRel
+// string (store stays payload-agnostic — same division of labor as
+// CompleteDataChunk's finalizeShard — but an ancestor's own cleanup shard is
+// only discovered while walking up the chain here, so the caller hands in a
+// builder function instead of one pre-built shard).
+func closeDeleteGroupTx(tx *sql.Tx, passID int64, relPath string, cleanupShard NewShard,
+	buildCleanup func(dirRel string) NewShard) error {
+	if _, err := insertShardsTx(tx, passID, 0, []NewShard{cleanupShard}); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE delete_groups SET closed = 1 WHERE pass_id = ? AND rel_path = ?`,
+		passID, relPath); err != nil {
+		return err
+	}
+	parent, ok := deleteGroupParent(relPath)
+	if !ok {
+		return nil
+	}
+	var pTotal, pDone, pDoneStreaming, pPending, pClosed int
+	err := tx.QueryRow(`UPDATE delete_groups SET pending_children = pending_children - 1
+		WHERE pass_id = ? AND rel_path = ? AND closed = 0
+		RETURNING n_total, n_done, done_streaming, pending_children, closed`,
+		passID, parent).Scan(&pTotal, &pDone, &pDoneStreaming, &pPending, &pClosed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // parent has no open row (not itself tracked, or already closed) — nothing to propagate
+	}
+	if err != nil {
+		return err
+	}
+	if pClosed != 0 || pDoneStreaming == 0 || pDone < pTotal || pPending > 0 {
+		return nil // parent not closeable yet from this side either
+	}
+	return closeDeleteGroupTx(tx, passID, parent, buildCleanup(parent), buildCleanup)
+}
+
 // DeleteGroupTotal records one delete-remainder batch shipped for DirRel —
 // RecordSplit bumps that group's n_total by one per entry, regardless of
 // LastBatch (see delete_groups' doc comment for why n_total counts shards,
 // not ShardSplit.DeleteRemainder.total_children's entry count). LastBatch is
 // set from total_children > 0 — the "readdir hit EOF for dirRel" signal, only
 // known on the final streamed batch, not upfront like a chunk group's
-// byte-size-derived n_chunks. CleanupShard is pre-built by the caller (store
-// stays payload-agnostic, same division of labor as CompleteDataChunk's
-// finalizeShard) and only actually inserted if every sibling delete-remainder
-// shard has already reported done by the time LastBatch lands — the same
-// race CompleteDeleteRemainder resolves from the other direction; it is only
-// read when LastBatch is true.
+// byte-size-derived n_chunks. BuildCleanup lets store build a cleanup
+// NewShard for DirRel — and, via closeDeleteGroupTx's upward walk, for any
+// ancestor directory this closure unblocks — without store itself knowing
+// the DeleteBatch payload shape (same division of labor as
+// CompleteDataChunk's finalizeShard). Only actually used once every sibling
+// delete-remainder shard has reported done AND no pending nested child group
+// remains open, by the time LastBatch lands — the same race
+// CompleteDeleteRemainder resolves from the other direction.
 type DeleteGroupTotal struct {
 	DirRel       string
 	LastBatch    bool
-	CleanupShard NewShard
+	BuildCleanup func(dirRel string) NewShard
 }
 
 // RecordSplit persists a ShardSplit idempotently: retransmits of the same
@@ -1321,35 +1422,42 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 		// two are independent shards/frames, only the parent's own
 		// ShardResult is ordered after every split it shipped (protocol
 		// §4.2), not the split's own processing relative to its children's.
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
-			passID, dt.DirRel); err != nil {
+		// n (0 or 1 rows affected) tells us whether THIS call is what
+		// created dt.DirRel's row — only then does it register as a pending
+		// child of dt.DirRel's own parent (registerPendingChildTx), so a
+		// retried/redelivered split for the same nested directory never
+		// double-bumps pending_children.
+		n, err := execCountTx(tx, `INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
+			passID, dt.DirRel)
+		if err != nil {
 			return nil, err
+		}
+		if n > 0 {
+			if err := registerPendingChildTx(tx, passID, dt.DirRel); err != nil {
+				return nil, err
+			}
 		}
 		// n_total counts shards (one per batch, this one included), never
 		// total_children — see delete_groups' doc comment.
-		var nTotal, nDone, doneStreaming, closed int
+		var nTotal, nDone, doneStreaming, pending, closed int
 		if dt.LastBatch {
 			err = tx.QueryRow(`UPDATE delete_groups SET n_total = n_total + 1, done_streaming = 1
 				WHERE pass_id = ? AND rel_path = ?
-				RETURNING n_total, n_done, done_streaming, closed`,
-				passID, dt.DirRel).Scan(&nTotal, &nDone, &doneStreaming, &closed)
+				RETURNING n_total, n_done, done_streaming, pending_children, closed`,
+				passID, dt.DirRel).Scan(&nTotal, &nDone, &doneStreaming, &pending, &closed)
 		} else {
 			err = tx.QueryRow(`UPDATE delete_groups SET n_total = n_total + 1
 				WHERE pass_id = ? AND rel_path = ?
-				RETURNING n_total, n_done, done_streaming, closed`,
-				passID, dt.DirRel).Scan(&nTotal, &nDone, &doneStreaming, &closed)
+				RETURNING n_total, n_done, done_streaming, pending_children, closed`,
+				passID, dt.DirRel).Scan(&nTotal, &nDone, &doneStreaming, &pending, &closed)
 		}
 		if err != nil {
 			return nil, err
 		}
-		if closed != 0 || doneStreaming == 0 || nDone < nTotal {
-			continue // streaming not finished, not every sibling has reported done yet, or already closed
+		if closed != 0 || doneStreaming == 0 || nDone < nTotal || pending > 0 {
+			continue // streaming not finished, siblings/nested children outstanding, or already closed
 		}
-		if _, err := insertShardsTx(tx, passID, 0, []NewShard{dt.CleanupShard}); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(`UPDATE delete_groups SET closed = 1 WHERE pass_id = ? AND rel_path = ?`,
-			passID, dt.DirRel); err != nil {
+		if err := closeDeleteGroupTx(tx, passID, dt.DirRel, dt.BuildCleanup(dt.DirRel), dt.BuildCleanup); err != nil {
 			return nil, err
 		}
 	}
@@ -1563,15 +1671,24 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 // CompleteDataChunk. relPath is the directory being emptied (dir_rel), not
 // this shard's own identity; see agentsrv.onShardResult for how a
 // split-produced KindDelete shard is told apart from an ordinary top-level
-// one. When n_done reaches n_total AND done_streaming is set (the streaming
-// parent's final DeleteRemainder batch has landed — see RecordSplit) this
-// inserts cleanupShard (built by the caller: a single-entry DeleteBatch for
-// relPath itself, run through the ordinary unmodified delete path — store
-// stays payload-agnostic, same division of labor as CompleteDataChunk's
-// finalizeShard) and marks the group closed so a re-delivered final result
-// can never seed it twice. counters folds the pass-counter accumulation into
+// one. When n_done reaches n_total, done_streaming is set (the streaming
+// parent's final DeleteRemainder batch has landed — see RecordSplit), AND no
+// pending nested child group remains open (fan-out applies at every
+// directory a removal touches, not just relPath itself — a name in one of
+// relPath's own batches can turn out to be pathological and get streamed off
+// as its own delete_groups row; relPath cannot close until that grandchild
+// closes too, see delete_groups' doc comment), this inserts cleanupShard
+// (built by the caller: a single-entry DeleteBatch for relPath itself, run
+// through the ordinary unmodified delete path — store stays payload-agnostic,
+// same division of labor as CompleteDataChunk's finalizeShard) and marks the
+// group closed so a re-delivered final result can never seed it twice, then
+// walks back up the chain (closeDeleteGroupTx) in case this was itself the
+// last blocker on relPath's own parent. buildCleanup builds a cleanup
+// NewShard for any dirRel string, used for any ancestor closeDeleteGroupTx's
+// upward walk unblocks. counters folds the pass-counter accumulation into
 // this same transaction — see CompleteShard's doc comment for why.
-func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath string, result []byte, cleanupShard NewShard, counters *drsyncpb.ShardCounters) error {
+func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath string, result []byte,
+	cleanupShard NewShard, buildCleanup func(dirRel string) NewShard, counters *drsyncpb.ShardCounters) error {
 	defer s.lockTimed("CompleteDeleteRemainder")()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1596,25 +1713,30 @@ func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath 
 	// RecordSplit's own insert for the batch that produced it — vanishingly
 	// unlikely (the grant that produced this ShardResult already required
 	// the row's shard to exist) but INSERT OR IGNORE makes the ordering
-	// irrelevant either way, same defensive shape as chunk_groups.
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
-		passID, relPath); err != nil {
+	// irrelevant either way, same defensive shape as chunk_groups. If THIS
+	// call is what creates the row, register it as relPath's parent's
+	// pending child too (registerPendingChildTx) — same as RecordSplit does
+	// for the ordinary case, just reached from the other side of the race.
+	n, err = execCountTx(tx, `INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
+		passID, relPath)
+	if err != nil {
 		return err
 	}
-	var nTotal, nDone, doneStreaming, closed int
+	if n > 0 {
+		if err := registerPendingChildTx(tx, passID, relPath); err != nil {
+			return err
+		}
+	}
+	var nTotal, nDone, doneStreaming, pending, closed int
 	if err := tx.QueryRow(`UPDATE delete_groups SET n_done = n_done + 1
-		WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, done_streaming, closed`,
-		passID, relPath).Scan(&nTotal, &nDone, &doneStreaming, &closed); err != nil {
+		WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, done_streaming, pending_children, closed`,
+		passID, relPath).Scan(&nTotal, &nDone, &doneStreaming, &pending, &closed); err != nil {
 		return err
 	}
-	if closed != 0 || doneStreaming == 0 || nDone < nTotal {
-		return tx.Commit() // already closed, streaming not finished yet, or siblings outstanding
+	if closed != 0 || doneStreaming == 0 || nDone < nTotal || pending > 0 {
+		return tx.Commit() // already closed, streaming not finished, or siblings/nested children outstanding
 	}
-	if _, err := insertShardsTx(tx, passID, 0, []NewShard{cleanupShard}); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE delete_groups SET closed = 1 WHERE pass_id = ? AND rel_path = ?`,
-		passID, relPath); err != nil {
+	if err := closeDeleteGroupTx(tx, passID, relPath, cleanupShard, buildCleanup); err != nil {
 		return err
 	}
 	return tx.Commit()

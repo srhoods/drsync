@@ -565,12 +565,12 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 		// bumps delete_groups.n_total by one per entry, so it stays in the same
 		// units as n_done (shards, not directory entries — see delete_groups'
 		// doc comment). total_children > 0 only marks LastBatch, the "readdir
-		// hit EOF" signal; the cleanup shard is pre-built regardless of whether
-		// every sibling has already reported done — RecordSplit only actually
-		// inserts it once that's true.
+		// hit EOF" signal; BuildCleanup is only actually called once every
+		// sibling AND any nested child group has reported done — RecordSplit
+		// decides that, not this loop.
 		deleteTotals = append(deleteTotals, store.DeleteGroupTotal{
 			DirRel: string(dr.DirRel), LastBatch: dr.TotalChildren > 0,
-			CleanupShard: deleteCleanupShard(string(dr.DirRel)),
+			BuildCleanup: deleteCleanupShard,
 		})
 	}
 
@@ -761,10 +761,11 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 			// seedDeletePass never does) — maintain delete_groups the same
 			// way completeChunk maintains chunk_groups, seeding a cleanup
 			// shard for the now-possibly-empty directory once every sibling
-			// has reported done.
+			// AND any nested child group (fan-out applies at every depth, not
+			// just relPath's own top level) has reported done.
 			blob, _ := proto.Marshal(r)
 			err = s.st.CompleteDeleteRemainder(shardID, leaseID, passID, relPath, blob,
-				deleteCleanupShard(relPath), r.Counters)
+				deleteCleanupShard(relPath), deleteCleanupShard, r.Counters)
 		default:
 			blob, _ := proto.Marshal(r)
 			err = s.st.CompleteShard(shardID, leaseID, passID, blob, r.Counters)

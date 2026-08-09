@@ -133,17 +133,31 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   closely than the plain directory-split (`queue_split`) mechanism, because delete
   has nothing to diff against a destination — the whole subtree is already
   condemned (D5) — so a batch is just names to remove, not a source/destination
-  merge. `remove_orphan` (`agent/src/delete.c`) probe-reads a top-level orphan
-  directory (only the path named directly in the shard's `paths[]`, not every
-  nested directory reached during recursion — same scope as the entry-list
-  trigger) up to `tuning.delete_split_threshold` entries; over that, the directory
-  is streamed via `stream_delete_split` in batches of `tuning.delete_split_batch`
-  names as `ShardSplit.DeleteRemainder` splits (wire field 7 — additive to the
-  existing `subdirs`/`entry_lists`/`big_files`/`link_sightings` repeated fields,
-  no new frame type needed) instead of being unlinked inline. `ship_split`/
+  merge. `remove_object` (`agent/src/delete.c`) probe-reads a directory up to
+  `tuning.delete_split_threshold` entries; over that, it is streamed via
+  `stream_delete_split` in batches of `tuning.delete_split_batch` names as
+  `ShardSplit.DeleteRemainder` splits (wire field 7 — additive to the existing
+  `subdirs`/`entry_lists`/`big_files`/`link_sightings` repeated fields, no new
+  frame type needed) instead of being unlinked inline. `ship_split`/
   `drain_splits` — the ack/backpressure machinery every split kind already shared
   — moved out of `walker.c` into a new `split.c` so `delete.c` can use them too
   without duplicating the ordering-invariant-critical code.
+
+  **This check applies at EVERY directory a removal touches, not just the
+  path named directly in a shard's `paths[]`.** The first version only probed
+  the top-level orphan path — `rm_dir_contents` routes every entry it finds
+  during descent back through `remove_object` rather than recursing into it
+  directly, so a subdirectory discovered at any depth that turns out to be
+  pathological is streamed out too, not just removed serially. This matters
+  because "pathological" is not the same shape as "large": a real incident
+  hit a destination-only orphan tree where NO single directory (not the top
+  orphan path, not any one subdirectory) individually exceeded the
+  threshold, but the tree as a whole summed to ~14M files and directories —
+  the delete pass finished all its other work and then sat on 2 remaining
+  shards for 6 hours, each depth-first-recursing an enormous subtree with no
+  fan-out at all, because the single-level-only check never had a reason to
+  fire anywhere in that tree — see the "found in production" note below for
+  the fix and the completion-tracking wrinkle it introduced.
 
   Unlike entry-list sharding, delete fan-out has a real completion problem
   entry-list never does: something has to remove the now-empty directory itself
@@ -194,6 +208,36 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
      construction) nor a code read caught this — it only showed up once a real
      directory failed to disappear from disk. `TestDeleteRemainderPathsJoinDirRel`
      (`agentsrv/server_test.go`) now pins the join at the `onShardSplit` level.
+
+  **Found in production, after the above shipped:** the "2 shards, 14M
+  files, 6 hours" incident above. Extending the pathological check to every
+  depth (`remove_object`/`rm_dir_contents`, not just the shard's own
+  top-level path) fixed the fan-out itself, but exposed a completion-order
+  bug the flat case structurally could not: a batch shard under `dir_rel`
+  that ships a name which turns out to be itself pathological reports
+  itself *done* the instant it hands that name off (correctly — the batch
+  has no more work of its own), which increments `dir_rel`'s `n_done` —
+  but the handed-off name is not yet actually removed, only queued as its
+  OWN separate `delete_groups` row. Before the fix, `dir_rel`'s group could
+  therefore close and seed its cleanup `rmdir` while a nested child was
+  still mid-removal: `delete_fanout_nested_e2e.sh` (built specifically
+  because the existing flat-directory e2e test structurally cannot exercise
+  this — no single directory in it is ever handed off to a nested group)
+  caught both a double-removed path (a race where the same name was
+  streamed twice) and a permanently-orphaned empty directory (the parent's
+  `rmdir` either never ran or ran too early and something after it
+  recreated nothing — the parent just silently never got removed). Fixed
+  with a `pending_children` counter on `delete_groups` (§3):
+  `registerPendingChildTx` bumps a parent's `pending_children` the first
+  time a nested child row is created under it (derived purely from the
+  child's own `rel_path` string — no explicit parent pointer needed, since
+  `orphandir/sub0000`'s parent is unambiguously `orphandir`); closing a
+  child's row (`closeDeleteGroupTx`) decrements the parent's count and
+  walks back up recursively, re-checking the parent's own closeability from
+  the other side — the same both-directions-check pattern `n_done`/
+  `done_streaming` already use, just one more hop, and applied at every
+  level so a pathological directory nested inside a pathological directory
+  inside another still closes bottom-up correctly.
 
 ### 2.3 Shard
 
@@ -250,13 +294,17 @@ chunk_groups (pass_id, rel_path, temp_name, size, mtime_ns,
               n_chunks, n_done, state)               -- large-file cross-fleet assembly;
               -- finalize task seeded (same tx as the last data chunk) at n_done==n_chunks
 delete_groups (pass_id, rel_path, n_total, n_done,          -- §2.2 DELETE fan-out; the
-              done_streaming, closed)                        -- delete-pass analogue of
+              done_streaming, pending_children, closed)      -- delete-pass analogue of
               -- chunk_groups. n_total counts split-produced DELETE *shards* (bumped by
               -- one per DeleteRemainder batch received, NOT total_children's entry
               -- count — see §2.2's "found in local verification" note for why those
               -- two must never be compared); done_streaming is set once the final
-              -- (EOF) batch lands. Cleanup shard seeded once done_streaming=1 AND
-              -- n_done>=n_total, whichever of CompleteDeleteRemainder/RecordSplit
+              -- (EOF) batch lands. pending_children counts open nested delete_groups
+              -- rows spawned from one of this row's own batches (fan-out applies at
+              -- every depth, not just rel_path's own top level — see §2.2's "found in
+              -- production" note); closeDeleteGroupTx walks this chain bottom-up.
+              -- Cleanup shard seeded once done_streaming=1 AND n_done>=n_total AND
+              -- pending_children=0, whichever of CompleteDeleteRemainder/RecordSplit
               -- observes that first (closed dedups)
 link_groups  (pass_id, dev, ino, nlink_expected, members_seen,
               anchor_rel_path, anchor_size, anchor_mtime_ns,
