@@ -506,6 +506,24 @@ file subtree that no longer exists on the source, common right after a large
 reorganization) can make the delete pass take as long as the rest of the job
 combined, with the whole fleet idle except the one agent working through it.
 
+**A deeply-branching orphan tree fans out too, even if no single directory
+is ever individually large.** `delete_split_threshold` only catches a
+directory that is itself WIDE. A tree that's pathological purely by
+aggregate depth/branching — many subdirectories, each individually well
+under the threshold, several levels deep — never trips that check
+anywhere, and would otherwise run serially inside one shard no matter how
+many millions of files it adds up to. `tuning.delete_shard_budget` (default
+250 000, objects removed) bounds the total work any ONE delete shard does
+regardless of tree shape: once a shard has removed that many objects, every
+subdirectory it hasn't opened yet is handed off as its own new shard
+instead of being recursed into, the same way `shard_budget` bounds the scan
+walker.
+
+```bash
+drsync job submit branchy-orphans.yaml --start \
+  --set spec.tuning.delete_shard_budget=50000
+```
+
 ---
 
 ## 6. Monitoring

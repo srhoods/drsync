@@ -161,7 +161,7 @@ out:
     pb_buf b;
     pb_init(&b);
     enc_shard_result(&b, it->shard_id, it->lease_id, status, &ctx.c,
-                     ctx.err[0] ? ctx.err : NULL);
+                     ctx.err[0] ? ctx.err : NULL, NULL, 0);
     out_push(FR_SHARD_RESULT, &b);
     lease_remove(it->lease_id);
     jrn_destroy(&ctx);

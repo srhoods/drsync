@@ -520,9 +520,48 @@ func (s *Server) onWorkRequest(ac *agentConn, req *drsyncpb.WorkRequest) error {
 }
 
 func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
-	shards := make([]store.NewShard, 0, len(sp.Subdirs)+len(sp.EntryLists)+len(sp.DeleteRemainders))
+	shards := make([]store.NewShard, 0, len(sp.Subdirs)+len(sp.EntryLists)+
+		len(sp.DeleteRemainders)+len(sp.DeleteSubdirs))
 	for _, d := range sp.Subdirs {
 		shards = append(shards, store.NewShard{Kind: model.KindDir, RelPath: string(d.RelPath)})
+	}
+	// deleteTotals accumulates one DeleteGroupTotal per delete_groups-tracked
+	// completion this split produces — DeleteSubdirs below (a size-1 group
+	// per handoff) and DeleteRemainders further down (one entry per streamed
+	// batch) both feed it; RecordSplit processes the whole slice together.
+	var deleteTotals []store.DeleteGroupTotal
+	// A wholly unopened subdirectory the delete pass is handing off once its
+	// shard's work budget ran out (agent/src/delete.c, delete_shard_budget) —
+	// the delete-pass analogue of Subdirs above, NOT of DeleteRemainders: the
+	// receiving shard starts its own fresh budget and re-runs the same
+	// remove_object descent on d.RelPath from scratch, exactly like a
+	// top-level orphan from seedDeletePass. See ShardSplit.delete_subdirs'
+	// doc comment for why this exists alongside DeleteRemainder: that
+	// mechanism only catches a directory that is itself wide; this one bounds
+	// one shard's total work regardless of tree shape.
+	//
+	// RelPath is set to d.RelPath itself (unlike an ordinary seedDeletePass
+	// shard, whose RelPath is empty) so onShardResult can register this
+	// handoff against delete_groups: the parent shard that handed d.RelPath
+	// off does NOT wait for it (it has already moved on to its own
+	// siblings), so nothing stops it from calling rmdir on ITS OWN directory
+	// before d.RelPath has actually finished being removed elsewhere — the
+	// exact same completion-order gap DeleteRemainder had, just via a
+	// different hand-off path. Registering d.RelPath as a size-1,
+	// already-done-streaming delete_groups entry lets the SAME
+	// pending_children chain (registerPendingChildTx/closeDeleteGroupTx)
+	// hold the parent's own group open until this shard reports done.
+	for _, d := range sp.DeleteSubdirs {
+		payload, err := proto.Marshal(&drsyncpb.DeleteBatch{RelPaths: [][]byte{d.RelPath}})
+		if err != nil {
+			return err
+		}
+		shards = append(shards, store.NewShard{
+			Kind: model.KindDelete, RelPath: string(d.RelPath), Payload: payload})
+		deleteTotals = append(deleteTotals, store.DeleteGroupTotal{
+			DirRel: string(d.RelPath), LastBatch: true, NoSelfCleanup: true,
+			BuildCleanup: deleteCleanupShard,
+		})
 	}
 	for _, el := range sp.EntryLists {
 		payload, err := proto.Marshal(&drsyncpb.EntryListShard{
@@ -540,7 +579,6 @@ func (s *Server) onShardSplit(ac *agentConn, sp *drsyncpb.ShardSplit) error {
 	// the top-level batches; job_id/pass_no/task_id are filled at grant time
 	// from the shard row (buildItem), same as every other split-produced
 	// kind.
-	var deleteTotals []store.DeleteGroupTotal
 	for _, dr := range sp.DeleteRemainders {
 		// dr.Names are bare basenames (agent readdir entries, delete.c
 		// flush_delete_split) — DeleteBatch.RelPaths must be full paths
@@ -755,17 +793,37 @@ func (s *Server) onShardResult(ac *agentConn, r *drsyncpb.ShardResult) error {
 		switch {
 		case kind == model.KindChunk:
 			err = s.completeChunk(passID, shardID, leaseID, payload, r)
-		case kind == model.KindDelete && relPath != "":
-			// A split-produced delete-remainder shard (onShardSplit sets
-			// RelPath to the directory it's emptying; a top-level batch from
-			// seedDeletePass never does) — maintain delete_groups the same
+		case kind == model.KindDelete:
+			// EVERY KindDelete shard's completion goes through here now, not
+			// just split-produced ones (relPath != "") — a plain top-level
+			// orphan shard from seedDeletePass (relPath == "") can ALSO carry
+			// DeferredRmdirs: the production incident this fixed was exactly
+			// that shape, a top-level shard deferring its own path's rmdir
+			// because a budget handoff fired somewhere in its own recursion.
+			//
+			// relPath != "" means this shard is itself tracked in
+			// delete_groups — either a DeleteRemainder batch (onShardSplit
+			// sets RelPath to the directory it's emptying) or a budget
+			// handoff (ShardSplit.delete_subdirs, RelPath set to the
+			// handed-off directory itself). Maintain delete_groups the same
 			// way completeChunk maintains chunk_groups, seeding a cleanup
 			// shard for the now-possibly-empty directory once every sibling
-			// AND any nested child group (fan-out applies at every depth, not
-			// just relPath's own top level) has reported done.
+			// AND any nested child group (fan-out applies at every depth)
+			// has reported done. isHandoff distinguishes the two relPath!=""
+			// shapes: a budget handoff's own DeleteBatch is exactly one path
+			// equal to relPath itself (it already removed relPath as an
+			// ordinary top-level orphan, agent/src/delete.c remove_object
+			// top_level=true) — seeding a cleanup shard for it too would be
+			// a redundant rmdir. A DeleteRemainder batch's paths are always
+			// children UNDER dir_rel, never equal to it, so this check
+			// never misfires on the ordinary case.
+			var batch drsyncpb.DeleteBatch
+			isHandoff := relPath != "" && proto.Unmarshal(payload, &batch) == nil &&
+				len(batch.RelPaths) == 1 && string(batch.RelPaths[0]) == relPath
 			blob, _ := proto.Marshal(r)
 			err = s.st.CompleteDeleteRemainder(shardID, leaseID, passID, relPath, blob,
-				deleteCleanupShard(relPath), deleteCleanupShard, r.Counters)
+				!isHandoff, deleteCleanupShard(relPath), deleteCleanupShard,
+				r.DeferredRmdirs, r.Counters)
 		default:
 			blob, _ := proto.Marshal(r)
 			err = s.st.CompleteShard(shardID, leaseID, passID, blob, r.Counters)

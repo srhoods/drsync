@@ -149,6 +149,13 @@ struct job_options {
      * depth-first by one agent. */
     uint64_t delete_split_threshold;
     uint32_t delete_split_batch; /* names per split-produced DELETE shard (0 = built-in default) */
+    /* Work budget for one DELETE shard, in objects removed — the delete-pass
+     * analogue of shard_budget above, mirroring queue_split rather than
+     * delete_split_threshold/delete_split_batch: bounds total work per shard
+     * regardless of tree SHAPE, catching a tree pathological by aggregate
+     * depth/branching with no single directory individually over
+     * delete_split_threshold (docs/DESIGN-coordinator.md §2.2). */
+    uint64_t delete_shard_budget;
     uint32_t statx_batch; /* target statx in flight per walker ⇒ io_uring ring depth */
     int64_t  mtime_slop_ns;
     bool     dry_run;
@@ -340,6 +347,15 @@ void enc_entrylist_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
 void enc_delete_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                       const char *dir_rel, char *const *names, size_t n_names,
                       uint32_t total_children);
+/* ShardSplit carrying delete_subdirs: wholly UNOPENED subdirectories being
+ * handed off as their own new independent, top-level DELETE shards — the
+ * delete-pass analogue of enc_shard_split's subdirs above, not of
+ * enc_delete_split (see ShardSplit.delete_subdirs' doc comment: this bounds
+ * one shard's total work regardless of tree shape, catching a tree
+ * pathological by aggregate depth/branching with no single directory ever
+ * individually exceeding delete_split_threshold). */
+void enc_delete_subdir_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                             char *const *subdirs, size_t n_subdirs);
 /* ShardSplit carrying big files: rel_path + size + mtime_ns each. The
  * coordinator lays them out into ChunkTasks (proto ShardSplit.BigFile). */
 struct bigfile {
@@ -363,8 +379,12 @@ struct linksighting {
 };
 void enc_linksighting_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                             const struct linksighting *sightings, size_t n_sightings);
+/* deferred_rmdirs/n_deferred_rmdirs: DELETE shards only (delete.c) — pass
+ * NULL/0 for every other kind. See ShardResult.deferred_rmdirs' doc comment
+ * (proto/drsync.proto) for what these are. */
 void enc_shard_result(pb_buf *b, uint64_t shard_id, uint64_t lease_id, int status,
-                      const struct shard_counters *c, const char *error);
+                      const struct shard_counters *c, const char *error,
+                      char *const *deferred_rmdirs, size_t n_deferred_rmdirs);
 void enc_stats(pb_buf *b, const struct stats_snapshot *s);
 
 /* journal (docs/DESIGN-coordinator.md §5): records are varint-length-

@@ -283,6 +283,17 @@ message TuningOptions {
   // pipeline, so the shapes that make sense for each can differ.
   uint64 delete_split_threshold = 7;
   uint32 delete_split_batch     = 8;  // names per split-produced DELETE shard (0 = built-in default)
+  // Work budget for one DELETE shard, in objects removed — the delete-pass
+  // analogue of shard_budget (field 1) above, mirroring the scan walker's
+  // queue_split rather than delete_split_threshold/entrylist_batch: bounds
+  // the total work any one shard does regardless of tree SHAPE, catching a
+  // tree that is pathological by aggregate depth/branching even when no
+  // single directory anywhere in it individually exceeds
+  // delete_split_threshold (docs/DESIGN-coordinator.md §2.2). Once exhausted
+  // mid-descent, every not-yet-opened subdirectory still queued for removal
+  // is handed off as its own new top-level DELETE shard
+  // (ShardSplit.delete_subdirs) instead of being recursed into inline.
+  uint64 delete_shard_budget    = 9;
 }
 
 message JobOptions {
@@ -547,6 +558,20 @@ message ShardSplit {
   repeated BigFile         big_files         = 5;
   repeated LinkSighting    link_sightings    = 6;
   repeated DeleteRemainder delete_remainders = 7;
+  // A wholly UNOPENED subdirectory the delete pass is handing off as its own
+  // independent, top-level DELETE shard once this shard's work budget
+  // (tuning.delete_shard_budget, agent/src/delete.c) runs out mid-descent —
+  // the delete-pass analogue of the scan walker's queue_split/subdirs above,
+  // not of DeleteRemainder: DeleteRemainder streams a directory's OWN entries
+  // once that one directory looks pathological by its immediate entry count;
+  // this instead bounds the total work any ONE delete shard does regardless
+  // of tree shape, catching a tree that is pathological by aggregate
+  // depth/branching with no single directory (at any level) ever individually
+  // exceeding delete_split_threshold. rel_path reuses NewShard's shape (a
+  // bare relative path, nothing else needed — the receiving shard starts a
+  // fresh budget and re-runs the same remove_object/rm_dir_contents descent
+  // from scratch on it, exactly like a top-level orphan from seedDeletePass).
+  repeated NewShard        delete_subdirs    = 8;
 }
 
 message ShardSplitAck {
@@ -603,6 +628,21 @@ message ShardResult {
   ResultStatus status   = 3;
   ShardCounters counters = 4;
   string error          = 5;
+  // DELETE shards only (agent/src/delete.c): relative paths of directories
+  // this shard processed INLINE (rm_tree, never handed off via
+  // queue_delete_subdir or stream_delete_split — individually too small to
+  // trigger either) whose own rmdir it deliberately skipped, because a
+  // descendant somewhere beneath it WAS handed off during this shard's run
+  // and therefore might still be in flight elsewhere. Every directory's
+  // contents are still fully removed by the time it lands here — only the
+  // directory's own rmdir is deferred. The coordinator's delete_groups
+  // tracking (registerPendingChildTx creates an ancestor row for exactly
+  // this case) treats each path here as that ancestor's own work finishing
+  // (n_done=1) — its cleanup shard (the actual deferred rmdir) is seeded
+  // once BOTH this lands AND every descendant handoff's own group has
+  // closed (pending_children=0), same closeDeleteGroupTx chain already
+  // used for every other delete-fan-out completion path.
+  repeated bytes deferred_rmdirs = 6;
 }
 
 message TaskResult {

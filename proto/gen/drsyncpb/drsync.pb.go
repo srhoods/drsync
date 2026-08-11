@@ -1953,8 +1953,19 @@ type TuningOptions struct {
 	// pipeline, so the shapes that make sense for each can differ.
 	DeleteSplitThreshold uint64 `protobuf:"varint,7,opt,name=delete_split_threshold,json=deleteSplitThreshold,proto3" json:"delete_split_threshold,omitempty"`
 	DeleteSplitBatch     uint32 `protobuf:"varint,8,opt,name=delete_split_batch,json=deleteSplitBatch,proto3" json:"delete_split_batch,omitempty"` // names per split-produced DELETE shard (0 = built-in default)
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Work budget for one DELETE shard, in objects removed — the delete-pass
+	// analogue of shard_budget (field 1) above, mirroring the scan walker's
+	// queue_split rather than delete_split_threshold/entrylist_batch: bounds
+	// the total work any one shard does regardless of tree SHAPE, catching a
+	// tree that is pathological by aggregate depth/branching even when no
+	// single directory anywhere in it individually exceeds
+	// delete_split_threshold (docs/DESIGN-coordinator.md §2.2). Once exhausted
+	// mid-descent, every not-yet-opened subdirectory still queued for removal
+	// is handed off as its own new top-level DELETE shard
+	// (ShardSplit.delete_subdirs) instead of being recursed into inline.
+	DeleteShardBudget uint64 `protobuf:"varint,9,opt,name=delete_shard_budget,json=deleteShardBudget,proto3" json:"delete_shard_budget,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *TuningOptions) Reset() {
@@ -2039,6 +2050,13 @@ func (x *TuningOptions) GetDeleteSplitThreshold() uint64 {
 func (x *TuningOptions) GetDeleteSplitBatch() uint32 {
 	if x != nil {
 		return x.DeleteSplitBatch
+	}
+	return 0
+}
+
+func (x *TuningOptions) GetDeleteShardBudget() uint64 {
+	if x != nil {
+		return x.DeleteShardBudget
 	}
 	return 0
 }
@@ -3546,8 +3564,22 @@ type ShardSplit struct {
 	BigFiles         []*ShardSplit_BigFile         `protobuf:"bytes,5,rep,name=big_files,json=bigFiles,proto3" json:"big_files,omitempty"`
 	LinkSightings    []*ShardSplit_LinkSighting    `protobuf:"bytes,6,rep,name=link_sightings,json=linkSightings,proto3" json:"link_sightings,omitempty"`
 	DeleteRemainders []*ShardSplit_DeleteRemainder `protobuf:"bytes,7,rep,name=delete_remainders,json=deleteRemainders,proto3" json:"delete_remainders,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// A wholly UNOPENED subdirectory the delete pass is handing off as its own
+	// independent, top-level DELETE shard once this shard's work budget
+	// (tuning.delete_shard_budget, agent/src/delete.c) runs out mid-descent —
+	// the delete-pass analogue of the scan walker's queue_split/subdirs above,
+	// not of DeleteRemainder: DeleteRemainder streams a directory's OWN entries
+	// once that one directory looks pathological by its immediate entry count;
+	// this instead bounds the total work any ONE delete shard does regardless
+	// of tree shape, catching a tree that is pathological by aggregate
+	// depth/branching with no single directory (at any level) ever individually
+	// exceeding delete_split_threshold. rel_path reuses NewShard's shape (a
+	// bare relative path, nothing else needed — the receiving shard starts a
+	// fresh budget and re-runs the same remove_object/rm_dir_contents descent
+	// from scratch on it, exactly like a top-level orphan from seedDeletePass).
+	DeleteSubdirs []*ShardSplit_NewShard `protobuf:"bytes,8,rep,name=delete_subdirs,json=deleteSubdirs,proto3" json:"delete_subdirs,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ShardSplit) Reset() {
@@ -3625,6 +3657,13 @@ func (x *ShardSplit) GetLinkSightings() []*ShardSplit_LinkSighting {
 func (x *ShardSplit) GetDeleteRemainders() []*ShardSplit_DeleteRemainder {
 	if x != nil {
 		return x.DeleteRemainders
+	}
+	return nil
+}
+
+func (x *ShardSplit) GetDeleteSubdirs() []*ShardSplit_NewShard {
+	if x != nil {
+		return x.DeleteSubdirs
 	}
 	return nil
 }
@@ -3882,14 +3921,29 @@ func (x *ShardCounters) GetLinkFallback() uint64 {
 }
 
 type ShardResult struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ShardId       uint64                 `protobuf:"varint,1,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
-	LeaseId       uint64                 `protobuf:"varint,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
-	Status        ResultStatus           `protobuf:"varint,3,opt,name=status,proto3,enum=drsync.v1.ResultStatus" json:"status,omitempty"`
-	Counters      *ShardCounters         `protobuf:"bytes,4,opt,name=counters,proto3" json:"counters,omitempty"`
-	Error         string                 `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	ShardId  uint64                 `protobuf:"varint,1,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
+	LeaseId  uint64                 `protobuf:"varint,2,opt,name=lease_id,json=leaseId,proto3" json:"lease_id,omitempty"`
+	Status   ResultStatus           `protobuf:"varint,3,opt,name=status,proto3,enum=drsync.v1.ResultStatus" json:"status,omitempty"`
+	Counters *ShardCounters         `protobuf:"bytes,4,opt,name=counters,proto3" json:"counters,omitempty"`
+	Error    string                 `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
+	// DELETE shards only (agent/src/delete.c): relative paths of directories
+	// this shard processed INLINE (rm_tree, never handed off via
+	// queue_delete_subdir or stream_delete_split — individually too small to
+	// trigger either) whose own rmdir it deliberately skipped, because a
+	// descendant somewhere beneath it WAS handed off during this shard's run
+	// and therefore might still be in flight elsewhere. Every directory's
+	// contents are still fully removed by the time it lands here — only the
+	// directory's own rmdir is deferred. The coordinator's delete_groups
+	// tracking (registerPendingChildTx creates an ancestor row for exactly
+	// this case) treats each path here as that ancestor's own work finishing
+	// (n_done=1) — its cleanup shard (the actual deferred rmdir) is seeded
+	// once BOTH this lands AND every descendant handoff's own group has
+	// closed (pending_children=0), same closeDeleteGroupTx chain already
+	// used for every other delete-fan-out completion path.
+	DeferredRmdirs [][]byte `protobuf:"bytes,6,rep,name=deferred_rmdirs,json=deferredRmdirs,proto3" json:"deferred_rmdirs,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ShardResult) Reset() {
@@ -3955,6 +4009,13 @@ func (x *ShardResult) GetError() string {
 		return x.Error
 	}
 	return ""
+}
+
+func (x *ShardResult) GetDeferredRmdirs() [][]byte {
+	if x != nil {
+		return x.DeferredRmdirs
+	}
+	return nil
 }
 
 type TaskResult struct {
@@ -5068,7 +5129,7 @@ const file_drsync_proto_rawDesc = "" +
 	"\rFSYNC_BATCHED\x10\x02\"d\n" +
 	"\fLimitOptions\x12.\n" +
 	"\x13bandwidth_per_agent\x18\x01 \x01(\x04R\x11bandwidthPerAgent\x12$\n" +
-	"\x0eiops_per_agent\x18\x02 \x01(\x04R\fiopsPerAgent\"\xd8\x02\n" +
+	"\x0eiops_per_agent\x18\x02 \x01(\x04R\fiopsPerAgent\"\x88\x03\n" +
 	"\rTuningOptions\x12!\n" +
 	"\fshard_budget\x18\x01 \x01(\x04R\vshardBudget\x12.\n" +
 	"\x13dir_split_threshold\x18\x02 \x01(\x04R\x11dirSplitThreshold\x12\x1f\n" +
@@ -5078,7 +5139,8 @@ const file_drsync_proto_rawDesc = "" +
 	"\rop_deadline_s\x18\x05 \x01(\rR\vopDeadlineS\x12'\n" +
 	"\x0fentrylist_batch\x18\x06 \x01(\rR\x0eentrylistBatch\x124\n" +
 	"\x16delete_split_threshold\x18\a \x01(\x04R\x14deleteSplitThreshold\x12,\n" +
-	"\x12delete_split_batch\x18\b \x01(\rR\x10deleteSplitBatch\"\xff\x03\n" +
+	"\x12delete_split_batch\x18\b \x01(\rR\x10deleteSplitBatch\x12.\n" +
+	"\x13delete_shard_budget\x18\t \x01(\x04R\x11deleteShardBudget\"\xff\x03\n" +
 	"\n" +
 	"JobOptions\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x19\n" +
@@ -5206,7 +5268,7 @@ const file_drsync_proto_rawDesc = "" +
 	"\x04item\"g\n" +
 	"\tWorkGrant\x12)\n" +
 	"\x05items\x18\x01 \x03(\v2\x13.drsync.v1.WorkItemR\x05items\x12/\n" +
-	"\aoptions\x18\x02 \x03(\v2\x15.drsync.v1.JobOptionsR\aoptions\"\xd9\x06\n" +
+	"\aoptions\x18\x02 \x03(\v2\x15.drsync.v1.JobOptionsR\aoptions\"\xa0\a\n" +
 	"\n" +
 	"ShardSplit\x12&\n" +
 	"\x0fparent_shard_id\x18\x01 \x01(\x04R\rparentShardId\x12\x10\n" +
@@ -5216,7 +5278,8 @@ const file_drsync_proto_rawDesc = "" +
 	"entryLists\x12:\n" +
 	"\tbig_files\x18\x05 \x03(\v2\x1d.drsync.v1.ShardSplit.BigFileR\bbigFiles\x12I\n" +
 	"\x0elink_sightings\x18\x06 \x03(\v2\".drsync.v1.ShardSplit.LinkSightingR\rlinkSightings\x12R\n" +
-	"\x11delete_remainders\x18\a \x03(\v2%.drsync.v1.ShardSplit.DeleteRemainderR\x10deleteRemainders\x1a%\n" +
+	"\x11delete_remainders\x18\a \x03(\v2%.drsync.v1.ShardSplit.DeleteRemainderR\x10deleteRemainders\x12E\n" +
+	"\x0edelete_subdirs\x18\b \x03(\v2\x1e.drsync.v1.ShardSplit.NewShardR\rdeleteSubdirs\x1a%\n" +
 	"\bNewShard\x12\x19\n" +
 	"\brel_path\x18\x01 \x01(\fR\arelPath\x1a=\n" +
 	"\fNewEntryList\x12\x17\n" +
@@ -5263,13 +5326,14 @@ const file_drsync_proto_rawDesc = "" +
 	"verifyFail\x12#\n" +
 	"\rlinks_created\x18\x11 \x01(\x04R\flinksCreated\x12*\n" +
 	"\x11link_anchor_races\x18\x12 \x01(\x04R\x0flinkAnchorRaces\x12#\n" +
-	"\rlink_fallback\x18\x13 \x01(\x04R\flinkFallback\"\xc0\x01\n" +
+	"\rlink_fallback\x18\x13 \x01(\x04R\flinkFallback\"\xe9\x01\n" +
 	"\vShardResult\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\x04R\ashardId\x12\x19\n" +
 	"\blease_id\x18\x02 \x01(\x04R\aleaseId\x12/\n" +
 	"\x06status\x18\x03 \x01(\x0e2\x17.drsync.v1.ResultStatusR\x06status\x124\n" +
 	"\bcounters\x18\x04 \x01(\v2\x18.drsync.v1.ShardCountersR\bcounters\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error\"\xcf\x02\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\x12'\n" +
+	"\x0fdeferred_rmdirs\x18\x06 \x03(\fR\x0edeferredRmdirs\"\xcf\x02\n" +
 	"\n" +
 	"TaskResult\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\x04R\x06taskId\x12\x19\n" +
@@ -5497,21 +5561,22 @@ var file_drsync_proto_depIdxs = []int32{
 	58, // 37: drsync.v1.ShardSplit.big_files:type_name -> drsync.v1.ShardSplit.BigFile
 	59, // 38: drsync.v1.ShardSplit.link_sightings:type_name -> drsync.v1.ShardSplit.LinkSighting
 	60, // 39: drsync.v1.ShardSplit.delete_remainders:type_name -> drsync.v1.ShardSplit.DeleteRemainder
-	2,  // 40: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
-	46, // 41: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
-	2,  // 42: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
-	10, // 43: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
-	10, // 44: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
-	48, // 45: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
-	8,  // 46: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
-	9,  // 47: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
-	9,  // 48: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
-	53, // 49: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
-	50, // [50:50] is the sub-list for method output_type
-	50, // [50:50] is the sub-list for method input_type
-	50, // [50:50] is the sub-list for extension type_name
-	50, // [50:50] is the sub-list for extension extendee
-	0,  // [0:50] is the sub-list for field type_name
+	56, // 40: drsync.v1.ShardSplit.delete_subdirs:type_name -> drsync.v1.ShardSplit.NewShard
+	2,  // 41: drsync.v1.ShardResult.status:type_name -> drsync.v1.ResultStatus
+	46, // 42: drsync.v1.ShardResult.counters:type_name -> drsync.v1.ShardCounters
+	2,  // 43: drsync.v1.TaskResult.status:type_name -> drsync.v1.ResultStatus
+	10, // 44: drsync.v1.TaskResult.src_caps:type_name -> drsync.v1.MountCaps
+	10, // 45: drsync.v1.TaskResult.dst_caps:type_name -> drsync.v1.MountCaps
+	48, // 46: drsync.v1.TaskResultBatch.results:type_name -> drsync.v1.TaskResult
+	8,  // 47: drsync.v1.JournalRecord.type:type_name -> drsync.v1.JournalRecord.Type
+	9,  // 48: drsync.v1.JournalRecord.src:type_name -> drsync.v1.StatInfo
+	9,  // 49: drsync.v1.JournalRecord.dst:type_name -> drsync.v1.StatInfo
+	53, // 50: drsync.v1.StatsReport.latencies:type_name -> drsync.v1.LatencyHistogram
+	51, // [51:51] is the sub-list for method output_type
+	51, // [51:51] is the sub-list for method input_type
+	51, // [51:51] is the sub-list for extension type_name
+	51, // [51:51] is the sub-list for extension extendee
+	0,  // [0:51] is the sub-list for field type_name
 }
 
 func init() { file_drsync_proto_init() }

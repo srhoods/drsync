@@ -1228,51 +1228,88 @@ func deleteGroupParent(relPath string) (string, bool) {
 	return relPath[:i], true
 }
 
-// registerPendingChildTx bumps parent's pending_children by one, but ONLY if
-// parent itself has an open (existing, not-yet-closed) delete_groups row —
-// an ordinary directory that merely happens to contain childRel is not
-// itself being tracked, so there is nothing to chain to. Called once per
-// child, guarded by the caller checking childIsNew (the child's own
-// delete_groups row was just newly INSERTed, not already present) so a
-// retried/redelivered split for the same child never double-counts.
+// registerPendingChildTx bumps parent's pending_children by one, creating
+// parent's delete_groups row first if it doesn't exist yet. It climbs
+// further up PAST parent — through every ancestor of childRel, all the way
+// to the top-level orphan path itself (deleteGroupParent returns ok=false
+// there — no slash left) — but ONLY as long as each level's row is being
+// created for the FIRST time by this very call; the moment a level's row
+// already existed, that level is already correctly tracking exactly one
+// pending child (whichever descendant triggered ITS OWN creation earlier),
+// and the climb stops there — bumping any level ABOVE an already-existing
+// row would double (or N-times) count every later, unrelated handoff
+// elsewhere under that same already-tracked ancestor. This matters for a
+// directory being processed INLINE by rm_tree's own recursion (never itself
+// handed off via queue_delete_subdir or DeleteRemainder — it's simply too
+// small to trigger either mechanism on its own): such a directory has NO
+// delete_groups row until something ELSEWHERE in its subtree gets handed
+// off, at which point this walk retroactively creates one for it (and, only
+// the FIRST time, everything above it up to the top-level orphan) so
+// rm_tree can later find it and defer that directory's own rmdir until the
+// handoff's group closes — see rm_tree's own pending-check before its
+// rmdir call. Each newly-created row along the way is marked
+// done_streaming=1, n_total=1, n_done=0 immediately: unlike a
+// DeleteRemainder group (many sibling batches) or a budget-handoff leaf (one
+// shard, already known), an inline ancestor's "n_total" is always exactly
+// one thing — its own rm_tree call finishing — so there is nothing further
+// to stream in; n_done is bumped later by CompleteDeleteRemainder processing
+// the containing shard's own ShardResult.deferred_rmdirs.
 func registerPendingChildTx(tx *sql.Tx, passID int64, childRel string) error {
-	parent, ok := deleteGroupParent(childRel)
-	if !ok {
-		return nil
+	for {
+		parent, ok := deleteGroupParent(childRel)
+		if !ok {
+			return nil
+		}
+		n, err := execCountTx(tx, `INSERT OR IGNORE INTO delete_groups
+			(pass_id, rel_path, n_total, n_done, done_streaming) VALUES (?, ?, 1, 0, 1)`,
+			passID, parent)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE delete_groups SET pending_children = pending_children + 1
+			WHERE pass_id = ? AND rel_path = ? AND closed = 0`, passID, parent); err != nil {
+			return err
+		}
+		if n == 0 {
+			// parent's row already existed — it's already tracking exactly
+			// one pending child from whatever handoff first created it;
+			// stop here, do NOT also bump anything further up the chain for
+			// this (different, later, unrelated) handoff.
+			return nil
+		}
+		childRel = parent
 	}
-	n, err := execCountTx(tx, `UPDATE delete_groups SET pending_children = pending_children + 1
-		WHERE pass_id = ? AND rel_path = ? AND closed = 0`, passID, parent)
-	if err != nil {
-		return err
-	}
-	// n == 0: parent has no open delete_groups row (not itself a fan-out
-	// group — e.g. childRel's immediate parent happens to be a plain
-	// directory name that never itself split) — nothing to chain to.
-	// Deliberately not recursive beyond one level: registerPendingChildTx
-	// only links a child to its DIRECT parent's row; if that parent is
-	// itself someone else's pending child, ITS OWN closing (checked by
-	// closeDeleteGroupTx below, which walks back up via deleteGroupParent)
-	// is what propagates the chain further up, one link at a time.
-	_ = n
-	return nil
 }
 
-// closeDeleteGroupTx marks relPath's delete_groups row closed and inserts
-// cleanupShard — called once the row's own counters prove it closeable
-// (done_streaming=1, n_done>=n_total, pending_children=0). If relPath has a
-// parent row, decrements ITS pending_children and recursively re-checks
-// whether that unblocks the parent's own closure too — the chain can be
-// arbitrarily deep (a pathological directory inside a pathological
-// directory inside...), so this walks all the way up rather than handling
-// just one level. buildCleanup builds a cleanup NewShard for any dirRel
-// string (store stays payload-agnostic — same division of labor as
-// CompleteDataChunk's finalizeShard — but an ancestor's own cleanup shard is
-// only discovered while walking up the chain here, so the caller hands in a
-// builder function instead of one pre-built shard).
-func closeDeleteGroupTx(tx *sql.Tx, passID int64, relPath string, cleanupShard NewShard,
-	buildCleanup func(dirRel string) NewShard) error {
-	if _, err := insertShardsTx(tx, passID, 0, []NewShard{cleanupShard}); err != nil {
-		return err
+// closeDeleteGroupTx marks relPath's delete_groups row closed — called once
+// the row's own counters prove it closeable (done_streaming=1,
+// n_done>=n_total, pending_children=0). If seedCleanup, also inserts
+// cleanupShard: true for an ordinary DeleteRemainder group (individual
+// batch shards only ever remove entries INSIDE relPath, never relPath
+// itself — something has to). false for a budget-handoff group
+// (queue_delete_subdir/ShardSplit.delete_subdirs): the single shard that
+// makes up that "group" already IS a top-level orphan removal that removes
+// relPath itself as part of its own ordinary completion (agent/src/
+// delete.c remove_object with top_level=true), so a second cleanup shard
+// here would be a redundant rmdir of something already gone. If relPath has
+// a parent row, decrements ITS pending_children and recursively re-checks
+// whether that unblocks the parent's own closure too (ALWAYS with
+// seedCleanup=true from here on up — every ancestor in the chain is an
+// ordinary DeleteRemainder-tracked directory, only the leaf that started
+// the chain can be a budget handoff) — the chain can be arbitrarily deep
+// (a pathological directory inside a pathological directory inside...), so
+// this walks all the way up rather than handling just one level.
+// buildCleanup builds a cleanup NewShard for any dirRel string (store stays
+// payload-agnostic — same division of labor as CompleteDataChunk's
+// finalizeShard — but an ancestor's own cleanup shard is only discovered
+// while walking up the chain here, so the caller hands in a builder
+// function instead of one pre-built shard).
+func closeDeleteGroupTx(tx *sql.Tx, passID int64, relPath string, seedCleanup bool,
+	cleanupShard NewShard, buildCleanup func(dirRel string) NewShard) error {
+	if seedCleanup {
+		if _, err := insertShardsTx(tx, passID, 0, []NewShard{cleanupShard}); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(`UPDATE delete_groups SET closed = 1 WHERE pass_id = ? AND rel_path = ?`,
 		passID, relPath); err != nil {
@@ -1296,7 +1333,11 @@ func closeDeleteGroupTx(tx *sql.Tx, passID int64, relPath string, cleanupShard N
 	if pClosed != 0 || pDoneStreaming == 0 || pDone < pTotal || pPending > 0 {
 		return nil // parent not closeable yet from this side either
 	}
-	return closeDeleteGroupTx(tx, passID, parent, buildCleanup(parent), buildCleanup)
+	// Every ancestor walked to from here is an ordinary DeleteRemainder-
+	// tracked directory (only the LEAF that started this call can be a
+	// budget-handoff group — see this function's doc comment), so its own
+	// cleanup shard is always needed: seedCleanup=true unconditionally.
+	return closeDeleteGroupTx(tx, passID, parent, true, buildCleanup(parent), buildCleanup)
 }
 
 // DeleteGroupTotal records one delete-remainder batch shipped for DirRel —
@@ -1309,14 +1350,24 @@ func closeDeleteGroupTx(tx *sql.Tx, passID int64, relPath string, cleanupShard N
 // NewShard for DirRel — and, via closeDeleteGroupTx's upward walk, for any
 // ancestor directory this closure unblocks — without store itself knowing
 // the DeleteBatch payload shape (same division of labor as
-// CompleteDataChunk's finalizeShard). Only actually used once every sibling
-// delete-remainder shard has reported done AND no pending nested child group
-// remains open, by the time LastBatch lands — the same race
-// CompleteDeleteRemainder resolves from the other direction.
+// CompleteDataChunk's finalizeShard). NoSelfCleanup skips seeding a cleanup
+// shard for DirRel ITSELF when this group closes (an ancestor this closure
+// unblocks still gets its own cleanup seeded regardless — only DirRel's own
+// is skipped): set for a budget-handoff group (ShardSplit.delete_subdirs),
+// whose single shard already removes DirRel itself as an ordinary top-level
+// orphan (agent/src/delete.c remove_object, top_level=true) — a cleanup
+// shard here would be a redundant rmdir of something already gone. Left
+// false (the default, seed the cleanup) for an ordinary DeleteRemainder
+// group, where individual batch shards only ever remove entries INSIDE
+// DirRel, never DirRel itself. Only actually used once every sibling has
+// reported done AND no pending nested child group remains open, by the time
+// LastBatch lands — the same race CompleteDeleteRemainder resolves from the
+// other direction.
 type DeleteGroupTotal struct {
-	DirRel       string
-	LastBatch    bool
-	BuildCleanup func(dirRel string) NewShard
+	DirRel        string
+	LastBatch     bool
+	NoSelfCleanup bool
+	BuildCleanup  func(dirRel string) NewShard
 }
 
 // RecordSplit persists a ShardSplit idempotently: retransmits of the same
@@ -1457,7 +1508,8 @@ func (s *Store) RecordSplit(parentShardID int64, seq uint64, shards []NewShard,
 		if closed != 0 || doneStreaming == 0 || nDone < nTotal || pending > 0 {
 			continue // streaming not finished, siblings/nested children outstanding, or already closed
 		}
-		if err := closeDeleteGroupTx(tx, passID, dt.DirRel, dt.BuildCleanup(dt.DirRel), dt.BuildCleanup); err != nil {
+		if err := closeDeleteGroupTx(tx, passID, dt.DirRel, !dt.NoSelfCleanup,
+			dt.BuildCleanup(dt.DirRel), dt.BuildCleanup); err != nil {
 			return nil, err
 		}
 	}
@@ -1677,18 +1729,37 @@ func (s *Store) CompleteDataChunk(shardID, leaseID, passID int64, relPath string
 // directory a removal touches, not just relPath itself — a name in one of
 // relPath's own batches can turn out to be pathological and get streamed off
 // as its own delete_groups row; relPath cannot close until that grandchild
-// closes too, see delete_groups' doc comment), this inserts cleanupShard
-// (built by the caller: a single-entry DeleteBatch for relPath itself, run
-// through the ordinary unmodified delete path — store stays payload-agnostic,
-// same division of labor as CompleteDataChunk's finalizeShard) and marks the
-// group closed so a re-delivered final result can never seed it twice, then
-// walks back up the chain (closeDeleteGroupTx) in case this was itself the
-// last blocker on relPath's own parent. buildCleanup builds a cleanup
-// NewShard for any dirRel string, used for any ancestor closeDeleteGroupTx's
-// upward walk unblocks. counters folds the pass-counter accumulation into
-// this same transaction — see CompleteShard's doc comment for why.
+// closes too, see delete_groups' doc comment), this marks the group closed
+// (so a re-delivered final result can never seed a cleanup twice) and, if
+// seedCleanup, inserts cleanupShard (built by the caller: a single-entry
+// DeleteBatch for relPath itself, run through the ordinary unmodified delete
+// path — store stays payload-agnostic, same division of labor as
+// CompleteDataChunk's finalizeShard). seedCleanup is false for a
+// budget-handoff group (ShardSplit.delete_subdirs — see DeleteGroupTotal.
+// NoSelfCleanup): the single shard that makes up that group already removed
+// relPath itself as an ordinary top-level orphan, so a cleanup shard here
+// would be a redundant rmdir. Then walks back up the chain
+// (closeDeleteGroupTx) in case this was itself the last blocker on relPath's
+// own parent — every ancestor found that way always gets its own cleanup
+// seeded (only a chain's own leaf can ever be a no-self-cleanup budget
+// handoff). buildCleanup builds a cleanup NewShard for any dirRel string,
+// used for any ancestor closeDeleteGroupTx's upward walk unblocks. counters
+// folds the pass-counter accumulation into this same transaction — see
+// CompleteShard's doc comment for why. deferredRmdirs (ShardResult.
+// deferred_rmdirs) are relative paths of directories THIS SAME shard
+// processed inline but deliberately did not rmdir, because a descendant was
+// handed off during its own run (agent/src/delete.c rm_tree/
+// queue_deferred_rmdir) — each is closed via bumpAndMaybeCloseDeleteGroupTx
+// in this same transaction, regardless of whether relPath itself is "" (an
+// ordinary top-level orphan shard from seedDeletePass — deferred_rmdirs is
+// exactly how the bug in a real production incident was fixed for THAT
+// case: the shard granted a whole orphan tree can itself defer its own
+// top-level path's rmdir, same as any inline ancestor deeper in its
+// recursion) or non-empty (this shard is itself a DeleteRemainder batch or
+// budget-handoff leaf, tracked via relPath's own group below).
 func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath string, result []byte,
-	cleanupShard NewShard, buildCleanup func(dirRel string) NewShard, counters *drsyncpb.ShardCounters) error {
+	seedCleanup bool, cleanupShard NewShard, buildCleanup func(dirRel string) NewShard,
+	deferredRmdirs [][]byte, counters *drsyncpb.ShardCounters) error {
 	defer s.lockTimed("CompleteDeleteRemainder")()
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1709,24 +1780,59 @@ func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath 
 		return err
 	}
 
-	// The row may not exist yet if this child's completion raced ahead of
-	// RecordSplit's own insert for the batch that produced it — vanishingly
-	// unlikely (the grant that produced this ShardResult already required
-	// the row's shard to exist) but INSERT OR IGNORE makes the ordering
-	// irrelevant either way, same defensive shape as chunk_groups. If THIS
-	// call is what creates the row, register it as relPath's parent's
-	// pending child too (registerPendingChildTx) — same as RecordSplit does
-	// for the ordinary case, just reached from the other side of the race.
-	n, err = execCountTx(tx, `INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
-		passID, relPath)
-	if err != nil {
-		return err
-	}
-	if n > 0 {
-		if err := registerPendingChildTx(tx, passID, relPath); err != nil {
+	if relPath != "" {
+		// The row may not exist yet if this child's completion raced ahead of
+		// RecordSplit's own insert for the batch that produced it — vanishingly
+		// unlikely (the grant that produced this ShardResult already required
+		// the row's shard to exist) but INSERT OR IGNORE makes the ordering
+		// irrelevant either way, same defensive shape as chunk_groups. If THIS
+		// call is what creates the row, register it as relPath's parent's
+		// pending child too (registerPendingChildTx) — same as RecordSplit does
+		// for the ordinary case, just reached from the other side of the race.
+		n, err = execCountTx(tx, `INSERT OR IGNORE INTO delete_groups (pass_id, rel_path) VALUES (?, ?)`,
+			passID, relPath)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			if err := registerPendingChildTx(tx, passID, relPath); err != nil {
+				return err
+			}
+		}
+		if err := bumpAndMaybeCloseDeleteGroupTx(tx, passID, relPath, seedCleanup,
+			cleanupShard, buildCleanup); err != nil {
 			return err
 		}
 	}
+	for _, dr := range deferredRmdirs {
+		// A directory THIS shard processed inline but did not rmdir — its
+		// delete_groups row already exists (registerPendingChildTx created it
+		// retroactively, n_total=1/n_done=0, the moment some descendant of it
+		// was first handed off) unless this ShardResult somehow arrives before
+		// any of that registration ever landed, which INSERT OR IGNORE below
+		// makes safe either way. seedCleanup=true always: this directory
+		// genuinely still needs its rmdir performed by someone (unlike a
+		// budget-handoff leaf, nobody has removed it yet).
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO delete_groups
+			(pass_id, rel_path, n_total, n_done, done_streaming) VALUES (?, ?, 1, 0, 1)`,
+			passID, string(dr)); err != nil {
+			return err
+		}
+		if err := bumpAndMaybeCloseDeleteGroupTx(tx, passID, string(dr), true,
+			buildCleanup(string(dr)), buildCleanup); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// bumpAndMaybeCloseDeleteGroupTx increments relPath's delete_groups n_done
+// by one and, if that makes the row closeable (done_streaming=1,
+// n_done>=n_total, pending_children=0), closes it (closeDeleteGroupTx) —
+// the shared body CompleteDeleteRemainder uses both for relPath's own group
+// (when relPath != "") and for each of a shard's deferredRmdirs entries.
+func bumpAndMaybeCloseDeleteGroupTx(tx *sql.Tx, passID int64, relPath string, seedCleanup bool,
+	cleanupShard NewShard, buildCleanup func(dirRel string) NewShard) error {
 	var nTotal, nDone, doneStreaming, pending, closed int
 	if err := tx.QueryRow(`UPDATE delete_groups SET n_done = n_done + 1
 		WHERE pass_id = ? AND rel_path = ? RETURNING n_total, n_done, done_streaming, pending_children, closed`,
@@ -1734,12 +1840,9 @@ func (s *Store) CompleteDeleteRemainder(shardID, leaseID, passID int64, relPath 
 		return err
 	}
 	if closed != 0 || doneStreaming == 0 || nDone < nTotal || pending > 0 {
-		return tx.Commit() // already closed, streaming not finished, or siblings/nested children outstanding
+		return nil // already closed, streaming not finished, or siblings/nested children outstanding
 	}
-	if err := closeDeleteGroupTx(tx, passID, relPath, cleanupShard, buildCleanup); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return closeDeleteGroupTx(tx, passID, relPath, seedCleanup, cleanupShard, buildCleanup)
 }
 
 // CompleteFinalizeChunk marks the finalize shard DONE and closes its group.

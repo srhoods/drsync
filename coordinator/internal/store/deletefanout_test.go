@@ -84,7 +84,7 @@ func TestDeleteGroupNestedChildBlocksParentClose(t *testing.T) {
 	// (handed "child" off), so it reports done. This must NOT close parent's
 	// group: parent/child's own group is still open (pending_children=1).
 	if err := s.CompleteDeleteRemainder(parentBatchID, parentBatchLeaseID, passID, parent, nil,
-		cleanupShard(parent), cleanupShard, nil); err != nil {
+		true, cleanupShard(parent), cleanupShard, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err := s.ShardStateCounts(passID)
@@ -110,7 +110,7 @@ func TestDeleteGroupNestedChildBlocksParentClose(t *testing.T) {
 		t.Fatalf("lease mismatch: leased=%v childIDs=%v", childLeased, childIDs)
 	}
 	if err := s.CompleteDeleteRemainder(childLeased[0].ID, childLeased[0].LeaseID, passID, child, nil,
-		cleanupShard(child), cleanupShard, nil); err != nil {
+		true, cleanupShard(child), cleanupShard, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err = s.ShardStateCounts(passID)
@@ -174,7 +174,7 @@ func TestDeleteGroupSeedsCleanupOnceAllChildrenDone(t *testing.T) {
 
 	for i, r := range leased {
 		if err := s.CompleteDeleteRemainder(r.ID, r.LeaseID, passID, dir, nil,
-			cleanupShard(dir), cleanupShard, nil); err != nil {
+			true, cleanupShard(dir), cleanupShard, nil, nil); err != nil {
 			t.Fatalf("complete remainder %d: %v", i, err)
 		}
 		counts, err := s.ShardStateCounts(passID)
@@ -240,7 +240,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 	// finished) — reaches n_done >= n_total by coincidence, but done_streaming
 	// is still 0, so the group must NOT close yet.
 	if err := s.CompleteDeleteRemainder(leased[0].ID, leased[0].LeaseID, passID, dir, nil,
-		cleanupShard(dir), cleanupShard, nil); err != nil {
+		true, cleanupShard(dir), cleanupShard, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err := s.ShardStateCounts(passID)
@@ -285,7 +285,7 @@ func TestDeleteGroupHandlesChildCompletionRacingFinalBatch(t *testing.T) {
 		t.Fatalf("lease mismatch: leased=%v ids2=%v", leased2, ids2)
 	}
 	if err := s.CompleteDeleteRemainder(leased2[0].ID, leased2[0].LeaseID, passID, dir, nil,
-		cleanupShard(dir), cleanupShard, nil); err != nil {
+		true, cleanupShard(dir), cleanupShard, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err = s.ShardStateCounts(passID)
@@ -325,7 +325,7 @@ func TestDeleteGroupNeverSeedsCleanupTwice(t *testing.T) {
 		t.Fatalf("lease mismatch: leased=%v ids=%v", leased, ids)
 	}
 	if err := s.CompleteDeleteRemainder(leased[0].ID, leased[0].LeaseID, passID, dir, nil,
-		cleanupShard(dir), cleanupShard, nil); err != nil {
+		true, cleanupShard(dir), cleanupShard, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	counts, err := s.ShardStateCounts(passID)

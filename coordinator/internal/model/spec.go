@@ -138,6 +138,17 @@ type JobSpec struct {
 			// differ.
 			DeleteSplitThreshold uint64 `yaml:"delete_split_threshold"`
 			DeleteSplitBatch     uint32 `yaml:"delete_split_batch"`
+			// Work budget for one DELETE shard, in objects removed — the
+			// delete-pass analogue of ShardBudget above, mirroring the scan
+			// walker's queue_split rather than DeleteSplitThreshold/
+			// DeleteSplitBatch: bounds one shard's total work regardless of
+			// tree SHAPE, catching a tree pathological by aggregate
+			// depth/branching even when no single directory anywhere in it
+			// individually exceeds DeleteSplitThreshold (docs/DESIGN-
+			// coordinator.md §2.2 — DeleteSplitThreshold alone cannot see
+			// this shape, since it only ever looks at one directory's own
+			// immediate entry count).
+			DeleteShardBudget uint64 `yaml:"delete_shard_budget"`
 			// Fan-out control. Coordinator-side only: these never reach an agent
 			// (D9 — the agent acts on the resolved per-shard overrides it is
 			// granted, not on policy). See SpreadPolicy.
@@ -270,6 +281,16 @@ func (s *JobSpec) ApplyDefaults() {
 	}
 	if sp.Tuning.DeleteSplitBatch == 0 {
 		sp.Tuning.DeleteSplitBatch = 20_000
+	}
+	// Delete-pass analogue of ShardBudget: bounds one shard's total work
+	// (objects removed) regardless of tree shape — catches a tree
+	// pathological by aggregate depth/branching that DeleteSplitThreshold
+	// alone cannot see, since that only ever checks one directory's own
+	// immediate entry count. Scaled up from ShardBudget's default the same
+	// way DeleteSplitBatch is scaled up from EntrylistBatch: delete work per
+	// object is a plain unlink, not a full stat/diff/copy pipeline.
+	if sp.Tuning.DeleteShardBudget == 0 {
+		sp.Tuning.DeleteShardBudget = 250_000
 	}
 	if sp.Tuning.StatxBatch == 0 {
 		sp.Tuning.StatxBatch = 256
@@ -456,6 +477,7 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 			MtimeSlopNs:          sp.Tuning.MtimeSlopNS,
 			DeleteSplitThreshold: sp.Tuning.DeleteSplitThreshold,
 			DeleteSplitBatch:     sp.Tuning.DeleteSplitBatch,
+			DeleteShardBudget:    sp.Tuning.DeleteShardBudget,
 		},
 		DryRun:       dryRun,
 		RequireMount: *sp.Probe.RequireMount,

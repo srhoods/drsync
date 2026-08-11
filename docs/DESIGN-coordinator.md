@@ -148,16 +148,14 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
   the top-level orphan path — `rm_dir_contents` routes every entry it finds
   during descent back through `remove_object` rather than recursing into it
   directly, so a subdirectory discovered at any depth that turns out to be
-  pathological is streamed out too, not just removed serially. This matters
-  because "pathological" is not the same shape as "large": a real incident
-  hit a destination-only orphan tree where NO single directory (not the top
-  orphan path, not any one subdirectory) individually exceeded the
-  threshold, but the tree as a whole summed to ~14M files and directories —
-  the delete pass finished all its other work and then sat on 2 remaining
-  shards for 6 hours, each depth-first-recursing an enormous subtree with no
-  fan-out at all, because the single-level-only check never had a reason to
-  fire anywhere in that tree — see the "found in production" note below for
-  the fix and the completion-tracking wrinkle it introduced.
+  pathological is streamed out too, not just removed serially. But this
+  mechanism only ever looks at ONE directory's own immediate entry count —
+  it catches a WIDE directory at any depth, not a tree that is pathological
+  by aggregate depth/branching with no single directory anywhere in it ever
+  individually wide. A second, independent mechanism (`tuning.
+  delete_shard_budget`, below) was added for that shape after it hit
+  production — see the "found in production" notes further down for both
+  the incident and the three-round fix.
 
   Unlike entry-list sharding, delete fan-out has a real completion problem
   entry-list never does: something has to remove the now-empty directory itself
@@ -209,35 +207,110 @@ PENDING ──▶ PROBING ──all probes ok──▶ SCANNING ──all shards
      directory failed to disappear from disk. `TestDeleteRemainderPathsJoinDirRel`
      (`agentsrv/server_test.go`) now pins the join at the `onShardSplit` level.
 
-  **Found in production, after the above shipped:** the "2 shards, 14M
-  files, 6 hours" incident above. Extending the pathological check to every
-  depth (`remove_object`/`rm_dir_contents`, not just the shard's own
-  top-level path) fixed the fan-out itself, but exposed a completion-order
-  bug the flat case structurally could not: a batch shard under `dir_rel`
-  that ships a name which turns out to be itself pathological reports
-  itself *done* the instant it hands that name off (correctly — the batch
-  has no more work of its own), which increments `dir_rel`'s `n_done` —
-  but the handed-off name is not yet actually removed, only queued as its
-  OWN separate `delete_groups` row. Before the fix, `dir_rel`'s group could
-  therefore close and seed its cleanup `rmdir` while a nested child was
-  still mid-removal: `delete_fanout_nested_e2e.sh` (built specifically
-  because the existing flat-directory e2e test structurally cannot exercise
-  this — no single directory in it is ever handed off to a nested group)
-  caught both a double-removed path (a race where the same name was
-  streamed twice) and a permanently-orphaned empty directory (the parent's
-  `rmdir` either never ran or ran too early and something after it
-  recreated nothing — the parent just silently never got removed). Fixed
-  with a `pending_children` counter on `delete_groups` (§3):
-  `registerPendingChildTx` bumps a parent's `pending_children` the first
-  time a nested child row is created under it (derived purely from the
-  child's own `rel_path` string — no explicit parent pointer needed, since
-  `orphandir/sub0000`'s parent is unambiguously `orphandir`); closing a
-  child's row (`closeDeleteGroupTx`) decrements the parent's count and
+  **Found in production, round 1 (nested WIDE completion race).** Extending
+  the pathological check to every depth (`remove_object`/`rm_dir_contents`,
+  not just the shard's own top-level path) fixed the fan-out itself, but
+  exposed a completion-order bug the flat case structurally could not: a
+  batch shard under `dir_rel` that ships a name which turns out to be itself
+  pathological reports itself *done* the instant it hands that name off
+  (correctly — the batch has no more work of its own), which increments
+  `dir_rel`'s `n_done` — but the handed-off name is not yet actually
+  removed, only queued as its OWN separate `delete_groups` row. Before the
+  fix, `dir_rel`'s group could therefore close and seed its cleanup `rmdir`
+  while a nested child was still mid-removal: `delete_fanout_nested_e2e.sh`
+  (built specifically because the existing flat-directory e2e test
+  structurally cannot exercise this — no single directory in it is ever
+  handed off to a nested group) caught both a double-removed path (a race
+  where the same name was streamed twice) and a permanently-orphaned empty
+  directory. Fixed with a `pending_children` counter on `delete_groups`
+  (§3): `registerPendingChildTx` bumps a parent's `pending_children` the
+  first time a nested child row is created under it (derived purely from
+  the child's own `rel_path` string — no explicit parent pointer needed,
+  since `orphandir/sub0000`'s parent is unambiguously `orphandir`); closing
+  a child's row (`closeDeleteGroupTx`) decrements the parent's count and
   walks back up recursively, re-checking the parent's own closeability from
-  the other side — the same both-directions-check pattern `n_done`/
-  `done_streaming` already use, just one more hop, and applied at every
-  level so a pathological directory nested inside a pathological directory
-  inside another still closes bottom-up correctly.
+  the other side.
+
+  **Found in production, round 2 (the actual "2 shards, 14M files, 6 hours"
+  incident).** A real orphan tree hit the shape mechanism 1 fundamentally
+  cannot see: 77 top-level branches, each several levels deep, with every
+  individual directory well under any reasonable `delete_split_threshold` —
+  no directory anywhere in the tree was ever WIDE, so `remove_object`'s
+  probe never once tripped, and the whole multi-million-object tree ran
+  serially inside 2 shards. This needed a second, independent mechanism:
+  **`tuning.delete_shard_budget`** (`agent/src/delete.c`, mirroring the scan
+  walker's `shard_budget`/`queue_split`) bounds the total number of objects
+  ONE shard removes, regardless of tree shape. `walk_ctx.budget` is
+  decremented once per object actually removed (`rm_tree`), threaded
+  through the whole recursive descent exactly like the walker's own budget.
+  Once it reaches zero, every not-yet-opened subdirectory `rm_dir_contents`
+  finds is handed off UNOPENED as its own brand-new top-level DELETE shard
+  (`queue_delete_subdir` → `ShardSplit.delete_subdirs`, wire field 8 —
+  deliberately NOT the walker's own `subdirs` field 3, since that always
+  becomes a `KindDir` walk/diff shard, wrong kind entirely for a directory
+  that's already condemned) instead of being recursed into — the receiving
+  shard starts its own fresh budget and re-runs `remove_object` on it from
+  scratch, same as any top-level orphan from `seedDeletePass`.
+  `delete_fanout_budget_e2e.sh` (a 10×10 branching tree, 5 files per leaf,
+  every directory capped at 10 entries — deliberately far under any
+  threshold mechanism 1 would ever trip) reproduces this shape directly.
+
+  **Found in production, round 3 (two more completion bugs the budget
+  mechanism itself introduced, both caught locally before reaching CI via
+  the new e2e script).** A budget handoff creates the SAME completion-order
+  problem round 1 fixed for the WIDE case, but in a shape the
+  `pending_children` chain as first built could not yet handle, because a
+  handed-off directory has no *sibling batches* the way a `DeleteRemainder`
+  group does — it is exactly one shard, already fully known:
+  1. The handed-off shard's own `DeleteBatch` (built in `onShardSplit`) is
+     registered as a size-one `delete_groups` row (`n_total=1,
+     done_streaming=1`) via the SAME `DeleteGroupTotal` plumbing
+     `DeleteRemainder` batches use, but with a new `NoSelfCleanup` flag: the
+     handoff shard's own completion (an ordinary top-level orphan removal,
+     `remove_object` with `top_level=true`) already removes the directory
+     itself, so `closeDeleteGroupTx` must NOT also seed a redundant cleanup
+     `rmdir` for it the way it does for an ordinary `DeleteRemainder` group
+     — only ancestors *above* a budget-handoff leaf, discovered while
+     walking the closing chain upward, ever get their own cleanup seeded.
+  2. Once (1) was fixed, a DIFFERENT directory — one that was never itself
+     handed off, but merely an ancestor of one deep in an otherwise-inline
+     `rm_tree` recursion (e.g. `orphandir/b00`, whose own `cNN` children got
+     handed off but `b00` itself stayed under budget and was processed
+     inline) — was left behind, empty, forever. `rm_tree` had no way to
+     know a descendant was mid-removal elsewhere, so it happily `rmdir`'d
+     itself the instant its own (locally visible) contents were gone. Fixed
+     by having the AGENT track this locally, no coordinator round-trip
+     needed: when a handoff fires anywhere inside an in-progress `rm_tree`
+     call, that fact propagates back up through the C call stack
+     (`*deferred_out`, threaded through `remove_object`/`rm_dir_contents`/
+     `rm_tree`) — a directory that sees a deferred descendant skips its own
+     `rmdir` too (`queue_deferred_rmdir`, recorded in
+     `walk_ctx.deferred[]`) and propagates the same signal to whoever is
+     recursing into IT. The accumulated list ships once, attached to the
+     shard's own final result (`ShardResult.deferred_rmdirs`, proto field
+     6) — not a separate streamed message, since the coordinator only needs
+     it once the whole shard is done. Coordinator-side,
+     `registerPendingChildTx` now walks EVERY ancestor of a handoff (not
+     just the direct parent) up to the top-level orphan path, retroactively
+     creating a `delete_groups` row for each ancestor the FIRST time
+     anything beneath it is handed off (`n_total=1, done_streaming=1`,
+     mirroring a budget-handoff leaf's own shape: there is exactly one
+     thing to wait for — this ancestor's own containing shard eventually
+     checking in via `deferred_rmdirs`) — critically, the climb STOPS the
+     moment it reaches a level that already had a row, or every later,
+     unrelated handoff under an already-tracked ancestor would double (or
+     N-times) count that ancestor's `pending_children` (an actual bug hit
+     and fixed during this same investigation: `orphandir`'s own
+     `pending_children` reached 69 instead of 10 before this stop condition
+     was added, since every one of the ~90 leaf handoffs was climbing all
+     the way to the top and bumping it again). `CompleteDeleteRemainder`
+     processes a completed shard's own `deferred_rmdirs` list in the same
+     transaction as its ordinary completion, via a shared
+     `bumpAndMaybeCloseDeleteGroupTx` helper — bumping `n_done` to 1 (always
+     `seedCleanup=true`: unlike a budget-handoff leaf, nobody has removed
+     this directory yet, it was deliberately skipped) and walking the
+     closing chain upward exactly like every other path into
+     `closeDeleteGroupTx`.
 
 ### 2.3 Shard
 
