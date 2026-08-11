@@ -525,6 +525,14 @@ var migrations = []string{
 	`ALTER TABLE passes ADD COLUMN link_anchor_races INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE passes ADD COLUMN link_fallback INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE jobs ADD COLUMN username TEXT NOT NULL DEFAULT ''`,
+	// delete_groups predates both of these (§2.2 DELETE fan-out landed with
+	// neither column; done_streaming was added when n_total's meaning changed
+	// from "total_children" to "shard count", pending_children when fan-out
+	// started applying at every depth instead of just a shard's own top-level
+	// path) — a coordinator with a data-dir from before either PR hits "no
+	// such column" on its very first delete pass without these.
+	`ALTER TABLE delete_groups ADD COLUMN done_streaming INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE delete_groups ADD COLUMN pending_children INTEGER NOT NULL DEFAULT 0`,
 }
 
 func (s *Store) Close() error {

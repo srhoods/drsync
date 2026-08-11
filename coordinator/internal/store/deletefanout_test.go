@@ -1,8 +1,12 @@
 package store
 
 import (
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"drsync/coordinator/internal/model"
 )
@@ -18,6 +22,69 @@ func deleteRemainderShard(dirRel string) NewShard {
 
 func cleanupShard(dirRel string) NewShard {
 	return NewShard{Kind: model.KindDelete}
+}
+
+// TestOpenMigratesPreExistingDeleteGroupsTable is the schema-migration
+// regression: delete_groups' CREATE TABLE IF NOT EXISTS predates both
+// done_streaming (added when n_total's meaning changed from total_children
+// to shard count, the fan-out-at-every-depth fix) and pending_children
+// (added when a budget-exhausted handoff needed to block its own parent's
+// close) — a data-dir created by an OLDER coordinator binary already has a
+// delete_groups table without one or both columns, and IF NOT EXISTS is a
+// no-op against it. Without an explicit ALTER TABLE migration for each
+// column (store.go's migrations slice), the very first delete pass such a
+// coordinator ever runs after upgrading fails outright: "SQL logic error:
+// no such column: pending_children" (or done_streaming, for an even older
+// data-dir) — reported live against a coordinator whose data-dir predated
+// this column. This builds exactly that pre-migration table by hand, then
+// confirms Open (the real migration path, not a mock) adds both columns
+// and delete_groups is fully usable afterward.
+func TestOpenMigratesPreExistingDeleteGroupsTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The delete_groups shape as it existed before EITHER done_streaming or
+	// pending_children were added — same PRIMARY KEY, same WITHOUT ROWID,
+	// just missing both later columns, exactly like a real pre-upgrade
+	// data-dir's table.
+	if _, err := raw.Exec(`CREATE TABLE delete_groups (
+		pass_id  INTEGER NOT NULL,
+		rel_path TEXT NOT NULL,
+		n_total  INTEGER NOT NULL DEFAULT 0,
+		n_done   INTEGER NOT NULL DEFAULT 0,
+		closed   INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (pass_id, rel_path)
+	) WITHOUT ROWID`); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a pre-migration delete_groups table: %v", err)
+	}
+	defer s.Close()
+
+	// delete_groups must now accept both columns — the exact query shape
+	// RecordSplit/CompleteDeleteRemainder run against it in production.
+	if _, err := s.db.Exec(`INSERT INTO delete_groups
+		(pass_id, rel_path, n_total, n_done, done_streaming, pending_children, closed)
+		VALUES (1, 'orphandir', 1, 0, 1, 0, 0)`); err != nil {
+		t.Fatalf("insert into migrated delete_groups: %v", err)
+	}
+	var doneStreaming, pending int
+	if err := s.db.QueryRow(`SELECT done_streaming, pending_children
+		FROM delete_groups WHERE pass_id = 1 AND rel_path = 'orphandir'`).
+		Scan(&doneStreaming, &pending); err != nil {
+		t.Fatalf("read back migrated columns: %v", err)
+	}
+	if doneStreaming != 1 || pending != 0 {
+		t.Fatalf("done_streaming/pending_children = %d/%d, want 1/0", doneStreaming, pending)
+	}
 }
 
 // TestDeleteGroupNestedChildBlocksParentClose is the nested fan-out
