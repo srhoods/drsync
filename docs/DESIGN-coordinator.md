@@ -907,6 +907,20 @@ GET    /api/v1/whoami                  current session identity + whether login 
   delete-pass's protection is the in-body confirmation string, not a
   privilege tier. `login`/`logout`/`whoami` are themselves unauthenticated
   (you can't require a session to obtain one); `whoami` never 401s.
+  **Found live:** `whoami`'s `login_configured` field only reflects whether
+  `auth.yaml` is present — it said nothing about a bearer token being
+  required. A coordinator with `-api-token-file` set (its default even names
+  a conventional path, `/etc/drsync/api-token`, that can be populated left
+  over from an earlier deployment) but no `auth.yaml` reported
+  `login_configured=false` — correct in isolation, but the WebUI (which has
+  no bearer-token entry, only session-cookie login) read that as "nothing to
+  authenticate," went straight to polling, got 401'd on every request (the
+  token check in `auth()` still applies), and reloaded on each 401 —
+  looping the console on "connecting…" forever with no explanation. Fixed by
+  adding a `token_required` field (`s.token != "" && s.authenticator ==
+  nil`) the WebUI checks before ever calling `startConsole()`, showing a
+  static explanation screen instead (there being no bearer-token UI to fall
+  back to, only a message pointing at the CLI/`DRSYNC_TOKEN`).
 - The listener is plain HTTP unless `/etc/drsync/certs.yaml` configures a
   cert/key pair, in which case it serves HTTPS and the session cookie is
   marked `Secure`.

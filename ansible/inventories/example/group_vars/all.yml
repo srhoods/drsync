@@ -27,12 +27,6 @@ drsync_config_dir: /etc/drsync
 drsync_data_dir: /var/lib/drsync          # coordinator: SQLite state store + journals
 drsync_pki_local_dir: "{{ drsync_build_dir }}/pki"   # PKI staged on the controller before distribution
 
-# Paths each agent host mounts BOTH filesystems at. Every job spec's
-# source.path/destination.path must match these exactly across the whole
-# fleet (docs/INSTALL.md §1).
-drsync_agent_source_mount: /mnt/src
-drsync_agent_dest_mount: /mnt/dst
-
 # --- mTLS (agent<->coordinator control channel) -------------------------------
 drsync_tls_enabled: true
 drsync_pki_ca_cn: drsync-ca

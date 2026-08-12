@@ -547,6 +547,25 @@
   </div>
 </div>
 
+<!-- Shown instead of #login-screen when the coordinator requires a bearer
+     token (-api-token-file set) but has no session/password login (auth.yaml
+     absent) — the WebUI has no bearer-token entry, so there is nothing this
+     page can prompt for; explain that plainly rather than looping the
+     console through repeated silent 401s (the bug this fixes). -->
+<div id="token-required-screen" class="login-screen" hidden role="dialog" aria-label="Bearer token required" aria-modal="true">
+  <div class="login-card">
+    <div class="login-brand"><span class="logo">dr<span class="flow">sync</span></span></div>
+    <div class="login-tag">cluster console</div>
+    <div class="login-msg err">
+      This coordinator requires an API bearer token, but has no interactive
+      login configured (<code>auth.yaml</code>) — the web console has no way
+      to accept a token. Use the <code>drsync</code> CLI or set
+      <code>DRSYNC_TOKEN</code>, or ask an operator to configure
+      <code>auth.yaml</code> for web login.
+    </div>
+  </div>
+</div>
+
 <div class="wrap">
 
  <div id="view-overview">
@@ -2125,12 +2144,19 @@
   // GET /api/v1/whoami (always unauthenticated) tells us whether login is
   // configured on this coordinator at all: if not, there's nothing to sign
   // into and the console proceeds straight through (dev mode / a coordinator
-  // with no auth configured at all).
+  // with no auth configured at all) — UNLESS token_required is also true (a
+  // bearer token IS required, just with no session login to obtain one
+  // through), in which case #token-required-screen explains that instead of
+  // silently attempting requests that can only ever 401. Previously
+  // login_configured=false was treated as "nothing needed" unconditionally,
+  // so that state 401-looped the console forever with no explanation — see
+  // #token-required-screen's own comment and onUnauthorized below.
   const loginScreen = $("#login-screen"), loginForm = $("#login-form"),
     loginUser = $("#login-user"), loginPass = $("#login-pass"),
     loginMsg = $("#login-msg"), loginSubmit = $("#login-submit"),
-    userChip = $("#user-chip"), userName = $("#user-name"), logoutBtn = $("#logout");
-  let loginConfigured = false;
+    userChip = $("#user-chip"), userName = $("#user-name"), logoutBtn = $("#logout"),
+    tokenRequiredScreen = $("#token-required-screen");
+  let loginConfigured = false, tokenRequired = false;
 
   function showLogin(msg) {
     loginScreen.hidden = false;
@@ -2138,6 +2164,7 @@
     loginUser.focus();
   }
   function hideLogin() { loginScreen.hidden = true; }
+  function showTokenRequired() { tokenRequiredScreen.hidden = false; }
   function setUserChip(username) {
     if (username) {
       userName.textContent = username; userChip.hidden = false; logoutBtn.hidden = false;
@@ -2147,11 +2174,16 @@
   }
 
   // onUnauthorized runs on any 401 from the API: send the operator back to
-  // the login screen. If login isn't configured at all, a 401 means the
-  // coordinator's auth setup changed out from under an open session — reload
-  // is the only sane recovery, since there is no credential UI to offer.
+  // the login screen. token_required with no login configured means there is
+  // no credential UI at all — show the explanation screen once rather than
+  // reloading (a reload would just re-run the identical whoami -> 401 ->
+  // reload cycle forever, the bug this fixes). Otherwise, if login isn't
+  // configured, a 401 means the coordinator's auth setup changed out from
+  // under an open session — reload is the sane recovery there, since a
+  // session-login coordinator can always re-establish one.
   function onUnauthorized() {
     setUserChip("");
+    if (tokenRequired && !loginConfigured) { showTokenRequired(); return; }
     if (loginConfigured) showLogin("session expired — please sign in again");
     else location.reload();
   }
@@ -2199,15 +2231,22 @@
     // whoami never 401s, so this alone decides the startup screen: an
     // established session shows the console immediately; a coordinator with
     // login configured but no session shows the login screen (never the raw
-    // console flashing 401s); a coordinator with no login configured at all
-    // goes straight to the console.
+    // console flashing 401s); a coordinator with no login configured AND no
+    // token required goes straight to the console; a coordinator with a
+    // token required but no login configured shows the explanation screen
+    // instead of starting the console (every request would just 401 —
+    // previously this looped silently forever instead of ever saying so).
     try {
       const who = await api("/api/v1/whoami");
       loginConfigured = !!who.login_configured;
+      tokenRequired = !!who.token_required;
       if (who.username) {
         setUserChip(who.username);
       } else if (loginConfigured) {
         showLogin("");
+        return;
+      } else if (tokenRequired) {
+        showTokenRequired();
         return;
       }
     } catch (_) { /* whoami unreachable — fall through to normal connect/401 handling */ }

@@ -794,9 +794,16 @@ allow:
   it elsewhere.
 - An absent `/etc/drsync/auth.yaml` (the default) disables interactive login
   entirely; the WebUI then connects straight through with no login screen
-  (open dev mode, matching prior behaviour) — the coordinator's REST API
-  itself may still be open or bearer-token-gated per `-api-token-file`, but
-  that token has no UI to enter it in.
+  (open dev mode, matching prior behaviour) — **unless** the coordinator's
+  REST API is still bearer-token-gated per `-api-token-file` (its own default
+  path, `/etc/drsync/api-token`, can be populated left over from an earlier
+  deployment even when nobody intended token auth to be active). That token
+  has no UI to enter it in, so in that specific combination — token
+  required, no `auth.yaml` — the WebUI shows a plain "this coordinator
+  requires a token; use the CLI/API instead" screen rather than attempting
+  to load (earlier versions instead looped silently on "connecting…" forever
+  — if you see that, either add `auth.yaml` for WebUI login, or remove the
+  stray token file if bearer-token auth was never intended).
 
 **HTTP(S) listener TLS** (`/etc/drsync/certs.yaml`, absent by default =
 plain `http://`):

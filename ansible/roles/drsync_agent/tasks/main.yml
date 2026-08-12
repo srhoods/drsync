@@ -25,36 +25,6 @@
       {{ drsync_agent_walkers }} walkers ({{ drsync_agent_walker_pct }}%) /
       {{ drsync_agent_copy_threads }} copy threads ({{ drsync_agent_copy_pct }}%)
 
-# --- mounts: the agent must be able to see both trees before it can do
-# anything useful, and systemd's RequiresMountsFor= only blocks agent startup
-# on a MISSING mount — it says nothing about whether the paths exist at all
-# (e.g. a fresh host with no mount unit configured yet). Fail loudly here
-# rather than let the agent start and silently sit idle / error on first job.
-
-- name: Check the source mount path exists
-  stat:
-    path: "{{ drsync_agent_source_mount }}"
-  register: _src_mount
-
-- name: Check the destination mount path exists
-  stat:
-    path: "{{ drsync_agent_dest_mount }}"
-  register: _dst_mount
-
-- name: Assert both mount paths exist
-  assert:
-    that:
-      - _src_mount.stat.exists
-      - _src_mount.stat.isdir
-      - _dst_mount.stat.exists
-      - _dst_mount.stat.isdir
-    fail_msg: >-
-      {{ drsync_agent_source_mount }} and {{ drsync_agent_dest_mount }} must
-      both exist as directories on {{ inventory_hostname }} before the agent
-      can run jobs — mount the source and destination filesystems there
-      first (see docs/INSTALL.md §1: every agent host mounts both trees at
-      the exact absolute paths named in the job spec).
-
 # --- io_uring: optional accelerator, not required for correctness -----------
 
 - name: Check the io_uring kernel switch

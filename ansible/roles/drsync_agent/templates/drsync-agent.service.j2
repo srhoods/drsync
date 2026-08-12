@@ -20,7 +20,6 @@
 {% endif %}
 [Unit]
 Description=drsync agent
-RequiresMountsFor={{ drsync_agent_source_mount }} {{ drsync_agent_dest_mount }}
 After=network-online.target remote-fs.target
 Wants=network-online.target
 

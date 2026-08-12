@@ -1,7 +1,5 @@
 ---
 drsync_agent_port: 7440
-drsync_agent_source_mount: /mnt/src
-drsync_agent_dest_mount: /mnt/dst
 drsync_tls_enabled: true
 
 # Walker/copy split as a percentage of ansible_processor_vcpus. Must sum to

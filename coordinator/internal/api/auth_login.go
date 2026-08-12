@@ -142,6 +142,21 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 
 // handleWhoAmI reports the caller's authenticated identity, letting the
 // WebUI show a username and decide whether to render the login page.
+//
+// login_configured=false means "no session/password login" — it says
+// nothing about whether a bearer TOKEN is still required. auth()'s three
+// passthrough conditions are token-empty-and-no-authenticator, valid
+// bearer, or valid session cookie: a coordinator can have -api-token-file
+// set (its default even points at a conventional path an operator may not
+// realise is populated, e.g. left over from an earlier deployment) with no
+// auth.yaml at all, in which case login_configured is correctly false (no
+// session login exists) but every other endpoint still 401s a browser that
+// never supplies that token — the WebUI has no bearer-token entry UI, only
+// session-cookie login (docs/DESIGN-coordinator.md §6), so that state was
+// previously indistinguishable from genuine "no auth at all" and the
+// console looped 401 -> reload forever without ever explaining why.
+// token_required makes that state visible so the frontend can show a clear
+// message instead of retrying a request it can never satisfy.
 func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 	username := ""
 	if c, err := r.Cookie(authn.CookieName); err == nil && s.sessions != nil {
@@ -152,6 +167,7 @@ func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"username":         username,
 		"login_configured": s.authenticator != nil,
+		"token_required":   s.token != "" && s.authenticator == nil,
 	})
 }
 

@@ -115,7 +115,6 @@ defaults already set; override only what you need to change.
 | `coordinator_ip` | from inventory | Optional extra SAN / dial address |
 | `drsync_agent_port` | `7440` | Agent protocol listener |
 | `drsync_http_port` | `7441` | REST/WebUI/metrics listener |
-| `drsync_agent_source_mount` / `drsync_agent_dest_mount` | `/mnt/src` / `/mnt/dst` | Paths every agent host must mount both filesystems at — must match every job spec's `source.path`/`destination.path` |
 | `drsync_tls_enabled` | `true` | Agent<->coordinator mTLS. Disabling runs the fleet in plaintext dev mode. |
 | `drsync_agent_walker_pct` / `drsync_agent_copy_pct` | `25` / `75` | Walker/copy thread split, as a % of detected vCPUs. Must sum to 100. |
 | `drsync_agent_uring_enabled` | `true` | `false` adds `-U` (force serial `fstatat`) |
