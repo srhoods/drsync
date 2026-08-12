@@ -221,7 +221,11 @@ walk_shard(shard):
 ### 2.1 Diff predicate (per merged entry, cheap → expensive)
 
 ```
-1. d_type differs (file vs dir vs symlink vs special)      → emit replace (unlink+create)
+1. d_type differs (file vs dir vs symlink vs special)      → emit replace (unlink+create;
+                                                             a non-empty directory being
+                                                             replaced is renamed aside and
+                                                             orphaned instead — remove_dst,
+                                                             §2.1a below)
 2. regular file: size differs                              → emit copy
 3. mtime differs beyond mtime_slop_ns (default 1 ms)       → emit copy
 4. symlink: target string differs                          → emit relink
@@ -235,6 +239,37 @@ walk_shard(shard):
 
 Step 6 keeps the common path at one `statx` per side per entry; xattr round trips are
 paid only by entries that are otherwise clean and only when xattr/ACL preservation is on.
+
+### 2.1a Type-change replace: a non-empty former directory can't just unlink
+
+Step 1's "replace" is `remove_dst` (`agent/src/walker.c`) followed by whatever
+`mkdirat`/`symlinkat`/`mknodat`/open-for-copy the new type needs — one shared
+helper for every `d_type` transition (dir↔file↔symlink↔special), not a
+symlink-specific path. The plain case is `unlinkat`/`rmdir`: fine for a file,
+a symlink, a special, or an *empty* directory. A directory that still has
+content in it — the source replaced a real directory (with data already
+copied to the destination in an earlier pass) with a file/symlink/special —
+fails `rmdir` with `ENOTEMPTY`, and (found live, reported as a symlink
+replacing a directory, but not actually symlink-specific — every type
+transition against a non-empty former directory hits the same thing) the
+create call that follows then fails too (`EEXIST` for `symlinkat`, similarly
+for the others), leaving the destination stuck in its stale state on every
+subsequent pass — the diff predicate keeps re-emitting "replace" and it keeps
+failing the same way.
+
+`remove_dst` doesn't attempt a recursive removal inline (that machinery
+already exists, at shard-fan-out scale, in the DELETE pass — duplicating it
+here mid-walk would be wrong twice over). Instead, on `ENOTEMPTY`, it
+`renameat`s the whole subtree aside under a dedicated prefix
+(`.drsync.stale.<job>-<pass>.<shard>.<seq>`, deliberately distinct from
+`temp_prefix` — the orphan sweep's temp-reclaim check treats anything under
+`temp_prefix` as possibly-live copy residue, and a renamed-aside stale
+subtree must never be mistaken for that) and journals the new name as an
+ordinary `JR_ORPHAN` — the walk's caller then creates the new
+file/symlink/special at the now-vacated original name in the same pass, and
+the stale subtree is picked up and removed by the next explicit DELETE pass
+through the same fan-out machinery any other orphan uses, no coordinator-side
+awareness of "type change" required.
 
 ### 2.2 statx batching — the NFS scan multiplier
 

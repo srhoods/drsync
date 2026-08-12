@@ -127,6 +127,7 @@ jobs:
           - scale_e2e              # pathological shapes: huge dir, huge file
           - temp_reclaim_e2e       # sweep reclaims crash residue, spares live temps
           - tls_e2e                # mTLS, auth enforcement, reconnect-resume
+          - type_change_e2e        # source path changes type (dir->symlink) between passes
           - ucopy_e2e              # io_uring copy path with server-side copy disabled
     steps:
       - uses: actions/checkout@v7

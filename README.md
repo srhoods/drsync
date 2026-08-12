@@ -73,6 +73,7 @@ tree, and builds the binaries it needs itself:
 | `scale_e2e.sh` | pathological shapes: huge directory, huge file |
 | `temp_reclaim_e2e.sh` | sweep reclaims crash residue, spares live temps |
 | `tls_e2e.sh` | mTLS, auth enforcement, reconnect-resume |
+| `type_change_e2e.sh` | source path changes type (dir->symlink) between passes |
 | `ucopy_e2e.sh` | io_uring copy path with server-side copy disabled |
 
 CI (`.github/workflows/ci.yml`) runs gofmt, vet, build and the Go tests; the

@@ -292,11 +292,71 @@ static void apply_meta_dirfd(struct walk_ctx *ctx, int fd, const struct estat *s
     }
 }
 
-static void remove_dst(struct walk_ctx *ctx, int dfd, const char *name, bool is_dir)
+/* Default prefix for a destination object renamed aside because its type no
+ * longer matches the source and it could not be unlinked/rmdir'd in place
+ * (non-empty directory: ENOTEMPTY: unlinkat/rmdir refuses a non-empty
+ * directory, and this code has no business doing a recursive remove inline
+ * mid-walk — that machinery already exists, at shard-fan-out scale, in the
+ * DELETE pass (delete.c), so this hands off to it instead of duplicating it).
+ * Deliberately distinct from o->temp_prefix: handle_orphan's temp-reclaim
+ * check matches destination entries against THAT prefix and treats a match
+ * as possibly-live in-progress-copy residue (protected unless the tag names
+ * an older pass) — a renamed-aside stale object is neither in-progress nor
+ * protectable that way, it is unconditionally orphaned the moment it lands,
+ * so it must never be mistaken for a copy temp by that logic. Sharing
+ * temp_name_fmt's <job>-<pass>.<shard>.<seq> shape (ctx->tmp_seq, the same
+ * atomic counter copy.c's own temp names use) only for uniqueness within
+ * this shard — the tag is not read back by anything, since this name is
+ * journaled as a plain JR_ORPHAN immediately, not treated as protected
+ * residue like a real copy temp. */
+#define STALE_PREFIX ".drsync.stale."
+
+/* Removes name (or, if that fails because it is a non-empty directory whose
+ * type no longer matches the source, renames it aside under STALE_PREFIX and
+ * journals the new name as an ordinary JR_ORPHAN) so the caller can then
+ * create the new source-typed object at the original name. rel is name's
+ * containing directory (dir_rel shape, "" at the tree root) — needed only to
+ * build the orphan's full relative path for the journal record; the rename
+ * itself stays within dfd, no path composition required for that half.
+ *
+ * This is the general fix for EVERY type transition at a given path (dir<->
+ * file<->symlink<->special, docs/DESIGN-agent.md §2's "type differs ->
+ * replace"), not a symlink-specific one — remove_dst is the single call site
+ * every case in handle_entry's switch already routes through. Before this,
+ * a non-empty directory conflicting with a new symlink/file/special at the
+ * same path failed with ENOTEMPTY here and then EEXIST (or similar) at
+ * whatever create call followed, leaving the destination stuck in its stale
+ * state forever — reported live against exactly the symlink case (a source
+ * directory replaced with a symlink), but the bug was never symlink-specific;
+ * every type transition against a non-empty former directory hit it. */
+static void remove_dst(struct walk_ctx *ctx, const char *rel, int dfd,
+                       const char *name, bool is_dir)
 {
-    if (unlinkat(dfd, name, is_dir ? AT_REMOVEDIR : 0) < 0 && errno != ENOENT)
-        walk_err(ctx, "replace-unlink", name); /* non-empty dir vs file conflict:
-                                                * recursive remove TODO(slice3) */
+    if (unlinkat(dfd, name, is_dir ? AT_REMOVEDIR : 0) == 0 || errno == ENOENT)
+        return;
+    if (!is_dir || errno != ENOTEMPTY) {
+        walk_err(ctx, "replace-unlink", name);
+        return;
+    }
+    if (ctx->oe->o.dry_run)
+        return; /* would rename+orphan; nothing to actually move */
+    char stale[NAME_MAX + 1];
+    unsigned seq = __atomic_fetch_add(&ctx->tmp_seq, 1, __ATOMIC_RELAXED);
+    temp_name_fmt(stale, sizeof stale, STALE_PREFIX, ctx->it->job_id,
+                 ctx->it->pass_no, ctx->it->shard_id, seq);
+    if (renameat(dfd, name, dfd, stale) < 0) {
+        walk_err(ctx, "replace-unlink", name); /* original ENOTEMPTY still stands */
+        return;
+    }
+    char orel[PATH_MAX];
+    if (snprintf(orel, sizeof orel, "%s%s%s", rel, rel[0] ? "/" : "", stale) >=
+            (int)sizeof orel) {
+        errno = ENAMETOOLONG;
+        walk_err(ctx, "path", stale);
+        return;
+    }
+    CTR_ADD(ctx->c.orphans, 1);
+    jrn_emit(ctx, JR_ORPHAN, orel, NULL, NULL, 0, NULL);
 }
 
 static void copy_symlink(struct walk_ctx *ctx, const char *dir_rel, int sfd,
@@ -322,7 +382,7 @@ static void copy_symlink(struct walk_ctx *ctx, const char *dir_rel, int sfd,
             }
         }
         if (!ctx->oe->o.dry_run)
-            remove_dst(ctx, dfd, name, false);
+            remove_dst(ctx, dir_rel, dfd, name, false);
     }
     CTR_ADD(ctx->c.symlinks, 1);
     if (ctx->oe->o.dry_run) {
@@ -684,7 +744,7 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
     case S_IFDIR:
         CTR_ADD(ctx->c.dirs, 1);
         if (ds && !type_match && !o->dry_run)
-            remove_dst(ctx, dfd, name, false);
+            remove_dst(ctx, rel, dfd, name, false);
         if ((!ds || !type_match) && !o->dry_run &&
             mkdirat(dfd, name, 0700) < 0 && errno != EEXIST) {
             walk_err(ctx, "mkdir", name);
@@ -753,7 +813,7 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
             return;
         }
         if (ds && !type_match)
-            remove_dst(ctx, dfd, name, S_ISDIR(ds->mode));
+            remove_dst(ctx, rel, dfd, name, S_ISDIR(ds->mode));
         if (should_chunk(o, ss->size)) {
             /* Hand a big file to the coordinator to copy across the fleet
              * instead of on this agent alone (design §2.3). The dst dir exists
@@ -770,7 +830,7 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
 
     case S_IFLNK:
         if (ds && !type_match && !o->dry_run) {
-            remove_dst(ctx, dfd, name, S_ISDIR(ds->mode));
+            remove_dst(ctx, rel, dfd, name, S_ISDIR(ds->mode));
             ds = NULL;
         }
         copy_symlink(ctx, rel, sfd, dfd, name, ss, ds && type_match);
@@ -790,7 +850,7 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
             return;
         }
         if (ds)
-            remove_dst(ctx, dfd, name, S_ISDIR(ds->mode));
+            remove_dst(ctx, rel, dfd, name, S_ISDIR(ds->mode));
         if (mknodat(dfd, name, ss->mode,
                     makedev(ss->rdev_major, ss->rdev_minor)) < 0) {
             walk_err(ctx, "mknod", name); /* usually EPERM without CAP_MKNOD */
