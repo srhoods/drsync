@@ -381,3 +381,41 @@ test("the page declares a theme-aware favicon", () => {
 test("the page ran without uncaught script errors", () => {
   assert.deepEqual(c.scriptErrors, []);
 });
+
+// --------------------------------------------------------------------------
+// Auth: token required but no session login configured
+// --------------------------------------------------------------------------
+// Regression: a coordinator can have -api-token-file set (its default even
+// names a conventional path an operator may not realise is populated) with
+// no auth.yaml — /api/v1/whoami's login_configured is correctly false (no
+// session login exists), but every other endpoint still requires a bearer
+// token the WebUI has no UI to supply. Before the fix, that state was
+// indistinguishable from genuine "no auth at all": the console called
+// startConsole(), every poll 401'd, onUnauthorized() reloaded the page, and
+// the reload re-ran the identical whoami -> startConsole -> 401 cycle
+// forever — "connecting…" and never anything else. token_required in the
+// whoami response is what breaks that loop.
+
+test("a token-required coordinator with no login shows an explanation, not an infinite reload loop", async () => {
+  const c2 = await boot({
+    routeOverrides: path => {
+      if (path === "/api/v1/whoami") {
+        return { json: { username: "", login_configured: false, token_required: true } };
+      }
+      // Every other endpoint behaves as the real coordinator would in this
+      // state: 401, since the browser has no bearer token to send.
+      return { status: 401, json: { error: "invalid or missing credentials" } };
+    },
+  });
+  await c2.tick(300);
+  assert.equal(c2.$("#token-required-screen").hidden, false,
+    "token-required explanation screen was not shown");
+  assert.equal(c2.$("#login-screen").hidden, true,
+    "the password login screen should not show — there is nothing to log into");
+  assert.match(c2.text("#token-required-screen"), /token/i);
+  assert.match(c2.text("#hz"), /connecting/,
+    "no successful poll ever completes in this state, so the header legitimately still reads connecting");
+  assert.deepEqual(c2.scriptErrors, [],
+    "no script errors — in particular no unhandled reload/navigation loop");
+  c2.dom.window.close();
+});

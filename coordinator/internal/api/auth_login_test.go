@@ -182,6 +182,52 @@ func TestWhoAmIWithoutSession(t *testing.T) {
 	}
 }
 
+// TestWhoAmIReportsTokenRequired is the WebUI-stuck-on-"connecting…"
+// regression: a coordinator can have -api-token-file set (its default even
+// names a conventional path an operator may not realise is populated, e.g.
+// left over from an earlier deployment) with no auth.yaml at all — SetAuth
+// is never called, so s.authenticator stays nil and login_configured is
+// correctly false, but every route s.auth() protects still 401s a browser
+// that supplies no bearer token. Before token_required existed, the WebUI
+// could not tell this state apart from genuine "no auth at all" and looped
+// silently (see webui/test/console.test.mjs's matching JS-side regression
+// test). token_required must be true here specifically because a token IS
+// configured and no authenticator is — the two other combinations
+// (TestWhoAmIWithSession/WithoutSession above) must both report false.
+func TestWhoAmIReportsTokenRequired(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv := New(st, nil, metrics.New(), nil, dir, "s3cr3t-token") // SetAuth deliberately never called
+
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/whoami", nil)
+	w := httptest.NewRecorder()
+	srv.handleWhoAmI(w, r)
+
+	var got map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["login_configured"] != false {
+		t.Errorf("login_configured = %v, want false (no auth.yaml, SetAuth never called)", got["login_configured"])
+	}
+	if got["token_required"] != true {
+		t.Errorf("token_required = %v, want true (a token is set with no authenticator to obtain a session through)", got["token_required"])
+	}
+
+	// And a protected route genuinely does 401 an unauthenticated request in
+	// this state — token_required=true is not just a label, it's true.
+	r2 := httptest.NewRequest(http.MethodGet, "/api/v1/jobs", nil)
+	w2 := httptest.NewRecorder()
+	srv.auth(srv.listJobs)(w2, r2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Fatalf("protected route status = %d, want 401 (token configured, none supplied)", w2.Code)
+	}
+}
+
 // TestAuthMiddlewareAcceptsSessionCookie exercises the middleware end to
 // end: a session cookie from login must be sufficient to pass s.auth() on a
 // protected route, without any bearer token.
