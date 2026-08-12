@@ -38,3 +38,6 @@ id_rsa*
 docs/PROJECT-SUMMARY.md
 tools/fsprobe/fsprobe
 tools/genfixture/genfixture
+
+# Claude Code project instructions — local-only, not for the public repo
+/CLAUDE.md
