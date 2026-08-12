@@ -297,7 +297,7 @@ static void release_shard(struct shard_item *it)
     memset(&c, 0, sizeof c);
     pb_buf b;
     pb_init(&b);
-    enc_shard_result(&b, it->shard_id, it->lease_id, RES_RELEASED, &c, NULL);
+    enc_shard_result(&b, it->shard_id, it->lease_id, RES_RELEASED, &c, NULL, NULL, 0);
     out_push(FR_SHARD_RESULT, &b);
     lease_remove(it->lease_id);
     shard_item_free(it);

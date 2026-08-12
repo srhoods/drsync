@@ -287,6 +287,14 @@ struct walk_ctx {
     struct split_wait       *infl[SPLIT_WINDOW];
     size_t                   infl_head, infl_count;
     unsigned                 tmp_seq; /* atomic: unique temp names per shard */
+    /* DELETE only (delete.c): relative paths of directories this shard
+     * processed inline but did NOT rmdir, because a descendant somewhere
+     * beneath them was handed off via queue_delete_subdir and might still be
+     * in flight elsewhere — see ShardResult.deferred_rmdirs' doc comment
+     * (proto/drsync.proto) for the coordinator-side completion tracking this
+     * feeds. */
+    char                   **deferred;
+    size_t                   n_deferred, cap_deferred;
     char                     err[256];
     bool                     fatal;
 };

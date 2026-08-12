@@ -138,6 +138,20 @@ void enc_delete_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
     pb_free(&dr);
 }
 
+void enc_delete_subdir_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
+                             char *const *subdirs, size_t n_subdirs)
+{
+    pb_put_u64(b, 1, parent_shard_id);
+    pb_put_u64(b, 2, seq);
+    for (size_t i = 0; i < n_subdirs; i++) {
+        pb_buf sub;
+        pb_init(&sub);
+        pb_put_bytes(&sub, 1, subdirs[i], strlen(subdirs[i]));
+        pb_put_msg(b, 8, &sub);
+        pb_free(&sub);
+    }
+}
+
 void enc_bigfile_split(pb_buf *b, uint64_t parent_shard_id, uint64_t seq,
                        const struct bigfile *files, size_t n_files)
 {
@@ -204,7 +218,8 @@ static void enc_counters(pb_buf *b, uint32_t field, const struct shard_counters 
 }
 
 void enc_shard_result(pb_buf *b, uint64_t shard_id, uint64_t lease_id, int status,
-                      const struct shard_counters *c, const char *error)
+                      const struct shard_counters *c, const char *error,
+                      char *const *deferred_rmdirs, size_t n_deferred_rmdirs)
 {
     pb_put_u64(b, 1, shard_id);
     pb_put_u64(b, 2, lease_id);
@@ -212,6 +227,8 @@ void enc_shard_result(pb_buf *b, uint64_t shard_id, uint64_t lease_id, int statu
     if (c)
         enc_counters(b, 4, c);
     pb_put_str(b, 5, error);
+    for (size_t i = 0; i < n_deferred_rmdirs; i++)
+        pb_put_bytes(b, 6, deferred_rmdirs[i], strlen(deferred_rmdirs[i]));
 }
 
 void enc_stats(pb_buf *b, const struct stats_snapshot *s)
@@ -503,6 +520,7 @@ static bool dec_tuning_opts(const uint8_t *p, size_t n, struct job_options *o)
         case 6: o->entrylist_batch = (uint32_t)pb_get_varint(&c); break;
         case 7: o->delete_split_threshold = pb_get_varint(&c); break;
         case 8: o->delete_split_batch = (uint32_t)pb_get_varint(&c); break;
+        case 9: o->delete_shard_budget = pb_get_varint(&c); break;
         default: pb_skip(&c, wt);
         }
     }

@@ -64,6 +64,7 @@ tree, and builds the binaries it needs itself:
 | `deep_e2e.sh` | directory chain deeper than the walker's in-agent limit |
 | `delete_fanout_e2e.sh` | pathological orphan directory fans out across DELETE shards |
 | `delete_fanout_nested_e2e.sh` | fan-out applies at every depth, not just the top-level orphan path |
+| `delete_fanout_budget_e2e.sh` | budget-based fan-out on a tree with no single wide directory |
 | `dirfix_e2e.sh` | DIRFIX over a directory that fans out to entry-lists |
 | `direct_write_e2e.sh` | `copy.direct_write`: new files skip the temp+rename, updates stay atomic |
 | `fanout_e2e.sh` | a small volume must still use the whole fleet |

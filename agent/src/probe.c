@@ -164,7 +164,7 @@ void process_probe(const struct shard_item *it)
     pb_buf b;
     pb_init(&b);
     enc_shard_result(&b, it->shard_id, it->lease_id, status, &c,
-                     err[0] ? err : NULL);
+                     err[0] ? err : NULL, NULL, 0);
     out_push(FR_SHARD_RESULT, &b);
     lease_remove(it->lease_id);
 }
