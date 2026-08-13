@@ -872,6 +872,40 @@ Append-only, per (job, pass), the system of record for per-file outcomes:
   the page cache, so a coordinator crash would lose them. If an fsync fails,
   every ack for that cycle is withheld (counted by
   `drsync_journal_fsync_errors_total`) and retried on the next successful flush.
+- **At-least-once, not exactly-once:** a shard whose lease expires mid-run
+  (`ExpireLeases` in store.go) is requeued and re-runs from scratch — it
+  re-walks and re-emits every journal record it had already written the
+  first time, not just the remainder. `agent/src/jrn.c`'s own doc comment
+  names this as the design: "lease-expiry re-runs gives at-least-once
+  journaling (readers dedup)." That last parenthetical is a contract on
+  every reader, and as of 2026-08 only some of them honor it:
+  `journal.Orphans()` always deduped correctly (it's a `map[string]struct{}`
+  by construction); `journal.Summary()` did not, until **found live**
+  investigating a user report of stale destination ACLs surviving a
+  re-run — a 22k-file/POSIX-ACL reproduction that turned out to hit a lease
+  expiry mid-pass, which inflated `drsync journal cat --summary`, the
+  completion email, and the WebUI journal-summary panel by exactly the
+  retried shard's record count (2000, in that repro). Fixed by deduping
+  `Summary()` per `(pass, type, rel_path)`, same pattern as `Orphans()`.
+  `passctrl.seedVerify`/`seedDirfix`, by contrast, deliberately do **not**
+  dedup: both stream the journal in O(batch) memory
+  (`TestSeedVerifyMemoryBounded` pins this at a 128 MiB budget for 1M
+  files), and a whole-pass "seen" set to dedup would reintroduce the O(N)
+  memory that streaming design exists to avoid. Left un-deduped there
+  because it's provably safe to: a duplicate `VerifyEntry`/`DirMeta` just
+  means that one file/dir gets verified or metadata-applied twice
+  (`check_entry` in agent/src/verify.c and dirfix's apply are both
+  idempotent), wasteful but not incorrect. Net effect: reporting/audit
+  views (`Summary`) are now exact; shard-seeding views (`seedVerify`/
+  `seedDirfix`) tolerate duplicates by design and always have. This
+  duplication bug is **not** the same thing as the original stale-ACL
+  report that surfaced it — double-counting a retried shard's records
+  cannot explain files being silently missed with zero journal signal
+  (a re-run shard re-diffs from scratch; it can re-fix or correctly see
+  nothing to fix, never skip). That symptom remains open, with a
+  source-filesystem metadata-caching staleness (observed before with VAST
+  appliances) as the leading theory, pending the user's own larger-scale
+  reproduction.
 
 ## 6. REST API & WebSocket (day-1 surface, also the WebUI contract)
 

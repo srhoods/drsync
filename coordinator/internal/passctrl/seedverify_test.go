@@ -69,6 +69,59 @@ func writeJournal(t *testing.T, root string, jobID int64, passNo int, rels []str
 	}
 }
 
+// writeJournalRecords is writeJournal's more general form: callers pass the
+// exact records to emit, in order, so a test can model a shard retry (the
+// same rel_path's record appearing twice in the journal — journaling is
+// at-least-once, see journal.ReadRecords' own doc comment) rather than
+// writeJournal's always-one-JR_COPIED-per-rel shape.
+func writeJournalRecords(t *testing.T, root string, jobID int64, passNo int, recs []*drsyncpb.JournalRecord) {
+	t.Helper()
+	w, err := journal.NewWriter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := zstd.NewWriter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const perBatch = 10_000
+	var raw []byte
+	var count int
+	appendBatch := func() {
+		if count == 0 {
+			return
+		}
+		if err := w.Append(&drsyncpb.JournalBatch{
+			JobId: uint64(jobID), PassNo: uint32(passNo),
+			RecordCount: uint32(count), RecordsZstd: enc.EncodeAll(raw, nil),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		raw = raw[:0]
+		count = 0
+	}
+	for _, rec := range recs {
+		b, err := proto.Marshal(rec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var hdr [binary.MaxVarintLen64]byte
+		n := binary.PutUvarint(hdr[:], uint64(len(b)))
+		raw = append(raw, hdr[:n]...)
+		raw = append(raw, b...)
+		if count++; count >= perBatch {
+			appendBatch()
+		}
+	}
+	appendBatch()
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // countVerify reads back the verify shards seeded into a pass (by leasing the
 // queued shards) and returns the total verify entries and how many are
 // checksummed, plus the number of verify shards.
@@ -240,5 +293,50 @@ func TestSeedVerifyMemoryBounded(t *testing.T) {
 	t.Logf("peak heap delta during seedVerify of %d files: %d MiB", n, grew>>20)
 	if grew > budget {
 		t.Fatalf("peak heap grew %d MiB (> %d MiB budget) — not streaming?", grew>>20, budget>>20)
+	}
+}
+
+// TestSeedVerifyToleratesRetriedShard pins a deliberate design choice, not a
+// bug: a shard whose lease expires mid-run is requeued and re-runs from
+// scratch (journal.ReadRecords' own doc comment: "a re-run shard re-emits
+// its records"), so the SAME rel_path's JR_META_FIXED/JR_COPIED can appear
+// twice in one pass's journal — confirmed live, a single lease expiry during
+// a 22k-file pass alone produced exactly this for 2000 files. seedVerify
+// does NOT dedup this (unlike journal.Summary, a bounded per-pass histogram
+// that can afford to): it streams in O(batch) memory
+// (TestSeedVerifyMemoryBounded pins this at 1M files), and a whole-pass
+// "seen" set to dedup would reintroduce the O(N) memory the streaming design
+// exists to avoid, in exchange for eliminating something that is wasteful
+// (a duplicated file gets verified, and possibly checksummed, twice) but not
+// incorrect (check_entry, agent/src/verify.c, is idempotent either way).
+// This test exists so a future change doesn't silently reintroduce
+// unbounded memory while "fixing" this — see the comment at this call site
+// in passctrl.go for the full tradeoff.
+func TestSeedVerifyToleratesRetriedShard(t *testing.T) {
+	c := newController(t)
+	spec := []byte(baseSpec + "  verify:\n    checksum:\n      sample_rate: 1.0\n")
+	job := makeJob(t, c, spec)
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "retried" appears twice as JR_META_FIXED (the shard that found and
+	// fixed it ran twice); "once" appears once, normally.
+	writeJournalRecords(t, c.journalRoot, job.ID, pass.PassNo, []*drsyncpb.JournalRecord{
+		{Type: drsyncpb.JournalRecord_JR_META_FIXED, RelPath: []byte("retried")},
+		{Type: drsyncpb.JournalRecord_JR_META_FIXED, RelPath: []byte("once")},
+		{Type: drsyncpb.JournalRecord_JR_META_FIXED, RelPath: []byte("retried")}, // duplicate: shard re-run
+	})
+
+	got, err := c.seedVerify(job, pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Fatalf("seedVerify returned %d entries, want 3 (duplicates are intentionally NOT collapsed — see comment)", got)
+	}
+	entries, _, _ := countVerify(t, c)
+	if entries != 3 {
+		t.Fatalf("verify shards cover %d entries, want 3", entries)
 	}
 }
