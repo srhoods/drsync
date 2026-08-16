@@ -953,6 +953,15 @@ func (c *Controller) seedDirfix(job *store.Job, pass *store.Pass) (int, error) {
 		return nil
 	}
 
+	// NOT deduped against a retried shard's duplicate JR_DIR_META (journaling
+	// is at-least-once, same mechanism as seedVerify's own doc comment
+	// below) — deliberately: this is streamed in O(batch) memory, and a
+	// whole-pass "seen" set would reintroduce the O(N) memory the streaming
+	// design exists to avoid. A duplicate DirMeta only means the same
+	// directory's metadata gets applied twice — wasteful but not incorrect,
+	// since dirfix.c's apply is idempotent. journal.Summary (a bounded
+	// per-pass histogram, not a per-file streaming consumer) does dedup this
+	// class of duplicate; this function cannot afford to the same way.
 	err := journal.ReadRecords(c.journalRoot, job.ID, pass.PassNo,
 		func(r *drsyncpb.JournalRecord) error {
 			if r.Type != drsyncpb.JournalRecord_JR_DIR_META || r.Src == nil {
@@ -1032,6 +1041,20 @@ func (c *Controller) seedVerify(job *store.Job, pass *store.Pass) (int, error) {
 	// file is hashed — and needs no whole-pass state.
 	firstCopied := true
 
+	// NOT deduped against a retried shard's duplicate records (journaling is
+	// at-least-once — a shard whose lease expires mid-run is requeued and
+	// re-runs from scratch, journal.go's own doc comment: "a re-run shard
+	// re-emits its records" — confirmed live: a single lease expiry during a
+	// 22k-file pass duplicated 2000 files' worth of records). Deliberately:
+	// this function is streamed in O(batch) memory (TestSeedVerifyMemoryBounded
+	// pins this at 1M files), and a whole-pass "seen" set to dedup would
+	// reintroduce the O(N) memory the streaming design exists to avoid. A
+	// duplicate VerifyEntry only means the same file gets verified twice —
+	// wasteful (double the read/hash cost for a checksum-sampled file) but not
+	// incorrect, since check_entry (agent/src/verify.c) is idempotent either
+	// way. journal.Summary (the reporting/audit view, not a per-file streaming
+	// consumer) does dedup, since a bounded per-pass type histogram can afford
+	// a "seen" set that seedVerify's per-file entries cannot.
 	err = journal.ReadRecords(c.journalRoot, job.ID, pass.PassNo,
 		func(r *drsyncpb.JournalRecord) error {
 			var checksum bool

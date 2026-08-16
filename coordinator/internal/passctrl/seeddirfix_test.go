@@ -162,3 +162,54 @@ func TestSeedDirfixEmpty(t *testing.T) {
 		t.Fatalf("seedDirfix seeded %d dirs from a journal with no DIR_META", n)
 	}
 }
+
+// TestSeedDirfixToleratesRetriedShard pins a deliberate design choice, not a
+// bug (same mechanism/rationale as TestSeedVerifyToleratesRetriedShard): a
+// shard whose lease expires mid-run is requeued and re-runs from scratch, so
+// the SAME directory's JR_DIR_META can appear twice in one pass's journal.
+// seedDirfix does NOT dedup this — it streams in O(batch) memory, and a
+// whole-pass "seen" set would reintroduce the O(N) memory that design
+// exists to avoid, in exchange for eliminating something that is wasteful
+// (the directory's metadata gets fetched and applied twice) but not
+// incorrect, since dirfix.c's apply is idempotent.
+func TestSeedDirfixToleratesRetriedShard(t *testing.T) {
+	c := newController(t)
+	job := makeJob(t, c, []byte(baseSpec))
+	pass, err := c.st.CreatePass(job.ID, 1, model.PassScanning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "a" appears twice (the shard that walked it ran twice); "b" appears once.
+	writeDirMetaJournal(t, c.journalRoot, job.ID, pass.PassNo, []dirRec{
+		{rel: "a", uid: 1, gid: 1, mode: 0o750, mt: 200},
+		{rel: "b", uid: 2, gid: 2, mode: 0o755, mt: 300},
+		{rel: "a", uid: 1, gid: 1, mode: 0o750, mt: 200}, // duplicate: shard re-run
+	})
+
+	n, err := c.seedDirfix(job, pass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("seedDirfix returned %d dirs, want 3 (duplicates are intentionally NOT collapsed — see comment)", n)
+	}
+
+	leased, err := c.st.LeaseShards("dirfix-reader", 1_000_000, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []*drsyncpb.DirMeta
+	for _, sh := range leased {
+		if sh.Kind != model.KindDirfix {
+			continue
+		}
+		fb := &drsyncpb.DirFixBatch{}
+		if err := proto.Unmarshal(sh.Payload, fb); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, fb.Dirs...)
+	}
+	if len(got) != 3 {
+		t.Fatalf("dirfix shards cover %d dirs, want 3", len(got))
+	}
+}
