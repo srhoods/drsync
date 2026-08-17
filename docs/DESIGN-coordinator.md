@@ -408,6 +408,30 @@ journal_cursors (pass_id, agent_id, acked_seq)      -- JournalBatch flow control
   `auto_vacuum=INCREMENTAL` and a periodic `PRAGMA incremental_vacuum` pump reclaims
   the pages the reaper frees, so deleting rows actually shrinks the file instead of
   leaving freed-but-unreturned pages in it forever.
+- **`DeleteJob` purges and B-tree fragmentation:** the steady incremental-vacuum
+  pump above is sized for the Shard Reaper's continuous trickle, not for `DeleteJob`
+  removing a whole large job's `shards`/`splits`/etc. rows in one transaction —
+  found live: a purge of a job with millions of shard rows left the `shards` B-tree
+  fragmented badly enough to visibly slow every later query against it, and the
+  500-page/30s incremental pump did not catch up before the next large purge
+  landed. `DeleteJob` now runs a full `VACUUM` (`store.vacuumAfterLargeDelete`)
+  whenever the purge removed at least `vacuumShardThreshold` (1M) shard rows —
+  below that, incremental vacuuming already handles it and a full rewrite would be
+  needless cost. Deliberately expensive: `VACUUM` rewrites the *entire* database
+  file, not just the freed pages, and needs the same exclusive lock class
+  `WALCheckpoint`'s TRUNCATE mode does (§ above that section documents measuring
+  that alone at up to 144s of write-lock hold on a 10-agent fleet) — for the whole
+  file, this runs longer still, and since `db` is the sole writer connection
+  (`MaxOpenConns(1)`), it has to run there, so it holds `mu` for its complete
+  duration and blocks every other write (and, once the rewrite itself starts,
+  every `rdb` reader too) fleet-wide. Two things keep this from being worse than
+  it has to be: it runs on its own goroutine off the purge request's own path (the
+  operator's `DELETE /api/v1/jobs/{name}` call returns as soon as the row deletes
+  commit, not after the vacuum), and concurrent/rapid `DeleteJob` calls coalesce
+  onto a single pending run (`vacuumPending`, CAS-guarded) — a bulk purge
+  (`POST /api/v1/jobs/purge`) can call `DeleteJob` once per matched job, and since
+  `VACUUM` compacts the whole file regardless of which job's rows triggered it,
+  running it once per job in that loop would be pure waste, not extra safety.
 - **Eager SCANNING reap:** the transition-time reap above still leaves SCANNING's own
   DONE probe/dir/entrylist/chunk rows sitting in `shards` (and their `splits` rows)
   for the entire scan, since that phase alone can run for most of a large job's wall

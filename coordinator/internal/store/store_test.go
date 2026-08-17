@@ -261,6 +261,155 @@ func TestDeleteJobRemovesJournalTypeCounts(t *testing.T) {
 	}
 }
 
+// waitVacuumIdle blocks until no VACUUM is pending/running, or fails the test
+// after a generous timeout — vacuumAfterLargeDelete runs on its own
+// goroutine, so a test asserting on its effects has to synchronize on
+// vacuumPending rather than the DeleteJob call returning.
+func waitVacuumIdle(t *testing.T, s *Store) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for s.vacuumPending.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for pending VACUUM to finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func freelistCount(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`PRAGMA freelist_count`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestDeleteJobSkipsVacuumBelowThreshold: a purge of a small job must not
+// queue a VACUUM at all — that scale is exactly what RunIncrementalVacuum's
+// steady trickle already handles, and this guards against the threshold
+// gate being dropped or inverted.
+func TestDeleteJobSkipsVacuumBelowThreshold(t *testing.T) {
+	s := openTest(t)
+	old := vacuumShardThreshold
+	vacuumShardThreshold = 1_000_000 // seed's job deletes far fewer shards than this
+	defer func() { vacuumShardThreshold = old }()
+
+	jobID, _, _ := seed(t, s)
+	if err := s.SetJobState(jobID, model.JobCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteJob("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if s.vacuumPending.Load() {
+		t.Error("DeleteJob queued a VACUUM for a purge below vacuumShardThreshold")
+	}
+}
+
+// TestDeleteJobVacuumsAboveThreshold: a purge whose shard-row count meets
+// vacuumShardThreshold must queue and complete a VACUUM — verified by
+// checking freelist_count actually drops to zero, not just that the pending
+// flag was set, so this fails if vacuumAfterLargeDelete's SQL is ever wrong
+// (e.g. VACUUM silently erroring) as well as if the trigger itself is wrong.
+func TestDeleteJobVacuumsAboveThreshold(t *testing.T) {
+	s := openTest(t)
+	old := vacuumShardThreshold
+	vacuumShardThreshold = 50
+	defer func() { vacuumShardThreshold = old }()
+
+	jobID, passID, _ := seed(t, s) // seed's own root shard, plus:
+	batch := make([]NewShard, 100)
+	for i := range batch {
+		batch[i] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%03d", i)}
+	}
+	if _, err := s.InsertShards(passID, 0, batch); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetJobState(jobID, model.JobCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if before := freelistCount(t, s); before != 0 {
+		t.Fatalf("freelist_count = %d before purge, want 0 (nothing deleted yet)", before)
+	}
+
+	if _, err := s.DeleteJob("t1"); err != nil {
+		t.Fatal(err)
+	}
+	waitVacuumIdle(t, s)
+
+	if after := freelistCount(t, s); after != 0 {
+		t.Errorf("freelist_count = %d after VACUUM, want 0 (VACUUM reclaims all free pages)", after)
+	}
+}
+
+// TestDeleteJobCoalescesConcurrentVacuums: purging several large jobs back to
+// back (as purgeJobs' bulk-purge loop does) must not queue one VACUUM per
+// purge — VACUUM compacts the whole database regardless of which job
+// triggered it, so overlapping DeleteJob calls should share a single run.
+// Asserts on vacuumRuns directly (not just that the purge itself succeeded):
+// without the CAS gate in vacuumAfterLargeDelete, N concurrent large purges
+// still all complete correctly (proven by deliberately removing the gate and
+// re-running this suite: purges still succeed, just with N redundant
+// VACUUM/checkpoint calls racing each other) — coalescing is a waste-avoidance
+// property, not a correctness one, so it needs its own direct assertion or a
+// regression here would pass silently.
+func TestDeleteJobCoalescesConcurrentVacuums(t *testing.T) {
+	s := openTest(t)
+	old := vacuumShardThreshold
+	vacuumShardThreshold = 50
+	defer func() { vacuumShardThreshold = old }()
+
+	const nJobs = 5
+	for i := 0; i < nJobs; i++ {
+		job, err := s.CreateJob(fmt.Sprintf("bulk%d", i), []byte(specYAML), false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetJobState(job.ID, model.JobRunning); err != nil {
+			t.Fatal(err)
+		}
+		pass, err := s.CreatePass(job.ID, 1, model.PassScanning)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch := make([]NewShard, 60)
+		for j := range batch {
+			batch[j] = NewShard{Kind: model.KindDir, RelPath: fmt.Sprintf("d%03d", j)}
+		}
+		if _, err := s.InsertShards(pass.ID, 0, batch); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetJobState(job.ID, model.JobCompleted); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < nJobs; i++ {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			if _, err := s.DeleteJob(name); err != nil {
+				t.Error(err)
+			}
+		}(fmt.Sprintf("bulk%d", i))
+	}
+	wg.Wait()
+	waitVacuumIdle(t, s)
+
+	jobs, err := s.ListJobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("%d jobs survived concurrent purge, want 0", len(jobs))
+	}
+	if runs := s.vacuumRuns.Load(); runs != 1 {
+		t.Errorf("vacuumRuns = %d, want exactly 1 — %d concurrent large purges should coalesce into a single VACUUM", runs, nJobs)
+	}
+}
+
 // A zero count for a type must not be written as a row (so it doesn't show up
 // as a spurious zero-count line in a caller that lists map keys) — mirrors the
 // omission behavior the WebUI/email rendering already relies on.
