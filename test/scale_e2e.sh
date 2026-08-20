@@ -46,6 +46,14 @@ mkdir -p "$SRC/bigdir/sub" "$DST/bigdir"
 for i in $(seq 1 200); do echo "entry $i" > "$SRC/bigdir/f$(printf %04d "$i").txt"; done
 echo nested > "$SRC/bigdir/sub/deep.txt"     # subdir inside the split dir
 echo stale  > "$DST/bigdir/f0001.txt"        # must be replaced
+touch -d '2000-01-01' "$DST/bigdir/f0001.txt" # older than the source it stands in
+                                              # for — copy.on_dest_newer defaults to
+                                              # skip, so an unbackdated destination
+                                              # write here (which lands at "now",
+                                              # after the source's own write above)
+                                              # would read as newer and be left
+                                              # alone instead of replaced, which is
+                                              # not what this fixture is testing
 echo orphan > "$DST/bigdir/zzz-orphan.txt"   # dst-only → orphan (report-only)
 head -c 629145600 /dev/urandom > "$SRC/huge.bin"   # 600 MiB → 3 ranges
 HUGE_SUM=$(sha256sum "$SRC/huge.bin" | cut -d' ' -f1)
