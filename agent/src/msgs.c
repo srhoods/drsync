@@ -213,6 +213,7 @@ static void enc_counters(pb_buf *b, uint32_t field, const struct shard_counters 
     pb_put_u64(&sub, 17, c->links_created);
     pb_put_u64(&sub, 18, c->link_anchor_races);
     pb_put_u64(&sub, 19, c->link_fallback);
+    pb_put_u64(&sub, 20, c->skipped_newer);
     pb_put_msg(b, field, &sub);
     pb_free(&sub);
 }
@@ -428,6 +429,11 @@ static bool dec_shard(const uint8_t *p, size_t n, struct shard_item *it)
 
 static bool dec_copy_opts(const uint8_t *p, size_t n, struct job_options *o)
 {
+    /* Pre-set before the field loop so an old coordinator that never sends
+     * field 10 at all (and, on the wire, a present-but-UNSPECIFIED value —
+     * proto's own zero default) both land on the safer skip behavior, not
+     * silently on the pre-this-field overwrite-always behavior. See the
+     * on_dest_newer_skip comment in msgs.h. */
     pb_cur c;
     pb_cur_init(&c, p, n);
     uint32_t f;
@@ -442,6 +448,14 @@ static bool dec_copy_opts(const uint8_t *p, size_t n, struct job_options *o)
         case 6: pb_get_strn(&c, o->temp_prefix, sizeof o->temp_prefix); break;
         case 7: o->fsync_per_file = pb_get_varint(&c) == 1; /* FSYNC_PER_FILE */ break;
         case 9: o->direct_write = pb_get_varint(&c) != 0; break;
+        case 10:
+            /* CONFLICT_UNSPECIFIED (0, proto's own zero value — should never
+             * be sent deliberately, but a corrupt/misbehaving coordinator is
+             * not a reason to fall back to the destructive choice) and
+             * CONFLICT_SKIP_IF_DEST_NEWER (1) both mean skip; only an
+             * explicit CONFLICT_OVERWRITE (2) turns it off. */
+            o->on_dest_newer_skip = pb_get_varint(&c) != 2;
+            break;
         default: pb_skip(&c, wt);
         }
     }
@@ -559,6 +573,20 @@ static bool dec_filter_rule(const uint8_t *p, size_t n, struct filter_rule *fr)
 static bool dec_job_options(const uint8_t *p, size_t n, struct job_options *o)
 {
     memset(o, 0, sizeof(*o));
+    /* Pre-set here, not just in dec_copy_opts: pb_put_msg (Go encoder side is
+     * equivalent) omits an entirely empty CopyOptions submessage from the
+     * wire rather than sending a zero-length one, so a JobOptions whose
+     * CopyOptions has every field at proto's zero value never reaches
+     * dec_copy_opts's own field loop at all — case 6 below is simply never
+     * taken. Setting it only inside dec_copy_opts left exactly that case
+     * (which is also what an old coordinator's CopyOptions predating this
+     * field would produce whenever its other fields also happened to be
+     * zero) resolving to false/overwrite, silently defeating the mixed-fleet
+     * safety this field exists for. dec_copy_opts still sets it again when
+     * that submessage IS present, which is harmless and keeps the two
+     * decode functions independently correct if either is ever called on
+     * its own. */
+    o->on_dest_newer_skip = true;
     pb_cur c;
     pb_cur_init(&c, p, n);
     uint32_t f;
