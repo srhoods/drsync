@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -64,6 +65,20 @@ type Store struct {
 	db  *sql.DB    // single writer connection; all mutations serialize on mu
 	rdb *sql.DB    // read-only connection pool; pure reads run here, lock-free
 	mu  sync.Mutex // single-writer discipline for db
+
+	// vacuumPending coalesces DeleteJob's post-purge VACUUM trigger (see
+	// vacuumAfterLargeDelete): a bulk purge calls DeleteJob once per job, and
+	// without this a purge of N large terminal jobs in one request would queue
+	// N full-database VACUUMs back to back — wasted work, since a VACUUM
+	// compacts the whole file regardless of which job's rows triggered it, so
+	// only the first of any back-to-back run does anything useful. CAS-guarded
+	// so concurrent DeleteJob calls only ever start one pending run.
+	vacuumPending atomic.Bool
+
+	// vacuumRuns counts completed VACUUM executions. Test-only instrument (no
+	// production reader) for asserting on coalescing directly rather than via
+	// side effects — see TestDeleteJobCoalescesConcurrentVacuums.
+	vacuumRuns atomic.Int64
 }
 
 // lockWaitWarnThreshold: diagnostic for the lease-requeue investigation
@@ -826,15 +841,79 @@ func (s *Store) DeleteJob(name string) (int64, error) {
 		`DELETE FROM jobs WHERE id = ?`,
 	}
 	args := []any{id, id, id, id, id, id, id, id, id, id}
+	const shardsStmt = 3 // index of the `DELETE FROM shards` statement above
+	var shardsDeleted int64
 	for i, q := range stmts {
-		if _, err := tx.Exec(q, args[i]); err != nil {
+		res, err := tx.Exec(q, args[i])
+		if err != nil {
 			return 0, err
+		}
+		if i == shardsStmt {
+			shardsDeleted, _ = res.RowsAffected()
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
+	if shardsDeleted >= vacuumShardThreshold {
+		s.vacuumAfterLargeDelete()
+	}
 	return id, nil
+}
+
+// vacuumShardThreshold is how many shard rows a single DeleteJob purge must
+// remove before it queues a full VACUUM (see vacuumAfterLargeDelete) — a
+// purge below this is exactly what RunIncrementalVacuum's steady 500-page/30s
+// trickle already handles; VACUUM's full-file rewrite is reserved for the
+// scale where B-tree fragmentation from millions of deleted rows was
+// observed live to fall off a performance cliff that incremental vacuuming
+// alone did not recover from before the next large purge landed.
+// var, not const, so a test can shorten it rather than seed a million rows.
+var vacuumShardThreshold int64 = 1_000_000
+
+// vacuumAfterLargeDelete queues a full VACUUM after a DeleteJob purge large
+// enough to fragment the shards B-tree (vacuumShardThreshold). Runs
+// asynchronously so the DeleteJob caller (the purge API handler) is not held
+// open for it, but coalesces via vacuumPending: a bulk purge (purgeJobs)
+// calls DeleteJob once per matched job, and VACUUM compacts the whole
+// database file regardless of which job's rows triggered it, so any
+// back-to-back purges within the same run should share one VACUUM rather
+// than repeat it once per job.
+//
+// This is expensive on purpose, not despite the cost: VACUUM must hold an
+// exclusive lock on the database for as long as the rewrite takes — the same
+// class of cost WALCheckpoint's TRUNCATE mode documents (measured there at up
+// to 144s at a 10-agent fleet for a far cheaper operation), except VACUUM
+// rewrites the *entire* file, not just replays the WAL, so its hold is
+// larger still and scales with total database size, not with what changed.
+// Because s.db is the sole writer connection (MaxOpenConns(1)), VACUUM has
+// to run there — a second connection would only contend with s.db and s.rdb
+// for the same file lock, not avoid it — so this still takes s.mu for the
+// full duration and stalls every other write (and, once VACUUM actually
+// starts rewriting, every s.rdb reader too) fleet-wide until it completes.
+// Moving this off the request path (the goroutine) does not remove that
+// cost, only defers it to a moment the caller isn't blocked waiting on.
+func (s *Store) vacuumAfterLargeDelete() {
+	if !s.vacuumPending.CompareAndSwap(false, true) {
+		return // a VACUUM is already queued or running; it will cover this purge too
+	}
+	go func() {
+		defer s.vacuumPending.Store(false)
+		if err := s.walCheckpoint("TRUNCATE", "VacuumAfterDelete-checkpoint"); err != nil {
+			slog.Warn("vacuum after delete: checkpoint failed", "err", err)
+			return
+		}
+		start := time.Now()
+		release := s.lockTimed("VacuumAfterDelete")
+		_, err := s.db.Exec(`VACUUM`)
+		release()
+		if err != nil {
+			slog.Warn("vacuum after delete: failed", "err", err, "elapsed_ms", time.Since(start).Milliseconds())
+			return
+		}
+		s.vacuumRuns.Add(1)
+		slog.Info("vacuum after delete: complete", "elapsed_ms", time.Since(start).Milliseconds())
+	}()
 }
 
 // ---------------------------------------------------------------------------
