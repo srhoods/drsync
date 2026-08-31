@@ -271,6 +271,74 @@ the stale subtree is picked up and removed by the next explicit DELETE pass
 through the same fan-out machinery any other orphan uses, no coordinator-side
 awareness of "type change" required.
 
+### 2.1b Conflict resolution: which side wins on a timestamp disagreement
+
+Steps 1–3 of the diff predicate above decide **whether** to copy; they say
+nothing about **direction** — `times_equal` (`agent/src/walker.c`) is an
+unsigned `|src.mtime - dst.mtime|` comparison, so before `copy.on_dest_newer`
+existed, any mtime difference beyond `mtime_slop_ns` meant "copy," full stop,
+regardless of which side was actually newer. drsync's normal operating
+mode is one-directional (source is authoritative, destination is a
+migration target), so this was never wrong for that case — but it also meant
+a destination edited out-of-band (a dataset **merge**, not a pure migration:
+an operator or another process wrote directly into the destination tree)
+would be silently clobbered on the very next pass, with no way to protect it
+short of excluding the path entirely.
+
+`copy.on_dest_newer` (proto `CopyOptions.ConflictPolicy`, job-spec
+`copy.on_dest_newer: skip|overwrite`) adds a direction-aware check ahead of
+the normal diff, using a second, *signed* comparison (`dest_is_newer`,
+alongside `times_equal` — direction matters here in a way it deliberately
+doesn't for the plain equality check the rest of the predicate uses):
+
+- **`skip` (default):** when the destination's mtime is strictly newer than
+  the source's (beyond `mtime_slop_ns`) and both sides agree on type, the
+  entry is left completely untouched — no copy, no owner/mode/xattr fixup
+  either, since those are normally applied as a cheap side-channel on an
+  otherwise-clean file (predicate steps 5–6) and would still be clobbering
+  something the operator may have deliberately changed. Recorded as
+  `JR_SKIPPED_NEWER` (own counter, `shard_counters.skipped_newer`) — every
+  occurrence, not sampled, since (unlike `JR_SKIPPED_CLEAN`) this is a real
+  conflict an operator needs to be able to audit in full, not routine
+  "nothing to do" volume.
+- **`overwrite`:** the pre-this-field behavior — source always wins,
+  direction never considered. The correct choice for a strict
+  one-directional mirror where the destination must never diverge from the
+  source, which is most drsync jobs; an operator opts into it explicitly.
+
+Two things keep this narrowly scoped rather than reshaping the predicate:
+
+- It only fires when `type_match` is true (same `d_type` on both sides) —
+  a type change (§2.1a) is not a "which side is newer" question, and still
+  goes through `remove_dst`/replace exactly as before regardless of
+  `on_dest_newer`.
+- A file the VERIFY phase never learns about cannot be "un-skipped" by
+  verification's own re-check: `passctrl.seedVerify` seeds VERIFY entries
+  only from `JR_COPIED`/`JR_META_FIXED` journal records (docs/DESIGN-
+  coordinator.md §5), and a skip emits neither — so a skipped file is
+  invisible to VERIFY by construction, not by an extra check inside
+  `verify.c`. This matters because VERIFY's own mismatch handling
+  (`recopy`, on ANY field disagreement including mtime) would otherwise
+  silently re-copy exactly the file this option exists to protect.
+
+**Mixed-fleet default safety:** the field defaults to `skip`, and that
+default has to survive an agent that cannot decode it at all — either
+because it predates this field (proto skips unknown field 10 on decode,
+`job_options.on_dest_newer_skip` never gets written) or because the
+coordinator's `CopyOptions` submessage happened to be empty on the wire
+(`pb_put_msg` omits an entirely zero-valued submessage rather than sending
+an empty one — a real, not merely theoretical, case: this is exactly the
+shape an old coordinator's `CopyOptions` produces). `dec_job_options`
+(`agent/src/msgs.c`) sets `on_dest_newer_skip = true` immediately after its
+`memset`, before any field parsing — not only inside `dec_copy_opts`'s own
+field loop, which a completely absent `copy` submessage never reaches. An
+agent that cannot see this field at all must land on the newer, safer
+default, never silently regress to overwrite-always; caught by
+`agent/test/on_dest_newer_test.c` before it shipped (a first version that
+only set the default inside `dec_copy_opts` passed the "explicit value"
+cases but failed exactly the "field absent" and "explicit
+`CONFLICT_UNSPECIFIED`" cases this note describes).
+
 ### 2.2 statx batching — the NFS scan multiplier
 
 Serial `stat` over NFS at 0.5 ms RTT = 2k entries/s/thread — hopeless. The walker

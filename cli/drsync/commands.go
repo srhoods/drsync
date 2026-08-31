@@ -799,6 +799,7 @@ var journalCats = []struct{ key, label, color string }{
 	{"ORPHAN", "orphan", ansiYellow},
 	{"SRC_CHANGED", "src_changed", ansiYellow},
 	{"LINK_FALLBACK", "link_fallback", ansiYellow},
+	{"SKIPPED_NEWER", "skipped_newer", ansiYellow},
 	{"ERROR", "error", ansiRed},
 	{"FIDELITY_EXCEPTION", "fidelity_exception", ansiRed},
 	{"VERIFY_FAIL", "verify_fail", ansiRed},
@@ -900,6 +901,9 @@ func cmdReport(args []string) error {
 	fmt.Printf("verify: %d ok, %d fail\n", i64(t["verify_ok"]), i64(t["verify_fail"]))
 	if lc, lr, lf := i64(t["links_created"]), i64(t["link_anchor_races"]), i64(t["link_fallback"]); lc+lr+lf > 0 {
 		fmt.Printf("hardlinks: %d linked, %d anchor races, %d fell back to independent copy\n", lc, lr, lf)
+	}
+	if sn := i64(t["skipped_newer"]); sn > 0 {
+		fmt.Printf("skipped: %d files left untouched (destination newer than source)\n", sn)
 	}
 	fmt.Printf("converged: %v   orphans remaining: %d   delete pass ran: %v\n",
 		rep["converged"], i64(rep["orphans_remaining"]), rep["delete_pass_ran"])

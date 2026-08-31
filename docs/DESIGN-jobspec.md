@@ -65,6 +65,16 @@ spec:
                                      # Trades atomicity: a crash mid-write leaves a
                                      # partial file, re-copied next pass. Only new
                                      # files; updates keep the atomic temp+rename.
+    on_dest_newer: skip              # skip (default) | overwrite. A destination file
+                                     # whose mtime is strictly newer than the source's
+                                     # (beyond tuning.mtime_slop_ns) is left untouched
+                                     # (JR_SKIPPED_NEWER) instead of overwritten — the
+                                     # safer default for a dataset merge, where an
+                                     # out-of-band destination edit shouldn't be
+                                     # silently clobbered. overwrite restores the
+                                     # behavior from before this field existed: source
+                                     # always wins regardless of mtime direction, for a
+                                     # strict one-directional mirror.
 
   metadata:
     owner: true                      # uid/gid (needs root)

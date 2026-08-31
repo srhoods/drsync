@@ -49,6 +49,11 @@ spec:
     direct_write: true               # write NEW files straight to their final name (faster
                                      # on GPFS/Weka; a crash leaves a partial, re-copied
                                      # next pass). Updates always use the atomic temp+rename.
+    on_dest_newer: skip              # skip (default) | overwrite — a destination file whose
+                                     # mtime is newer than the source's is left untouched
+                                     # (recorded as JR_SKIPPED_NEWER) rather than overwritten.
+                                     # Set overwrite for a strict one-directional mirror where
+                                     # source must always win, regardless of destination mtime.
 
   metadata:
     owner: true                      # uid/gid (needs root on the agents)

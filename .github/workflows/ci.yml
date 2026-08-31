@@ -123,6 +123,7 @@ jobs:
           - filter_e2e             # include/exclude filters
           - hardlink_e2e           # hardlinks: preserve dedups across a multi-agent fleet
           - hardlink_resilience_e2e # agent dies mid-LINKFIX; oversized group falls back
+          - on_dest_newer_e2e      # copy.on_dest_newer: skip (default) vs overwrite conflict resolution
           - probe_e2e              # per-agent mount probe gates pass start
           - scale_e2e              # pathological shapes: huge dir, huge file
           - temp_reclaim_e2e       # sweep reclaims crash residue, spares live temps

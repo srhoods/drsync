@@ -321,8 +321,11 @@ type passView struct {
 	LinksCreated    int64 `json:"links_created"`
 	LinkAnchorRaces int64 `json:"link_anchor_races"`
 	LinkFallback    int64 `json:"link_fallback"`
-	StartedAtMs     int64 `json:"started_at_ms,omitempty"`
-	FinishedAtMs    int64 `json:"finished_at_ms,omitempty"`
+	// copy.on_dest_newer = skip (default): files left untouched because the
+	// destination's mtime was newer than the source's.
+	SkippedNewer int64 `json:"skipped_newer"`
+	StartedAtMs  int64 `json:"started_at_ms,omitempty"`
+	FinishedAtMs int64 `json:"finished_at_ms,omitempty"`
 	// DurationMs is finished-started for a completed pass, or elapsed-so-far
 	// (now-started) for one still running. Zero if the pass never started.
 	DurationMs int64 `json:"duration_ms"`
@@ -336,7 +339,7 @@ func passViewOf(p *store.Pass) passView {
 		FidelityExc: p.FidelityExceptions,
 		VerifyOK:    p.VerifyOK, VerifyFail: p.VerifyFail,
 		LinksCreated: p.LinksCreated, LinkAnchorRaces: p.LinkAnchorRaces,
-		LinkFallback: p.LinkFallback,
+		LinkFallback: p.LinkFallback, SkippedNewer: p.SkippedNewer,
 	}
 	if p.Started.Valid {
 		v.StartedAtMs = p.Started.Int64

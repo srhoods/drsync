@@ -1,6 +1,10 @@
 package model
 
-import "testing"
+import (
+	"testing"
+
+	drsyncpb "drsync/proto/gen/drsyncpb"
+)
 
 // TestDefaultsAppliedToMinimalSpec locks down ApplyDefaults' resolved values
 // for a spec that specifies nothing beyond the required fields, so the
@@ -82,5 +86,60 @@ func TestDirectWriteExplicitFalseIsRespected(t *testing.T) {
 	}
 	if s.Spec.Copy.DirectWrite == nil || *s.Spec.Copy.DirectWrite {
 		t.Errorf("copy.direct_write = %v, want explicit false to stick", s.Spec.Copy.DirectWrite)
+	}
+}
+
+// TestOnDestNewerDefaultsToSkip: a spec that doesn't set copy.on_dest_newer
+// must resolve to "skip" — the deliberate behavior change from the
+// pre-this-field always-overwrite default (source always won regardless of
+// mtime direction). Checked at both the YAML-resolved level and the wire
+// level (ToJobOptions), since a mismatch between the two would mean the
+// coordinator's own idea of the default diverges from what agents receive.
+func TestOnDestNewerDefaultsToSkip(t *testing.T) {
+	s, err := ParseSpec([]byte(filterBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Spec.Copy.OnDestNewer != "skip" {
+		t.Errorf("copy.on_dest_newer = %q, want skip", s.Spec.Copy.OnDestNewer)
+	}
+	o, err := s.ToJobOptions(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Copy.OnDestNewer != drsyncpb.CopyOptions_CONFLICT_SKIP_IF_DEST_NEWER {
+		t.Errorf("resolved JobOptions.Copy.OnDestNewer = %v, want CONFLICT_SKIP_IF_DEST_NEWER",
+			o.Copy.OnDestNewer)
+	}
+}
+
+// TestOnDestNewerOverwriteIsRespected: an operator who explicitly opts into
+// the old always-overwrite behavior must have that honored end to end, not
+// silently defaulted back to skip.
+func TestOnDestNewerOverwriteIsRespected(t *testing.T) {
+	spec := filterBase + "  copy:\n    on_dest_newer: overwrite\n"
+	s, err := ParseSpec([]byte(spec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Spec.Copy.OnDestNewer != "overwrite" {
+		t.Errorf("copy.on_dest_newer = %q, want explicit overwrite to stick", s.Spec.Copy.OnDestNewer)
+	}
+	o, err := s.ToJobOptions(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Copy.OnDestNewer != drsyncpb.CopyOptions_CONFLICT_OVERWRITE {
+		t.Errorf("resolved JobOptions.Copy.OnDestNewer = %v, want CONFLICT_OVERWRITE", o.Copy.OnDestNewer)
+	}
+}
+
+// TestOnDestNewerRejectsUnknownValue guards the validation switch: a typo'd
+// value must fail fast at submit time, not silently fall through to
+// whatever the zero enum value happens to mean.
+func TestOnDestNewerRejectsUnknownValue(t *testing.T) {
+	spec := filterBase + "  copy:\n    on_dest_newer: sometimes\n"
+	if _, err := ParseSpec([]byte(spec)); err == nil {
+		t.Fatal("expected an error for copy.on_dest_newer: sometimes, got nil")
 	}
 }

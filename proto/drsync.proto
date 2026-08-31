@@ -257,6 +257,30 @@ message CopyOptions {
   // applied when the destination file does not already exist; updates keep the
   // atomic temp+rename. Default off.
   bool direct_write     = 9;
+  enum ConflictPolicy {
+    CONFLICT_UNSPECIFIED = 0;
+    // A destination file whose mtime is strictly newer than the source's
+    // (beyond tuning.mtime_slop_ns) is left alone: not copied, not
+    // metadata-fixed, no VERIFY_FAIL — recorded as JR_SKIPPED_NEWER instead.
+    // Default: drsync is a one-directional migration/consolidation tool
+    // (source is normally authoritative), but an out-of-band destination
+    // edit or a dataset merge scenario means "newer" isn't always "source's
+    // copy". This is the safer default for a merge — an unexpected skip
+    // loses nothing (the file just isn't touched), where an unexpected
+    // overwrite is destructive and cannot be undone by a later pass.
+    CONFLICT_SKIP_IF_DEST_NEWER = 1;
+    // The behavior before this field existed: mtime difference in EITHER
+    // direction means copy, source always wins. Opt in explicitly for a true
+    // one-directional mirror where the destination must never diverge.
+    CONFLICT_OVERWRITE = 2;
+  }
+  // Default CONFLICT_SKIP_IF_DEST_NEWER — see the enum's own comment. An old
+  // agent that does not understand this field (pre-dates it, decodes as 0/
+  // UNSPECIFIED via proto default-on-absence) falls back to its own built-in
+  // default at the agent/src/msgs.c decode site, not to whatever the
+  // coordinator resolved — see docs/DESIGN-protocol.md §5.1's "old agent,
+  // new coordinator field" mixed-fleet caveat.
+  ConflictPolicy on_dest_newer = 10;
 }
 
 message LimitOptions {
@@ -620,6 +644,11 @@ message ShardCounters {
                                   // at most one per group, tracked for visibility
   uint64 link_fallback    = 19;  // groups that fell back to independent-copy
                                  // (anchor failure or hardlinks_max_group_scan cap)
+  // copy.on_dest_newer = CONFLICT_SKIP_IF_DEST_NEWER (the default): files
+  // left untouched because the destination's mtime was strictly newer than
+  // the source's. Each one also gets its own JR_SKIPPED_NEWER journal
+  // record (not sampled) — this counter is the pass-summary rollup of that.
+  uint64 skipped_newer    = 20;
 }
 
 message ShardResult {
@@ -689,6 +718,12 @@ message JournalRecord {
     // Hardlink preservation (docs/DESIGN-hardlinks.md):
     JR_LINK_CREATED       = 15;  // member linked to its group's anchor
     JR_LINK_FALLBACK      = 16;  // group fell back to independent copy
+    // copy.on_dest_newer = CONFLICT_SKIP_IF_DEST_NEWER (the default): the
+    // destination's mtime was strictly newer than the source's, so the
+    // otherwise-due copy/meta-fix was skipped. Not sampled — every skip is
+    // recorded, since (unlike JR_SKIPPED_CLEAN) this is a conflict an
+    // operator needs to be able to audit in full.
+    JR_SKIPPED_NEWER      = 17;
   }
   Type type        = 1;
   bytes rel_path   = 2;

@@ -74,6 +74,16 @@ type JobSpec struct {
 			TempNaming     string   `yaml:"temp_naming"`
 			Fsync          string   `yaml:"fsync"`
 			DirectWrite    *bool    `yaml:"direct_write"`
+			// OnDestNewer resolves a conflict where the destination's mtime is
+			// strictly newer than the source's (beyond tuning.mtime_slop_ns):
+			// skip (default) leaves that file alone, recorded as
+			// JR_SKIPPED_NEWER; overwrite is the behavior before this field
+			// existed — source always wins regardless of direction. skip is
+			// the safer default for a dataset merge (an unexpected skip loses
+			// nothing; an unexpected overwrite is destructive and permanent).
+			// A true one-directional mirror, where the destination must never
+			// diverge from the source, should set this to overwrite explicitly.
+			OnDestNewer string `yaml:"on_dest_newer"`
 		} `yaml:"copy"`
 		Metadata struct {
 			Owner  *bool `yaml:"owner"`
@@ -232,6 +242,9 @@ func (s *JobSpec) ApplyDefaults() {
 		sp.Copy.Fsync = "batched"
 	}
 	boolDefault(&sp.Copy.DirectWrite, true)
+	if sp.Copy.OnDestNewer == "" {
+		sp.Copy.OnDestNewer = "skip"
+	}
 	boolDefault(&sp.Metadata.Owner, true)
 	boolDefault(&sp.Metadata.Mode, true)
 	boolDefault(&sp.Metadata.Times, true)
@@ -399,6 +412,11 @@ func (s *JobSpec) Validate() error {
 	default:
 		return fmt.Errorf("deletes.mode must be report|mirror")
 	}
+	switch s.Spec.Copy.OnDestNewer {
+	case "skip", "overwrite":
+	default:
+		return fmt.Errorf("copy.on_dest_newer must be skip|overwrite")
+	}
 	switch s.Spec.Verify.Mode {
 	case "on", "off":
 	default:
@@ -491,6 +509,14 @@ func (s *JobSpec) ToJobOptions(jobID uint64, dryRun bool) (*drsyncpb.JobOptions,
 		o.Copy.ServerSideCopy = drsyncpb.CopyOptions_SSC_REQUIRE
 	default:
 		return nil, fmt.Errorf("copy.server_side_copy must be auto|off|require")
+	}
+	switch sp.Copy.OnDestNewer {
+	case "skip":
+		o.Copy.OnDestNewer = drsyncpb.CopyOptions_CONFLICT_SKIP_IF_DEST_NEWER
+	case "overwrite":
+		o.Copy.OnDestNewer = drsyncpb.CopyOptions_CONFLICT_OVERWRITE
+	default:
+		return nil, fmt.Errorf("copy.on_dest_newer must be skip|overwrite")
 	}
 	if sp.Copy.Fsync == "per_file" {
 		o.Copy.FsyncMode = drsyncpb.CopyOptions_FSYNC_PER_FILE

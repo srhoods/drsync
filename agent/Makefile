@@ -6,7 +6,7 @@ SRC := src/pb.c src/msgs.c src/wire.c src/tls.c src/state.c src/uring.c src/copy
 OBJ := $(SRC:.c=.o)
 BIN := bin/drsync-agent
 
-.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test estat-test link-test
+.PHONY: all clean test filter-test fidelity-test ucopy-test tempname-test xattr-copy-test poolsize-test state-test opts-test estat-test link-test on-dest-newer-test
 
 all: $(BIN)
 
@@ -18,7 +18,7 @@ $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Unit tests that need no coordinator/fleet.
-test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test estat-test link-test
+test: filter-test fidelity-test xattr-copy-test ucopy-test tempname-test poolsize-test state-test opts-test estat-test link-test on-dest-newer-test
 
 # Standalone unit test for the glob matcher.
 filter-test: bin/filter_test
@@ -110,5 +110,15 @@ bin/link_test: test/link_test.c src/link.o src/delete.o src/split.o src/jrn.o sr
 	@mkdir -p bin
 	$(CC) $(CFLAGS) -o $@ test/link_test.c src/link.o src/delete.o src/split.o src/jrn.o src/msgs.o src/pb.o src/state.o src/uring.o -pthread -lzstd
 
+# copy.on_dest_newer wire decode: absent field / CONFLICT_UNSPECIFIED / _SKIP /
+# _OVERWRITE all resolve job_options.on_dest_newer_skip correctly, driven
+# through the real dec_work_grant -> dec_job_options -> dec_copy_opts path.
+on-dest-newer-test: bin/on_dest_newer_test
+	./bin/on_dest_newer_test
+
+bin/on_dest_newer_test: test/on_dest_newer_test.c src/msgs.o src/pb.o
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -o $@ test/on_dest_newer_test.c src/msgs.o src/pb.o -pthread -lzstd
+
 clean:
-	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test bin/estat_test bin/link_test
+	rm -f $(OBJ) $(BIN) bin/filter_test bin/fidelity_test bin/xattr_copy_test bin/ucopy_test bin/tempname_test bin/poolsize_test bin/state_test bin/opts_test bin/estat_test bin/link_test bin/on_dest_newer_test

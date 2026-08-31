@@ -277,6 +277,19 @@ static bool times_equal(const struct walk_ctx *ctx, const struct timespec *a,
     return ts_diff_ns(a, b) <= ctx->oe->o.mtime_slop_ns;
 }
 
+/* Signed counterpart to times_equal, for the on_dest_newer_skip conflict
+ * check (§ handle_entry S_IFREG): unlike times_equal/ts_diff_ns, direction
+ * matters here — a destination strictly newer than the source by more than
+ * mtime_slop_ns is the one case this policy treats differently from a plain
+ * "mtime differs" copy trigger. */
+static bool dest_is_newer(const struct walk_ctx *ctx, const struct timespec *src,
+                          const struct timespec *dst)
+{
+    int64_t d = ((int64_t)dst->tv_sec - src->tv_sec) * 1000000000 +
+                (dst->tv_nsec - src->tv_nsec);
+    return d > ctx->oe->o.mtime_slop_ns;
+}
+
 static void apply_meta_dirfd(struct walk_ctx *ctx, int fd, const struct estat *ss,
                              const char *path)
 {
@@ -776,6 +789,22 @@ static void handle_entry(struct walk_ctx *ctx, struct dpend *dp, const char *rel
         }
         bool need = !type_match || ds->size != ss->size ||
                     !times_equal(ctx, &ss->mtim, &ds->mtim);
+        /* Conflict check (copy.on_dest_newer, default skip): a destination
+         * regular file strictly newer than the source is left entirely
+         * alone — no copy, no metadata fix, not even the owner/mode/xattr
+         * lazy fixups below — rather than treated as drift to reconcile.
+         * Only applies once both sides agree it's the same file (type_match
+         * — ds is non-NULL whenever that's true) and only for the "dest is
+         * newer" direction: a source that's newer, or equal within slop,
+         * proceeds through the normal diff exactly as before. */
+        if (o->on_dest_newer_skip && type_match &&
+            dest_is_newer(ctx, &ss->mtim, &ds->mtim)) {
+            CTR_ADD(ctx->c.skipped_newer, 1);
+            char srel[PATH_MAX];
+            snprintf(srel, sizeof srel, "%s%s%s", rel, rel[0] ? "/" : "", name);
+            jrn_emit(ctx, JR_SKIPPED_NEWER, srel, ss, ds, 0, NULL);
+            return;
+        }
         if (!need) {
             /* diff predicate steps 5–6: owner/mode, then lazy xattr digest —
              * paid only by files that are otherwise clean (design §2.1) */

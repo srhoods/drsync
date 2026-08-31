@@ -77,6 +77,7 @@ enum {
     JR_SRC_CHANGED = 14,
     JR_LINK_CREATED = 15,  /* hardlink member linked to its group's anchor */
     JR_LINK_FALLBACK = 16, /* hardlink group fell back to independent copy */
+    JR_SKIPPED_NEWER = 17, /* on_dest_newer_skip: dest mtime > src, left alone */
 };
 
 /* Control.Command */
@@ -132,6 +133,16 @@ struct job_options {
     char     temp_prefix[64];
     bool     fsync_per_file;
     bool     direct_write; /* copy a new file straight to its final name */
+    /* CONFLICT_* (proto CopyOptions.ConflictPolicy). A destination file
+     * strictly newer than the source (beyond mtime_slop_ns) is skipped
+     * rather than overwritten unless the job set on_dest_newer: overwrite
+     * (the pre-this-field behavior — source always wins regardless of
+     * direction). dec_copy_opts (msgs.c) pre-sets this true before decoding
+     * field 10, specifically so a coordinator old enough to never send that
+     * field at all — struct starts memset(0) and the field is then simply
+     * never written — still resolves to the newer, safer skip behavior
+     * rather than silently falling back to overwrite-always. */
+    bool     on_dest_newer_skip;
     /* metadata */
     bool meta_owner, meta_mode, meta_times, meta_xattrs, meta_specials;
     bool acl_posix, acl_nfs4;
@@ -299,6 +310,7 @@ struct shard_counters {
     uint64_t links_created;     /* member links created via linkat (space saved) */
     uint64_t link_anchor_races; /* redundant speculative copies (§3.4) */
     uint64_t link_fallback;     /* groups that fell back to independent-copy */
+    uint64_t skipped_newer;     /* on_dest_newer_skip: dest mtime > src, left alone */
 };
 
 struct cached_opts {
