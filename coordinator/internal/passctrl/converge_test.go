@@ -1,6 +1,8 @@
 package passctrl
 
 import (
+	"database/sql"
+	"errors"
 	"testing"
 
 	"drsync/coordinator/internal/model"
@@ -38,6 +40,20 @@ func newController(t *testing.T) *Controller {
 func makeJob(t *testing.T, c *Controller, spec []byte) *store.Job {
 	t.Helper()
 	job, err := c.st.CreateJob("t1", spec, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.st.SetJobState(job.ID, model.JobRunning); err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
+
+// makeDryRunJob is makeJob with dry_run set, for decideNextPass's dry-run
+// pass-ceiling override.
+func makeDryRunJob(t *testing.T, c *Controller, spec []byte) *store.Job {
+	t.Helper()
+	job, err := c.st.CreateJob("t1", spec, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,5 +147,35 @@ func TestThresholdConvergesEarly(t *testing.T) {
 	}
 	if got := jobState(t, c, job.ID); got != model.JobCompleted {
 		t.Fatalf("delta under threshold should complete, got state %v", got)
+	}
+}
+
+// A dry run writes nothing, so a second pass would just re-walk and re-diff
+// the same unchanged trees — it must complete after pass 1 regardless of
+// passes.max, without requiring the spec to also set max: 1 itself. Mirrors
+// TestNonzeroDeltaSeedsNextPass's non-dry-run case, which expects the
+// opposite outcome (another pass seeded) for the identical delta/ceiling.
+func TestDryRunStopsAfterOnePass(t *testing.T) {
+	c := newController(t)
+	job := makeDryRunJob(t, c, withConverge("    max: 5\n"))
+
+	done := &store.Pass{ID: 1, JobID: job.ID, PassNo: 1, FilesCopied: 42}
+	jobDone, converged, err := c.decideNextPass(job, done)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jobDone {
+		t.Fatal("dry-run job should complete after pass 1, got jobDone=false")
+	}
+	if converged {
+		t.Fatal("dry-run completion is a ceiling stop, not real convergence (nonzero delta)")
+	}
+	if got := jobState(t, c, job.ID); got != model.JobCompleted {
+		t.Fatalf("dry-run job should be COMPLETED after pass 1, got state %v", got)
+	}
+	if p, err := c.st.PassByNo(job.ID, 2); err == nil {
+		t.Fatalf("dry-run job must not seed a second pass, but found one: %+v", p)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal(err)
 	}
 }

@@ -256,7 +256,11 @@ drsync ca init | issue --agent <host>
   object internally.
 - `--dry-run` runs a full pass pipeline with copy/metadata/delete execution stubbed:
   everything is walked, diffed and journaled (`would_copy`, `would_delete`), giving an
-  exact preview and a free scan benchmark.
+  exact preview and a free scan benchmark. Always stops after pass 1 regardless of
+  `passes.max`: nothing is ever written, so a second pass would just re-walk and
+  re-diff the same unchanged trees (`passctrl.decideNextPass` caps the ceiling to 1
+  whenever the job's dry-run flag is set — no need to also set `passes.max: 1` in
+  the spec).
 
 ## 3. Resolution Pipeline
 
