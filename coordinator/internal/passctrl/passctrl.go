@@ -789,7 +789,16 @@ func (c *Controller) decideNextPass(job *store.Job, done *store.Pass) (jobDone, 
 	if cw.DeltaBytesBelow > 0 && uint64(done.BytesCopied) < uint64(cw.DeltaBytesBelow) {
 		converged = true
 	}
-	if converged || done.PassNo >= spec.Spec.Passes.Max {
+	// A dry run never writes anything, so a second pass would just re-walk and
+	// re-diff the same, unchanged source and destination trees — there is
+	// nothing a later pass could see that pass 1 didn't already report. Cap
+	// the effective ceiling to 1 regardless of what passes.max says, rather
+	// than requiring every dry-run job spec to also set passes.max: 1 itself.
+	maxPasses := spec.Spec.Passes.Max
+	if job.DryRun {
+		maxPasses = 1
+	}
+	if converged || done.PassNo >= maxPasses {
 		slog.Info("job converged", "job", job.Name, "passes", done.PassNo,
 			"last_delta_files", done.FilesCopied, "last_delta_bytes", done.BytesCopied)
 		err := c.st.SetJobState(job.ID, model.JobCompleted)
